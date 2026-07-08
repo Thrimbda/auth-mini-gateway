@@ -1,6 +1,10 @@
 node_modules/
 dist/
+target/
 .git/
 .legion/
 .docker/
 coverage/
+*.sqlite
+*.sqlite-shm
+*.sqlite-wal

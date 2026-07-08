@@ -2,7 +2,9 @@
 
 ## auth-mini gateway follow-up
 
-- Select a production session store before using this gateway beyond a single-process PoC. Candidate stores should support TTL, revocation, and single-flight or compare-and-swap semantics for refresh.
 - Before OpenCode rollout, verify OpenCode is not reachable directly from any public origin and only accepts traffic through nginx/gateway enforcement.
-- Run a real auth-mini Passkey smoke with the deployed issuer/RP ID before replacing Basic Auth.
-- Decide whether `GET /logout` remains as a PoC convenience or should be disabled in deployment examples in favor of `POST /logout`.
+- Run a real auth-mini Passkey/WebAuthn browser smoke with the deployed issuer/RP ID before replacing Basic Auth.
+- Decide whether `GET /logout` remains as compatibility convenience or should be disabled in deployment examples in favor of `POST /logout`.
+- Add E2E replay assertions for consumed callback/login state.
+- Validate `AUTH_MINI_LOGIN_URL` during gateway config parsing.
+- Document operational assumptions for direct gateway exposure hardening.

@@ -6,33 +6,27 @@ services:
       HOST: 0.0.0.0
       PORT: 3000
       GATEWAY_PUBLIC_BASE_URL: http://localhost:${NGINX_PORT:-8080}
-      AUTH_MINI_ISSUER: http://mock-auth-mini:7777
-      AUTH_MINI_PUBLIC_BASE_URL: http://localhost:${AUTH_MINI_PORT:-7777}
-      GATEWAY_COOKIE_SECRET: compose-dev-secret-change-me-32chars
+      AUTH_MINI_ISSUER: ${AUTH_MINI_ISSUER:-http://auth-mini:7777}
+      AUTH_MINI_PUBLIC_BASE_URL: ${AUTH_MINI_PUBLIC_BASE_URL:-http://localhost:7777}
+      GATEWAY_DB: /data/auth-mini-gateway.sqlite
+      GATEWAY_COOKIE_SECRET: ${GATEWAY_COOKIE_SECRET:-compose-dev-secret-change-me-32chars}
       COOKIE_SECURE: "false"
-      ALLOW_EMAILS: allowed@example.com
-      REQUIRE_PASSKEY: "true"
+      COOKIE_SAME_SITE: lax
+      ALLOW_EMAILS: ${ALLOW_EMAILS:-allowed@example.com}
+      ALLOW_USER_IDS: ${ALLOW_USER_IDS:-}
+      REQUIRE_PASSKEY: ${REQUIRE_PASSKEY:-true}
+    volumes:
+      - gateway-data:/data
     depends_on:
-      - mock-auth-mini
+      - upstream
 
   upstream:
     build:
       context: ..
-    command: ["node", "dist/examples/upstream.js"]
+    command: ["auth-mini-gateway-upstream"]
     environment:
       HOST: 0.0.0.0
       PORT: 4000
-
-  mock-auth-mini:
-    build:
-      context: ..
-    command: ["node", "dist/examples/mock-auth-mini.js"]
-    environment:
-      HOST: 0.0.0.0
-      PORT: 7777
-      ISSUER: http://mock-auth-mini:7777
-    ports:
-      - "${AUTH_MINI_PORT:-7777}:7777"
 
   nginx:
     image: nginx:1.27-alpine
@@ -43,3 +37,6 @@ services:
     depends_on:
       - gateway
       - upstream
+
+volumes:
+  gateway-data:
