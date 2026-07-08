@@ -35,7 +35,7 @@ The gateway expects a real auth-mini server at `AUTH_MINI_ISSUER`. For local bro
 - `HOST`: bind host, default `127.0.0.1`.
 - `PORT`: bind port, default `3000`.
 - `GATEWAY_PUBLIC_BASE_URL`: public origin serving gateway routes through nginx.
-- `AUTH_MINI_ISSUER`: internal auth-mini issuer used for `/jwks`, `/me`, refresh, and logout.
+- `AUTH_MINI_ISSUER`: auth-mini issuer used for JWT `iss` validation and for `/jwks`, `/me`, refresh, and logout; it must be reachable by the gateway.
 - `AUTH_MINI_PUBLIC_BASE_URL`: browser-visible auth-mini origin; defaults to `AUTH_MINI_ISSUER`.
 - `AUTH_MINI_LOGIN_URL`: optional full login URL; defaults to `${AUTH_MINI_PUBLIC_BASE_URL}/web/#/login`.
 - `GATEWAY_DB`: SQLite database path.
@@ -53,6 +53,11 @@ The gateway expects a real auth-mini server at `AUTH_MINI_ISSUER`. For local bro
 ## nginx
 
 `examples/nginx.conf` exposes public gateway routes and keeps `/auth/check` internal through `/_auth`. Protected upstream requests use nginx `auth_request`; denied requests do not reach upstream. WebSocket upgrade headers are forwarded only after auth succeeds.
+
+## Docs
+
+- [Docs overview](docs/README.md)
+- [Production deployment](docs/production-deployment.md)
 
 ## Docker Compose
 

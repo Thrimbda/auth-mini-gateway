@@ -13,3 +13,6 @@
 - Final gateway validation must include real auth-mini token issuance/refresh/logout plus nginx and protected upstream, not mock-only tests.
 - Do not log access tokens, refresh tokens, signed session cookies, cookie secrets, or callback bodies in runtime or test diagnostics.
 - Treat identity values crossing the nginx `auth_request` response-header boundary as untrusted and reject unsafe header bytes before forwarding.
+- Production deployment docs live under `docs/`; `docs/README.md` is the docs entry point and `docs/production-deployment.md` is the operational deployment guide.
+- `AUTH_MINI_ISSUER` must match auth-mini's JWT `iss` and be reachable by the gateway for `/jwks`, `/me`, refresh, and logout.
+- Rollback guidance must keep a verified access-control layer in place; do not expose protected upstreams directly as a rollback shortcut.

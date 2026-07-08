@@ -7,4 +7,5 @@
 - Decide whether `GET /logout` remains as compatibility convenience or should be disabled in deployment examples in favor of `POST /logout`.
 - Add E2E replay assertions for consumed callback/login state.
 - Validate `AUTH_MINI_LOGIN_URL` during gateway config parsing.
-- Document operational assumptions for direct gateway exposure hardening.
+- Keep `docs/production-deployment.md` aligned with future runtime config, nginx, and rollback behavior changes.
+- Consider adding compromise-specific rollback steps for suspected cookie secret, SQLite DB, or refresh-token exposure.
