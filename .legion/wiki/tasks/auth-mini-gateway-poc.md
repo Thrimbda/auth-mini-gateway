@@ -6,10 +6,11 @@
 - RFC review passed after adding composed nginx verification.
 - Verification passed: `npm test`, `npm run typecheck`, `npm run build`, Compose config, and Compose-network smoke.
 - Readiness/security review passed with no blocking findings.
+- Historical: superseded for production runtime by `production-rust-sqlite-gateway`.
 
 ## Outcome
 
-The repository now contains a runnable TypeScript PoC gateway that uses auth-mini as an external authentication authority and exposes nginx-facing front-auth decisions.
+The repository previously contained a runnable TypeScript PoC gateway that used auth-mini as an external authentication authority and exposed nginx-facing front-auth decisions. This summary is retained as historical evidence; production runtime knowledge should start from `production-rust-sqlite-gateway`.
 
 Implemented capabilities:
 
