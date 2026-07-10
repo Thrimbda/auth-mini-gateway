@@ -11,7 +11,7 @@ Rust/SQLite gateway that adapts auth-mini sessions to nginx `auth_request` front
 - Verifies auth-mini access JWTs with `/jwks`.
 - Refreshes expired or near-expired access tokens through auth-mini `/session/refresh`.
 - Durably revokes local sessions on logout or refresh failure.
-- Applies email/user-id allowlists and optional Passkey-only policy from JWT `amr`.
+- Applies exact email/user-id allowlists independently of the IdP authentication method.
 - Lets nginx protect HTTP and WebSocket upstream traffic with `auth_request`.
 
 ## Quick Start
@@ -44,7 +44,6 @@ The gateway expects a real auth-mini server at `AUTH_MINI_ISSUER`. For local bro
 - `COOKIE_SAME_SITE`: `lax`, `strict`, or `none`.
 - `ALLOW_EMAILS`: comma-separated exact email allowlist, compared case-insensitively.
 - `ALLOW_USER_IDS`: optional comma-separated auth-mini user id allowlist.
-- `REQUIRE_PASSKEY`: when `true`, requires JWT `amr` to include `webauthn`.
 - `SESSION_TTL_SECONDS`: local gateway session lifetime.
 - `LOGIN_STATE_TTL_SECONDS`: one-time login state lifetime.
 - `REFRESH_SKEW_SECONDS`: refresh access tokens this many seconds before expiry.

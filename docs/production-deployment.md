@@ -70,7 +70,6 @@ COOKIE_SECURE=true
 COOKIE_SAME_SITE=lax
 ALLOW_EMAILS=alice@example.com,bob@example.com
 ALLOW_USER_IDS=
-REQUIRE_PASSKEY=true
 SESSION_TTL_SECONDS=28800
 LOGIN_STATE_TTL_SECONDS=300
 REFRESH_SKEW_SECONDS=60
@@ -86,7 +85,6 @@ Important settings:
 - `GATEWAY_DB` must point to persistent storage. Back up this file and its WAL files consistently.
 - `GATEWAY_COOKIE_SECRET` must remain stable. Rotating it invalidates all browser gateway cookies.
 - `COOKIE_SECURE` should be `true` for HTTPS production deployments.
-- `REQUIRE_PASSKEY=true` requires JWT `amr` to include `webauthn`.
 
 ## Docker Deployment
 
@@ -114,7 +112,6 @@ docker run -d \
   -e COOKIE_SECURE=true \
   -e COOKIE_SAME_SITE=lax \
   -e ALLOW_EMAILS=alice@example.com,bob@example.com \
-  -e REQUIRE_PASSKEY=true \
   auth-mini-gateway:latest
 ```
 
@@ -132,7 +129,6 @@ export GATEWAY_COOKIE_SECRET='<strong-random-secret>'
 export AUTH_MINI_ISSUER=https://auth.example.com
 export AUTH_MINI_PUBLIC_BASE_URL=https://auth.example.com
 export ALLOW_EMAILS=alice@example.com,bob@example.com
-export REQUIRE_PASSKEY=true
 ```
 
 Then start the topology:
@@ -173,7 +169,6 @@ GATEWAY_COOKIE_SECRET=<strong-random-secret>
 COOKIE_SECURE=true
 COOKIE_SAME_SITE=lax
 ALLOW_EMAILS=alice@example.com,bob@example.com
-REQUIRE_PASSKEY=true
 SESSION_TTL_SECONDS=28800
 LOGIN_STATE_TTL_SECONDS=300
 REFRESH_SKEW_SECONDS=60
@@ -367,7 +362,7 @@ Backup the gateway DB separately from the auth-mini DB. The gateway DB contains 
 - Keep the gateway private. Public traffic should enter through nginx.
 - Keep the protected upstream private. Public bypass around nginx defeats the gateway.
 - Use HTTPS in production and set `COOKIE_SECURE=true`.
-- Use `REQUIRE_PASSKEY=true` if the protected app should require Passkey-backed auth-mini sessions.
+- Treat auth-mini as the authority for authentication methods. The gateway authorizes verified identities through exact email/user-id allowlists.
 - Treat identity headers from `/auth/check` as data for the upstream, not as proof outside the nginx-protected path.
 
 ## Troubleshooting
@@ -394,7 +389,6 @@ Check:
 Check:
 
 - User email is listed in `ALLOW_EMAILS`, or auth-mini user id is listed in `ALLOW_USER_IDS`.
-- If `REQUIRE_PASSKEY=true`, the auth-mini access token must include `webauthn` in `amr`.
 
 ### Sessions disappear after restart
 

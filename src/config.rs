@@ -21,7 +21,6 @@ pub struct Config {
     pub refresh_skew_seconds: i64,
     pub allow_emails: HashSet<String>,
     pub allow_user_ids: HashSet<String>,
-    pub require_passkey: bool,
     pub logout_redirect: String,
 }
 
@@ -74,7 +73,6 @@ impl Config {
             refresh_skew_seconds: parse_i64("REFRESH_SKEW_SECONDS", 60)?,
             allow_emails: parse_csv_lower("ALLOW_EMAILS"),
             allow_user_ids: parse_csv("ALLOW_USER_IDS"),
-            require_passkey: parse_bool("REQUIRE_PASSKEY", true)?,
             logout_redirect: env::var("LOGOUT_REDIRECT").unwrap_or_else(|_| "/".to_string()),
         })
     }

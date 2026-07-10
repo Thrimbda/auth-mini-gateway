@@ -6,7 +6,7 @@
 - Keep nginx as the reverse proxy and WebSocket proxy; gateway does not proxy protected upstream traffic.
 - Browser stores only opaque signed gateway cookies. auth-mini access/refresh tokens stay server-side in gateway sessions.
 - Use a first-party callback bridge page for auth-mini fragment redirects because URL fragments are never sent to servers.
-- Deny unknown users by default through email/user-id allowlists, with optional Passkey-only enforcement via JWT `amr`.
+- Deny unknown users by default through exact email/user-id allowlists. Auth-mini is the sole authority for authentication methods; gateway authorization must not branch on JWT `amr`.
 - Preserve authenticated-but-unauthorized gateway sessions so nginx can return `403` without allowing upstream access.
 - Production runtime is Rust with SQLite WAL persistence, replacing the TypeScript PoC for production behavior.
 - Supported production topology is one active gateway instance with durable local/mounted SQLite storage; multi-active shared SQLite is out of scope.
