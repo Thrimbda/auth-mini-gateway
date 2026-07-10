@@ -46,6 +46,8 @@ Implemented capabilities:
 - Unsafe identity values are denied before forwarding `X-Auth-Mini-*` headers through nginx.
 - E2E uses real auth-mini Email OTP issuance, refresh, and logout. Full browser WebAuthn automation remains a follow-up; Passkey policy is unit-tested via `amr`.
 
+The later `remove-auth-method-policy` task supersedes the optional `webauthn` authorization requirement. Current gateway authorization uses identity allowlists only; auth-mini owns authentication methods.
+
 ## Residual Follow-Up
 
 - Add full browser/virtual-authenticator WebAuthn E2E when the environment supports it.

@@ -386,7 +386,6 @@ fn evaluate_session_policy(session: &GatewaySession, config: &Config) -> PolicyD
         Identity {
             user_id: &session.user_id,
             email: session.email.as_deref(),
-            amr: &session.amr,
         },
         config,
     )
@@ -519,7 +518,6 @@ mod tests {
             refresh_skew_seconds: 60,
             allow_emails: HashSet::new(),
             allow_user_ids: HashSet::new(),
-            require_passkey: true,
             logout_redirect: "/".to_string(),
         }
     }

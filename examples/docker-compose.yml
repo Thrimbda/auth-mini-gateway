@@ -14,7 +14,6 @@ services:
       COOKIE_SAME_SITE: lax
       ALLOW_EMAILS: ${ALLOW_EMAILS:-allowed@example.com}
       ALLOW_USER_IDS: ${ALLOW_USER_IDS:-}
-      REQUIRE_PASSKEY: ${REQUIRE_PASSKEY:-true}
     volumes:
       - gateway-data:/data
     depends_on:

@@ -136,7 +136,6 @@ start_gateway() {
     COOKIE_SECURE=false \
     COOKIE_SAME_SITE=lax \
     ALLOW_EMAILS=allowed@example.com \
-    REQUIRE_PASSKEY=false \
     REFRESH_SKEW_SECONDS=60 \
     "$ROOT_DIR/target/debug/auth-mini-gateway" \
     >"$TMP_DIR/gateway.log" 2>&1 &

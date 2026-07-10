@@ -13,7 +13,7 @@ Use this gateway when you want:
 - server-side storage of auth-mini access and refresh tokens.
 - browser sessions represented only by opaque, signed, HttpOnly cookies.
 - a single active gateway instance with durable SQLite WAL persistence.
-- simple email/user-id allowlists and optional Passkey-only enforcement via JWT `amr`.
+- simple email/user-id allowlists independent of the IdP authentication method.
 
 ## Not Trying To Include
 

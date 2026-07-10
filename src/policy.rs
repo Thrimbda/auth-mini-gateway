@@ -3,7 +3,6 @@ use crate::config::Config;
 pub struct Identity<'a> {
     pub user_id: &'a str,
     pub email: Option<&'a str>,
-    pub amr: &'a [String],
 }
 
 #[derive(Debug, PartialEq, Eq)]
@@ -23,10 +22,6 @@ pub fn evaluate(identity: Identity<'_>, config: &Config) -> PolicyDecision {
         return PolicyDecision::Deny;
     }
 
-    if config.require_passkey && !identity.amr.iter().any(|item| item == "webauthn") {
-        return PolicyDecision::Deny;
-    }
-
     PolicyDecision::Allow
 }
 
@@ -41,14 +36,13 @@ mod tests {
 
     #[test]
     fn denies_unknown_users_by_default() {
-        let config = test_config(["allowed@example.com"], [], false);
+        let config = test_config(["allowed@example.com"], []);
 
         assert_eq!(
             evaluate(
                 Identity {
                     user_id: "user-1",
                     email: Some("other@example.com"),
-                    amr: &["email_otp".to_string()],
                 },
                 &config,
             ),
@@ -57,26 +51,24 @@ mod tests {
     }
 
     #[test]
-    fn enforces_passkey_when_required() {
-        let config = test_config(["allowed@example.com"], [], true);
+    fn allows_any_authentication_method_for_allowlisted_identity() {
+        let config = test_config(["allowed@example.com"], ["allowed-user"]);
 
         assert_eq!(
             evaluate(
                 Identity {
                     user_id: "user-1",
                     email: Some("allowed@example.com"),
-                    amr: &["email_otp".to_string()],
                 },
                 &config,
             ),
-            PolicyDecision::Deny
+            PolicyDecision::Allow
         );
         assert_eq!(
             evaluate(
                 Identity {
-                    user_id: "user-1",
-                    email: Some("allowed@example.com"),
-                    amr: &["webauthn".to_string()],
+                    user_id: "allowed-user",
+                    email: None,
                 },
                 &config,
             ),
@@ -87,7 +79,6 @@ mod tests {
     fn test_config<const E: usize, const U: usize>(
         emails: [&str; E],
         user_ids: [&str; U],
-        require_passkey: bool,
     ) -> Config {
         Config {
             host: "127.0.0.1".to_string(),
@@ -111,7 +102,6 @@ mod tests {
                 .into_iter()
                 .map(ToOwned::to_owned)
                 .collect::<HashSet<_>>(),
-            require_passkey,
             logout_redirect: "/".to_string(),
         }
     }
