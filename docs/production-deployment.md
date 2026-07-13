@@ -70,8 +70,10 @@ COOKIE_SECURE=true
 COOKIE_SAME_SITE=lax
 ALLOW_EMAILS=alice@example.com,bob@example.com
 ALLOW_USER_IDS=
-SESSION_TTL_SECONDS=28800
-LOGIN_STATE_TTL_SECONDS=300
+SESSION_TTL_SECONDS=604800
+SESSION_ABSOLUTE_TTL_SECONDS=2592000
+SESSION_TOUCH_INTERVAL_SECONDS=3600
+LOGIN_STATE_TTL_SECONDS=600
 REFRESH_SKEW_SECONDS=60
 LOGOUT_REDIRECT=/
 ```
@@ -85,6 +87,7 @@ Important settings:
 - `GATEWAY_DB` must point to persistent storage. Back up this file and its WAL files consistently.
 - `GATEWAY_COOKIE_SECRET` must remain stable. Rotating it invalidates all browser gateway cookies.
 - `COOKIE_SECURE` should be `true` for HTTPS production deployments.
+- Session settings must satisfy `0 < SESSION_TOUCH_INTERVAL_SECONDS <= SESSION_TTL_SECONDS <= SESSION_ABSOLUTE_TTL_SECONDS`. Defaults are one-hour touch merging, seven-day inactivity, and a hard 30-day lifetime.
 
 ## Docker Deployment
 
@@ -112,6 +115,10 @@ docker run -d \
   -e COOKIE_SECURE=true \
   -e COOKIE_SAME_SITE=lax \
   -e ALLOW_EMAILS=alice@example.com,bob@example.com \
+  -e SESSION_TTL_SECONDS=604800 \
+  -e SESSION_ABSOLUTE_TTL_SECONDS=2592000 \
+  -e SESSION_TOUCH_INTERVAL_SECONDS=3600 \
+  -e LOGIN_STATE_TTL_SECONDS=600 \
   auth-mini-gateway:latest
 ```
 
@@ -169,8 +176,10 @@ GATEWAY_COOKIE_SECRET=<strong-random-secret>
 COOKIE_SECURE=true
 COOKIE_SAME_SITE=lax
 ALLOW_EMAILS=alice@example.com,bob@example.com
-SESSION_TTL_SECONDS=28800
-LOGIN_STATE_TTL_SECONDS=300
+SESSION_TTL_SECONDS=604800
+SESSION_ABSOLUTE_TTL_SECONDS=2592000
+SESSION_TOUCH_INTERVAL_SECONDS=3600
+LOGIN_STATE_TTL_SECONDS=600
 REFRESH_SKEW_SECONDS=60
 LOGOUT_REDIRECT=/
 ```
@@ -251,8 +260,12 @@ location / {
   auth_request /_auth;
   auth_request_set $auth_user_id $upstream_http_x_auth_mini_user_id;
   auth_request_set $auth_email $upstream_http_x_auth_mini_email;
+  auth_request_set $auth_set_cookie $upstream_http_set_cookie;
+  add_header Set-Cookie $auth_set_cookie always;
   error_page 401 = /__login_redirect;
   error_page 403 = @forbidden;
+  error_page 500 = @auth_unavailable;
+  proxy_intercept_errors off;
 
   proxy_http_version 1.1;
   proxy_set_header Upgrade $http_upgrade;
@@ -269,12 +282,23 @@ location = /__login_redirect {
   proxy_set_header Host $host;
   proxy_set_header X-Forwarded-Proto $scheme;
   proxy_set_header X-Original-URI $request_uri;
+  add_header Set-Cookie $auth_set_cookie always;
 }
 
 location @forbidden {
   return 403 "Forbidden\n";
 }
+
+location @auth_unavailable {
+  add_header Cache-Control "no-store" always;
+  add_header Retry-After "5" always;
+  return 503 "Authentication service temporarily unavailable\n";
+}
 ```
+
+`auth_request` turns a subrequest status other than `2xx`, `401`, or `403` into a main-request `500`; the `error_page 500` mapping above deliberately converts that authentication-phase failure to `503`. Keep `proxy_intercept_errors off` so a protected upstream's own `500` remains `500`. Do not log `$http_cookie`, `$auth_set_cookie`, `Authorization`, callback bodies, or identity headers.
+
+The first `add_header` propagates an idle-touch renewal to successful HTTP and WebSocket handshake responses. The redirect location's `add_header` preserves the independent `amg_session` clear header while proxied `/login` sets `amg_login_state`; both `Set-Cookie` headers are required.
 
 ## Verification Before Rollout
 
@@ -342,19 +366,25 @@ Backup the gateway DB separately from the auth-mini DB. The gateway DB contains 
 
 ### Upgrades
 
-1. Read release notes or PR notes for config changes.
-2. Back up the gateway SQLite DB.
-3. Deploy the new binary or image.
-4. Restart the single active gateway instance.
-5. Run the verification checklist above.
+Schema v2 is additive. It adds authoritative idle/absolute deadlines and identity-pending columns while retaining `session_expires_at` as an old-binary compatibility gate. Migration never extends a legacy session's existing deadline. An unknown future schema version or malformed legacy timestamp refuses startup.
+
+1. Stop the single active writer and take a WAL-consistent backup.
+2. Preserve the previous binary/image, environment, and nginx config.
+3. Deploy the binary, lifecycle environment variables, and nginx config as one unit.
+4. Start the gateway and confirm schema migration completes before opening traffic.
+5. Verify login, a touch renewal with absolute `Expires` and no positive `Max-Age`, refresh, `503` isolation, logout, and WebSocket handshake.
+6. Monitor pending-session count/age, SQLite errors, invalidation spikes, and refresh-flight outcomes.
+
+Before rollout, run `scripts/e2e-old-binary-compat.sh` against the intended base ref (default `origin/master`), `scripts/e2e-wal-backup-restore.sh`, and `scripts/e2e-real-auth-mini.sh` against the pinned auth-mini source. The old-binary harness builds and runs the actual pre-change binary; it does not simulate old behavior with new code. The WAL drill uses SQLite's backup API while committed data remains in WAL frames, restores to a separate database, checks integrity/schema/snapshot boundaries, and starts the real gateway against the restored copy.
 
 ### Rollback
 
-1. Stop the new gateway version.
-2. Restore the previous binary or container image.
-3. Keep the same `GATEWAY_COOKIE_SECRET` and SQLite DB if you want existing gateway sessions to remain valid.
-4. If rollback follows a bad migration or corrupted DB, restore the DB backup as well.
-5. If needed, switch nginx only to a previously verified alternative access-control configuration. If no verified fallback exists, keep `auth_request` protection in place and serve maintenance/deny traffic rather than exposing the upstream directly.
+1. Keep `auth_request` or a maintenance deny in place; never expose the upstream during rollback.
+2. Stop the new gateway and all refresh flights.
+3. Restore the previous binary/image and old environment. Do not lower `user_version` or drop v2 columns.
+4. Ready rows remain readable by the old binary. Pending rows have a past compatibility deadline and therefore fail closed; the old binary may prune them, requiring login again.
+5. If the database is suspect, restore the WAL-consistent backup. A token rotated after that backup may be superseded and require login again.
+6. Never repair Pending rows by manually copying tokens, email, or revocation values.
 
 ## Security Notes
 
@@ -364,6 +394,24 @@ Backup the gateway DB separately from the auth-mini DB. The gateway DB contains 
 - Use HTTPS in production and set `COOKIE_SECURE=true`.
 - Treat auth-mini as the authority for authentication methods. The gateway authorizes verified identities through exact email/user-id allowlists.
 - Treat identity headers from `/auth/check` as data for the upstream, not as proof outside the nginx-protected path.
+
+### Refresh and identity residuals
+
+- The gateway disables automatic HTTP redirects for auth-mini calls. Redirect responses are unavailable results; in particular, a `307`/`308` cannot replay the refresh POST or its credentials to `Location`.
+- JWKS, `/me`, and refresh success require exact `200 OK`. Other `2xx` responses are contract drift and fail closed without advancing identity state or token generation.
+- A timeout, transport error, `429`, `5xx`, unknown response, parse failure, or other indeterminate refresh result denies the current request with `503`, keeps the local session, and permits a later independent request to retry.
+- Only exact refresh-endpoint `401` errors `session_invalidated` and `session_superseded` are remote revoke authority. auth-mini currently may fold an internal failure into `session_invalidated`; alert on invalidation spikes and track an auth-mini follow-up to return `5xx` for internal errors.
+- If auth-mini commits token rotation but its response is lost, all requests already joined to that flight receive `503`. A later independent refresh may receive `session_superseded`, conditionally revoke the old local generation, and require login. The gateway does not automatically retry a rotating POST.
+- After successful rotation, tokens are durably `Pending` until fresh matching `/me` data is stored. Every non-fresh `/me` result—including exact `401 invalid_access_token`—keeps Pending and returns `503`; `/me` cannot revoke or clear the session.
+- Logout is local-first and terminal. A failed remote logout never restores local access.
+
+### Cookie deadlines
+
+Positive `amg_session` and login-state cookies use only an absolute IMF-fixdate `Expires`. Session expiry comes directly from the database's effective idle/absolute deadline, so a slow upstream cannot shift it later. Clear cookies use both `Max-Age=0` and a 1970 `Expires`. The database remains the authorization authority if a client clock is wrong.
+
+### Silent SSO capability gate
+
+The pinned auth-mini evidence does not establish no-interaction session reuse for a top-level redirect. The capability gate is **FAIL / unsupported**. Do not claim silent SSO in production; it requires a separate auth-mini task and a real browser-flow gate.
 
 ## Troubleshooting
 

@@ -10,7 +10,9 @@ Rust/SQLite gateway that adapts auth-mini sessions to nginx `auth_request` front
 - Keeps the browser session as an opaque, HttpOnly signed cookie.
 - Verifies auth-mini access JWTs with `/jwks`.
 - Refreshes expired or near-expired access tokens through auth-mini `/session/refresh`.
-- Durably revokes local sessions on logout or refresh failure.
+- Uses a 7-day idle timeout and a non-sliding 30-day absolute lifetime.
+- Refreshes on protected requests and preserves the local session across temporary auth-mini failures.
+- Durably revokes only on local logout/expiry or an exact auth-mini refresh rejection.
 - Applies exact email/user-id allowlists independently of the IdP authentication method.
 - Lets nginx protect HTTP and WebSocket upstream traffic with `auth_request`.
 
@@ -44,8 +46,10 @@ The gateway expects a real auth-mini server at `AUTH_MINI_ISSUER`. For local bro
 - `COOKIE_SAME_SITE`: `lax`, `strict`, or `none`.
 - `ALLOW_EMAILS`: comma-separated exact email allowlist, compared case-insensitively.
 - `ALLOW_USER_IDS`: optional comma-separated auth-mini user id allowlist.
-- `SESSION_TTL_SECONDS`: local gateway session lifetime.
-- `LOGIN_STATE_TTL_SECONDS`: one-time login state lifetime.
+- `SESSION_TTL_SECONDS`: inactivity timeout, default `604800` (7 days).
+- `SESSION_ABSOLUTE_TTL_SECONDS`: hard lifetime from callback, default `2592000` (30 days).
+- `SESSION_TOUCH_INTERVAL_SECONDS`: successful-request touch merge interval, default `3600`.
+- `LOGIN_STATE_TTL_SECONDS`: one-time login state lifetime, default `600`.
 - `REFRESH_SKEW_SECONDS`: refresh access tokens this many seconds before expiry.
 - `LOGOUT_REDIRECT`: default post-logout relative redirect.
 
@@ -57,6 +61,7 @@ The gateway expects a real auth-mini server at `AUTH_MINI_ISSUER`. For local bro
 
 - [Docs overview](docs/README.md)
 - [Production deployment](docs/production-deployment.md)
+- [Silent SSO capability gate](docs/silent-sso-capability.md)
 
 ## Docker Compose
 
@@ -65,3 +70,13 @@ The gateway expects a real auth-mini server at `AUTH_MINI_ISSUER`. For local bro
 ## Deployment Model
 
 The supported production target is one active gateway instance backed by durable SQLite WAL storage. Multi-active gateway instances sharing one SQLite session database are out of scope.
+
+Only successful `204` authorization checks can advance the idle deadline, and they never advance the absolute deadline. Positive cookies carry an absolute `Expires` value and no `Max-Age`; clear cookies carry both `Max-Age=0` and a past `Expires`.
+
+Temporary, rate-limit, transport, timeout, and indeterminate refresh failures return `503` through nginx without clearing the session. Only exact `401 {"error":"session_invalidated"}` or `session_superseded` responses from `/session/refresh` can remotely revoke it. `/me` never has revoke authority.
+
+Auth-mini HTTP redirects are never followed, and JWKS, `/me`, and refresh success require exact `200 OK`. Redirects and other unexpected success statuses fail closed without replaying refresh credentials or advancing local state.
+
+## Silent SSO capability
+
+The pinned auth-mini version does not provide a verified no-interaction top-level redirect reuse contract. The silent-SSO capability gate is **FAIL / unsupported**. This gateway does not emulate it; adding that capability requires a separate auth-mini change and browser verification.

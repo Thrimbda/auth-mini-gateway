@@ -1,12 +1,16 @@
 use std::env;
 use std::io::{Read, Write};
 use std::net::{TcpListener, TcpStream};
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::thread;
+use std::time::Duration;
 
 use auth_mini_gateway::http::{Request, Response};
 use base64::engine::general_purpose::STANDARD;
 use base64::Engine as _;
 use sha1::{Digest, Sha1};
+
+static HITS: AtomicUsize = AtomicUsize::new(0);
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     let host = env::var("HOST").unwrap_or_else(|_| "0.0.0.0".to_string());
@@ -21,8 +25,25 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             let Ok(request) = Request::read(&mut stream) else {
                 return;
             };
+            if request.path == "/__hits" {
+                let body = HITS.load(Ordering::SeqCst).to_string();
+                let _ = Response::text(200, &body).write_to(&mut stream);
+                return;
+            }
+            HITS.fetch_add(1, Ordering::SeqCst);
             if request.path == "/ws" && is_websocket(&request) {
                 let _ = websocket(&request, &mut stream);
+                return;
+            }
+            if request.path == "/slow" {
+                let delay = env::var("SLOW_RESPONSE_MILLISECONDS")
+                    .ok()
+                    .and_then(|value| value.parse::<u64>().ok())
+                    .unwrap_or(3000);
+                thread::sleep(Duration::from_millis(delay));
+            }
+            if request.path == "/upstream-500" {
+                let _ = Response::text(500, "Upstream failure").write_to(&mut stream);
                 return;
             }
 

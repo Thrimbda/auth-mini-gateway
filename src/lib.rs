@@ -2,6 +2,7 @@ pub mod auth_mini;
 pub mod config;
 pub mod cookies;
 pub mod db;
+pub mod flight;
 pub mod http;
 pub mod jwt;
 pub mod policy;

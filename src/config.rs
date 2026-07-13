@@ -4,7 +4,7 @@ use std::path::PathBuf;
 
 use url::Url;
 
-#[derive(Clone, Debug)]
+#[derive(Clone)]
 pub struct Config {
     pub host: String,
     pub port: u16,
@@ -17,6 +17,8 @@ pub struct Config {
     pub cookie_secure: bool,
     pub cookie_same_site: SameSite,
     pub session_ttl_seconds: i64,
+    pub session_absolute_ttl_seconds: i64,
+    pub session_touch_interval_seconds: i64,
     pub login_state_ttl_seconds: i64,
     pub refresh_skew_seconds: i64,
     pub allow_emails: HashSet<String>,
@@ -51,7 +53,7 @@ impl Config {
             return Err("GATEWAY_COOKIE_SECRET must be at least 32 characters".into());
         }
 
-        Ok(Self {
+        let config = Self {
             host: env::var("HOST").unwrap_or_else(|_| "127.0.0.1".to_string()),
             port: parse_u16("PORT", 3000)?,
             public_base_url,
@@ -68,14 +70,43 @@ impl Config {
             cookie_same_site: parse_same_site(
                 &env::var("COOKIE_SAME_SITE").unwrap_or_else(|_| "lax".to_string()),
             )?,
-            session_ttl_seconds: parse_i64("SESSION_TTL_SECONDS", 8 * 60 * 60)?,
-            login_state_ttl_seconds: parse_i64("LOGIN_STATE_TTL_SECONDS", 5 * 60)?,
+            session_ttl_seconds: parse_i64("SESSION_TTL_SECONDS", 7 * 24 * 60 * 60)?,
+            session_absolute_ttl_seconds: parse_i64(
+                "SESSION_ABSOLUTE_TTL_SECONDS",
+                30 * 24 * 60 * 60,
+            )?,
+            session_touch_interval_seconds: parse_i64("SESSION_TOUCH_INTERVAL_SECONDS", 60 * 60)?,
+            login_state_ttl_seconds: parse_i64("LOGIN_STATE_TTL_SECONDS", 10 * 60)?,
             refresh_skew_seconds: parse_i64("REFRESH_SKEW_SECONDS", 60)?,
             allow_emails: parse_csv_lower("ALLOW_EMAILS"),
             allow_user_ids: parse_csv("ALLOW_USER_IDS"),
             logout_redirect: env::var("LOGOUT_REDIRECT").unwrap_or_else(|_| "/".to_string()),
-        })
+        };
+        config.validate()?;
+        Ok(config)
     }
+
+    pub fn validate(&self) -> Result<(), Box<dyn std::error::Error>> {
+        validate_session_lifetimes(
+            self.session_touch_interval_seconds,
+            self.session_ttl_seconds,
+            self.session_absolute_ttl_seconds,
+        )
+        .map_err(Into::into)
+    }
+}
+
+fn validate_session_lifetimes(touch: i64, idle: i64, absolute: i64) -> Result<(), &'static str> {
+    if touch <= 0 || idle <= 0 || absolute <= 0 {
+        return Err("session lifecycle values must be positive");
+    }
+    if touch > idle {
+        return Err("SESSION_TOUCH_INTERVAL_SECONDS must not exceed SESSION_TTL_SECONDS");
+    }
+    if idle > absolute {
+        return Err("SESSION_TTL_SECONDS must not exceed SESSION_ABSOLUTE_TTL_SECONDS");
+    }
+    Ok(())
 }
 
 pub fn normalize_base_url(value: &str, name: &str) -> Result<String, Box<dyn std::error::Error>> {
@@ -146,4 +177,17 @@ fn parse_csv_lower(name: &str) -> HashSet<String> {
         .into_iter()
         .map(|value| value.to_ascii_lowercase())
         .collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::validate_session_lifetimes;
+
+    #[test]
+    fn lifecycle_validation_enforces_positive_ordering() {
+        assert!(validate_session_lifetimes(3_600, 604_800, 2_592_000).is_ok());
+        assert!(validate_session_lifetimes(0, 604_800, 2_592_000).is_err());
+        assert!(validate_session_lifetimes(604_801, 604_800, 2_592_000).is_err());
+        assert!(validate_session_lifetimes(3_600, 2_592_001, 2_592_000).is_err());
+    }
 }
