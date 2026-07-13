@@ -92,7 +92,9 @@ mod tests {
             cookie_secure: false,
             cookie_same_site: SameSite::Lax,
             session_ttl_seconds: 3600,
-            login_state_ttl_seconds: 300,
+            session_absolute_ttl_seconds: 7200,
+            session_touch_interval_seconds: 600,
+            login_state_ttl_seconds: 600,
             refresh_skew_seconds: 60,
             allow_emails: emails
                 .into_iter()

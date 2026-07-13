@@ -146,6 +146,19 @@ impl Response {
         write!(stream, "\r\n")?;
         stream.write_all(&self.body)
     }
+
+    #[cfg(test)]
+    pub(crate) fn status(&self) -> u16 {
+        self.status
+    }
+
+    #[cfg(test)]
+    pub(crate) fn header_values<'a>(&'a self, name: &'a str) -> impl Iterator<Item = &'a str> {
+        self.headers
+            .iter()
+            .filter(move |(candidate, _)| candidate.eq_ignore_ascii_case(name))
+            .map(|(_, value)| value.as_str())
+    }
 }
 
 fn parse_target(target: &str) -> (String, HashMap<String, String>) {
@@ -197,6 +210,7 @@ fn reason(status: u16) -> &'static str {
         403 => "Forbidden",
         404 => "Not Found",
         500 => "Internal Server Error",
+        503 => "Service Unavailable",
         _ => "OK",
     }
 }

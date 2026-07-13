@@ -8,3 +8,7 @@
 - Validate `AUTH_MINI_LOGIN_URL` during gateway config parsing.
 - Keep `docs/production-deployment.md` aligned with future runtime config, nginx, and rollback behavior changes.
 - Consider adding compromise-specific rollback steps for suspected cookie secret, SQLite DB, or refresh-token exposure.
+- Add an auth-mini top-level authorize/resume flow with redirect allowlisting and browser tests before claiming silent SSO.
+- Add auth-mini refresh idempotency, result lookup, or previous-token recovery to close the post-commit lost-response residual.
+- Make auth-mini internal refresh failures return 5xx instead of folding them into `401 session_invalidated`.
+- Run a physical mobile Safari smoke for overnight suspension, first-request recovery, and absolute `Expires` behavior.

@@ -3,6 +3,7 @@ set -euo pipefail
 
 ROOT_DIR=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)
 AUTH_MINI_RUST_DIR=${AUTH_MINI_RUST_DIR:-/tmp/opencode/auth-mini-reference/rust-backend}
+AUTH_MINI_EXPECTED_COMMIT=${AUTH_MINI_EXPECTED_COMMIT:-86b4aaa8ca97d1218217a7f6f0144251a5f30c9b}
 NGINX_IMAGE=${NGINX_IMAGE:-nginx:1.27-alpine}
 
 need() {
@@ -14,10 +15,17 @@ need() {
 
 need cargo
 need curl
+need git
 need python3
 
 if [[ ! -f "$AUTH_MINI_RUST_DIR/Cargo.toml" ]]; then
   printf 'AUTH_MINI_RUST_DIR must point to auth-mini rust-backend; got %s\n' "$AUTH_MINI_RUST_DIR" >&2
+  exit 1
+fi
+
+AUTH_MINI_ACTUAL_COMMIT=$(git -C "$AUTH_MINI_RUST_DIR" rev-parse HEAD)
+if [[ "$AUTH_MINI_ACTUAL_COMMIT" != "$AUTH_MINI_EXPECTED_COMMIT" ]]; then
+  printf 'auth-mini commit mismatch: expected %s, got %s\n' "$AUTH_MINI_EXPECTED_COMMIT" "$AUTH_MINI_ACTUAL_COMMIT" >&2
   exit 1
 fi
 
@@ -75,12 +83,6 @@ wait_status() {
   if [[ "$name" == "nginx" && "$NGINX_MODE" == "docker" ]]; then
     docker logs "$NGINX_CONTAINER" >&2 || true
   fi
-  for log in auth-mini gateway upstream; do
-    if [[ -f "$TMP_DIR/$log.log" ]]; then
-      printf '\n--- %s.log ---\n' "$log" >&2
-      sed -n '1,120p' "$TMP_DIR/$log.log" >&2 || true
-    fi
-  done
   return 1
 }
 
@@ -136,11 +138,29 @@ start_gateway() {
     COOKIE_SECURE=false \
     COOKIE_SAME_SITE=lax \
     ALLOW_EMAILS=allowed@example.com \
+    SESSION_TTL_SECONDS=604800 \
+    SESSION_ABSOLUTE_TTL_SECONDS=2592000 \
+    SESSION_TOUCH_INTERVAL_SECONDS=3600 \
+    LOGIN_STATE_TTL_SECONDS=600 \
     REFRESH_SKEW_SECONDS=60 \
     "$ROOT_DIR/target/debug/auth-mini-gateway" \
     >"$TMP_DIR/gateway.log" 2>&1 &
   GATEWAY_PID=$!
   wait_status "http://127.0.0.1:$GATEWAY_PORT/healthz" 204 gateway
+}
+
+start_auth() {
+  "$AUTH_MINI_RUST_DIR/target/debug/auth-mini" --db "$AUTH_DB" --host 127.0.0.1 --port "$AUTH_PORT" >"$TMP_DIR/auth-mini.log" 2>&1 &
+  AUTH_PID=$!
+  wait_status "$AUTH_BASE/healthz" 200 auth-mini
+}
+
+stop_auth() {
+  if [[ -n "$AUTH_PID" ]]; then
+    kill "$AUTH_PID"
+    wait "$AUTH_PID" >/dev/null 2>&1 || true
+    AUTH_PID=""
+  fi
 }
 
 stop_gateway() {
@@ -195,8 +215,12 @@ http {
       auth_request /_auth;
       auth_request_set \$auth_user_id \$upstream_http_x_auth_mini_user_id;
       auth_request_set \$auth_email \$upstream_http_x_auth_mini_email;
+      auth_request_set \$auth_set_cookie \$upstream_http_set_cookie;
+      add_header Set-Cookie \$auth_set_cookie always;
       error_page 401 = /__login_redirect;
       error_page 403 = @forbidden;
+      error_page 500 = @auth_unavailable;
+      proxy_intercept_errors off;
 
       proxy_http_version 1.1;
       proxy_set_header Upgrade \$http_upgrade;
@@ -214,9 +238,15 @@ http {
       proxy_set_header Host \$host;
       proxy_set_header X-Forwarded-Proto \$scheme;
       proxy_set_header X-Original-URI \$request_uri;
+      add_header Set-Cookie \$auth_set_cookie always;
     }
 
     location @forbidden { return 403 "Forbidden\n"; }
+    location @auth_unavailable {
+      add_header Cache-Control "no-store" always;
+      add_header Retry-After "5" always;
+      return 503 "Authentication service temporarily unavailable\n";
+    }
   }
 }
 EOF
@@ -256,6 +286,13 @@ for line in headers:
         break
 if not location:
     raise SystemExit("missing login redirect location")
+cookies = [line.split(":", 1)[1].strip() for line in headers if line.lower().startswith("set-cookie:")]
+session = [value for value in cookies if value.lower().startswith("amg_session=")]
+state_cookie = [value for value in cookies if value.lower().startswith("amg_login_state=")]
+if len(session) != 1 or "max-age=0" not in session[0].lower() or "expires=thu, 01 jan 1970" not in session[0].lower():
+    raise SystemExit("missing independent session clear cookie")
+if len(state_cookie) != 1 or "expires=" not in state_cookie[0].lower() or "max-age=" in state_cookie[0].lower():
+    raise SystemExit("missing absolute-expiry login-state cookie")
 parsed = urllib.parse.urlparse(location)
 fragment_query = parsed.fragment.split("?", 1)[1] if "?" in parsed.fragment else ""
 query = urllib.parse.parse_qs(parsed.query or fragment_query)
@@ -284,15 +321,24 @@ callback_session() {
   local body_file=$TMP_DIR/callback-body-$(date +%s%N).json
   json_body "$tokens_file" "$state" "$body_file"
   local output=$TMP_DIR/callback-output-$(date +%s%N).txt
+  local headers=$TMP_DIR/callback-headers-$(date +%s%N).txt
   local status
-  status=$(curl -sS -o "$output" -b "$jar" -c "$jar" -w '%{http_code}' \
+  status=$(curl -sS -o "$output" -D "$headers" -b "$jar" -c "$jar" -w '%{http_code}' \
     -H 'content-type: application/json' \
     --data @"$body_file" \
     "$PUBLIC_BASE/auth/callback/session")
   if [[ "$status" != "$expected" ]]; then
-    printf 'callback expected %s, got %s: %s\n' "$expected" "$status" "$(cat "$output")" >&2
+    printf 'callback expected %s, got %s\n' "$expected" "$status" >&2
     return 1
   fi
+  python3 - "$headers" <<'PY'
+import sys
+headers = open(sys.argv[1], encoding="utf-8").read().splitlines()
+cookies = [line.split(":", 1)[1].strip() for line in headers if line.lower().startswith("set-cookie:")]
+sessions = [value for value in cookies if value.lower().startswith("amg_session=")]
+if len(sessions) != 1 or "expires=" not in sessions[0].lower() or "max-age=" in sessions[0].lower():
+    raise SystemExit("callback session cookie must use absolute Expires without Max-Age")
+PY
 }
 
 protected_status() {
@@ -354,6 +400,59 @@ finally:
 PY
 }
 
+upstream_hits() {
+  curl -fsS "http://127.0.0.1:$UPSTREAM_PORT/__hits"
+}
+
+force_touch_due() {
+  python3 - "$GATEWAY_DB" <<'PY'
+import sqlite3, sys
+connection = sqlite3.connect(sys.argv[1])
+try:
+    connection.execute(
+        "UPDATE gateway_sessions SET last_touched_at = '2000-01-01T00:00:00.000Z' WHERE id = (SELECT id FROM gateway_sessions WHERE revoked_at IS NULL ORDER BY created_at DESC, id DESC LIMIT 1)"
+    )
+    connection.commit()
+finally:
+    connection.close()
+PY
+}
+
+shorten_active_deadline() {
+  python3 - "$GATEWAY_DB" <<'PY'
+import datetime, email.utils, sqlite3, sys
+connection = sqlite3.connect(sys.argv[1])
+try:
+    now = datetime.datetime.now(datetime.timezone.utc)
+    idle = now + datetime.timedelta(seconds=3)
+    absolute = now + datetime.timedelta(seconds=4)
+    fmt = lambda value: value.isoformat(timespec="milliseconds").replace("+00:00", "Z")
+    connection.execute(
+        """UPDATE gateway_sessions
+           SET idle_expires_at=?, session_expires_at=?, absolute_expires_at=?,
+               last_touched_at='2000-01-01T00:00:00.000Z'
+           WHERE id=(SELECT id FROM gateway_sessions WHERE revoked_at IS NULL ORDER BY created_at DESC, id DESC LIMIT 1)""",
+        (fmt(idle), fmt(idle), fmt(absolute)),
+    )
+    connection.commit()
+    print(email.utils.format_datetime(absolute, usegmt=True))
+finally:
+    connection.close()
+PY
+}
+
+assert_absolute_renewal() {
+  local headers=$1
+  python3 - "$headers" <<'PY'
+import sys
+headers = open(sys.argv[1], encoding="utf-8").read().splitlines()
+cookies = [line.split(":", 1)[1].strip() for line in headers if line.lower().startswith("set-cookie:")]
+sessions = [value for value in cookies if value.lower().startswith("amg_session=")]
+if len(sessions) != 1 or "expires=" not in sessions[0].lower() or "max-age=" in sessions[0].lower():
+    raise SystemExit("missing absolute-only session renewal")
+PY
+}
+
 websocket_check() {
   local jar=$1
   python3 - "$NGINX_PORT" "$jar" <<'PY'
@@ -387,7 +486,10 @@ with socket.create_connection(("127.0.0.1", port), timeout=5) as sock:
     while b"\r\n\r\n" not in response:
         response += sock.recv(4096)
     if b" 101 " not in response.split(b"\r\n", 1)[0]:
-        raise SystemExit(f"websocket handshake failed: {response!r}")
+        raise SystemExit("websocket handshake failed")
+    lowered = response.lower()
+    if b"set-cookie: amg_session=" not in lowered or b"expires=" not in lowered or b"max-age=" in lowered:
+        raise SystemExit("websocket handshake did not propagate absolute renewal")
     payload = b"ping"
     mask = b"\x01\x02\x03\x04"
     masked = bytes(byte ^ mask[index % 4] for index, byte in enumerate(payload))
@@ -398,7 +500,7 @@ with socket.create_connection(("127.0.0.1", port), timeout=5) as sock:
     length = header[1] & 0x7F
     echoed = sock.recv(length)
     if echoed != payload:
-        raise SystemExit(f"websocket echo mismatch: {echoed!r}")
+        raise SystemExit("websocket echo mismatch")
 PY
 }
 
@@ -412,14 +514,13 @@ AUTH_DB="$TMP_DIR/auth-mini.sqlite"
 GATEWAY_DB="$TMP_DIR/gateway.sqlite"
 
 printf 'Building auth-mini and gateway binaries...\n'
+printf 'Pinned auth-mini commit: %s\n' "$AUTH_MINI_ACTUAL_COMMIT"
 cargo build --manifest-path "$AUTH_MINI_RUST_DIR/Cargo.toml" --bin auth-mini >/dev/null
 cargo build --manifest-path "$ROOT_DIR/Cargo.toml" --bin auth-mini-gateway --example upstream >/dev/null
 
-"$AUTH_MINI_RUST_DIR/target/debug/auth-mini" --db "$AUTH_DB" --host 127.0.0.1 --port "$AUTH_PORT" >"$TMP_DIR/auth-mini.log" 2>&1 &
-AUTH_PID=$!
-wait_status "$AUTH_BASE/healthz" 200 auth-mini
+start_auth
 
-env HOST=127.0.0.1 PORT="$UPSTREAM_PORT" "$ROOT_DIR/target/debug/examples/upstream" >"$TMP_DIR/upstream.log" 2>&1 &
+env HOST=127.0.0.1 PORT="$UPSTREAM_PORT" SLOW_RESPONSE_MILLISECONDS=5000 "$ROOT_DIR/target/debug/examples/upstream" >"$TMP_DIR/upstream.log" 2>&1 &
 UPSTREAM_PID=$!
 wait_status "http://127.0.0.1:$UPSTREAM_PORT/" 200 upstream
 
@@ -436,25 +537,70 @@ callback_session "$ALLOWED_JAR" "$TMP_DIR/allowed-tokens.json" "$state" 200
 body="$TMP_DIR/protected-body.txt"
 status=$(protected_status "$ALLOWED_JAR" "$body")
 if [[ "$status" != "200" ]] || ! grep -q 'allowed@example.com' "$body"; then
-  printf 'expected authorized protected HTTP response, got %s: %s\n' "$status" "$(cat "$body")" >&2
+  printf 'expected authorized protected HTTP response, got %s\n' "$status" >&2
   exit 1
 fi
 
+printf 'Checking successful HTTP touch propagates an absolute-only renewal...\n'
+force_touch_due
+curl -sS -o /dev/null -D "$TMP_DIR/touch.headers" -b "$ALLOWED_JAR" -c "$ALLOWED_JAR" "$PUBLIC_BASE/"
+assert_absolute_renewal "$TMP_DIR/touch.headers"
+
 printf 'Checking WebSocket proxy after auth_request...\n'
+force_touch_due
 websocket_check "$ALLOWED_JAR"
 
-printf 'Checking gateway restart preserves SQLite session...\n'
+printf 'Checking protected upstream 500 is not remapped as auth unavailable...\n'
+status=$(curl -sS -o /dev/null -b "$ALLOWED_JAR" -w '%{http_code}' "$PUBLIC_BASE/upstream-500")
+if [[ "$status" != "500" ]]; then
+  printf 'expected protected upstream 500 to remain 500, got %s\n' "$status" >&2
+  exit 1
+fi
+
+printf 'Checking gateway connection failure maps to 503 without upstream access...\n'
+hits_before=$(upstream_hits)
 stop_gateway
+status=$(curl -sS -o /dev/null -D "$TMP_DIR/gateway-down.headers" -b "$ALLOWED_JAR" -w '%{http_code}' "$PUBLIC_BASE/")
+hits_after=$(upstream_hits)
+if [[ "$status" != "503" || "$hits_before" != "$hits_after" ]]; then
+  printf 'gateway-down auth isolation failed\n' >&2
+  exit 1
+fi
+python3 - "$TMP_DIR/gateway-down.headers" <<'PY'
+import sys
+headers = open(sys.argv[1], encoding="utf-8").read().lower()
+if "location:" in headers or "set-cookie: amg_session=" in headers:
+    raise SystemExit("gateway-down 503 redirected or changed session cookie")
+PY
 start_gateway
+
+printf 'Checking gateway restart preserves SQLite session...\n'
 status=$(protected_status "$ALLOWED_JAR" "$body")
 if [[ "$status" != "200" ]]; then
   printf 'expected session to survive gateway restart, got %s\n' "$status" >&2
   exit 1
 fi
 
-printf 'Checking real auth-mini refresh through persisted refresh token...\n'
+printf 'Checking temporary refresh failure preserves the local session and later recovers...\n'
 before_refresh=$(active_refresh_token)
 expire_active_access
+hits_before=$(upstream_hits)
+stop_auth
+status=$(curl -sS -o /dev/null -D "$TMP_DIR/auth-down.headers" -b "$ALLOWED_JAR" -c "$ALLOWED_JAR" -w '%{http_code}' "$PUBLIC_BASE/")
+hits_after=$(upstream_hits)
+if [[ "$status" != "503" || "$hits_before" != "$hits_after" || "$(active_session_count)" != "1" ]]; then
+  printf 'temporary refresh failure did not preserve fail-closed session state\n' >&2
+  exit 1
+fi
+python3 - "$TMP_DIR/auth-down.headers" <<'PY'
+import sys
+headers = open(sys.argv[1], encoding="utf-8").read().lower()
+if "location:" in headers or "max-age=0" in headers:
+    raise SystemExit("temporary refresh failure redirected or cleared the session")
+PY
+start_auth
+
+printf 'Checking real auth-mini refresh and Pending identity finalization...\n'
 status=$(protected_status "$ALLOWED_JAR" "$body")
 after_refresh=$(active_refresh_token)
 if [[ "$status" != "200" || -z "$after_refresh" || "$after_refresh" == "$before_refresh" ]]; then
@@ -475,18 +621,31 @@ if [[ "$logout_status" != "302" || "$(active_session_count)" != "0" ]]; then
   exit 1
 fi
 
-printf 'Checking refresh failure revokes local session...\n'
+printf 'Checking exact refresh rejection revokes local session...\n'
 REFRESH_FAIL_JAR="$TMP_DIR/refresh-fail-cookies.txt"
 state=$(login_start "$REFRESH_FAIL_JAR" "$TMP_DIR/refresh-fail-login.headers")
 seed_otp allowed@example.com 654321
 mint_tokens allowed@example.com 654321 "$TMP_DIR/refresh-fail-tokens.json"
 callback_session "$REFRESH_FAIL_JAR" "$TMP_DIR/refresh-fail-tokens.json" "$state" 200
 corrupt_active_refresh_and_expire
-status=$(protected_status "$REFRESH_FAIL_JAR" "$body")
-if [[ "$status" != "302" || "$(active_session_count)" != "0" ]]; then
-  printf 'expected refresh failure to revoke and redirect to login, status=%s active=%s\n' "$status" "$(active_session_count)" >&2
+hits_before=$(upstream_hits)
+status=$(curl -sS -o /dev/null -D "$TMP_DIR/refresh-rejected.headers" -b "$REFRESH_FAIL_JAR" -c "$REFRESH_FAIL_JAR" -w '%{http_code}' "$PUBLIC_BASE/")
+hits_after=$(upstream_hits)
+if [[ "$status" != "302" || "$(active_session_count)" != "0" || "$hits_before" != "$hits_after" ]]; then
+  printf 'expected exact refresh rejection to revoke and redirect, status=%s active=%s\n' "$status" "$(active_session_count)" >&2
   exit 1
 fi
+python3 - "$TMP_DIR/refresh-rejected.headers" <<'PY'
+import sys
+headers = open(sys.argv[1], encoding="utf-8").read().splitlines()
+cookies = [line.split(":", 1)[1].strip() for line in headers if line.lower().startswith("set-cookie:")]
+session = [value for value in cookies if value.lower().startswith("amg_session=")]
+state = [value for value in cookies if value.lower().startswith("amg_login_state=")]
+if len(session) != 1 or "max-age=0" not in session[0].lower() or "expires=thu, 01 jan 1970" not in session[0].lower():
+    raise SystemExit("exact rejection redirect lost session clear cookie")
+if len(state) != 1 or "expires=" not in state[0].lower() or "max-age=" in state[0].lower():
+    raise SystemExit("exact rejection redirect lost independent login-state cookie")
+PY
 
 printf 'Checking allowlist denial does not reach upstream...\n'
 DENIED_JAR="$TMP_DIR/denied-cookies.txt"
@@ -494,10 +653,36 @@ state=$(login_start "$DENIED_JAR" "$TMP_DIR/denied-login.headers")
 seed_otp denied@example.com 111111
 mint_tokens denied@example.com 111111 "$TMP_DIR/denied-tokens.json"
 callback_session "$DENIED_JAR" "$TMP_DIR/denied-tokens.json" "$state" 403
+hits_before=$(upstream_hits)
 status=$(protected_status "$DENIED_JAR" "$body")
-if [[ "$status" != "403" ]]; then
-  printf 'expected denied user to receive 403, got %s: %s\n' "$status" "$(cat "$body")" >&2
+hits_after=$(upstream_hits)
+if [[ "$status" != "403" || "$hits_before" != "$hits_after" ]]; then
+  printf 'expected denied user to receive isolated 403, got %s\n' "$status" >&2
   exit 1
 fi
+
+printf 'Checking a slow upstream cannot move absolute Cookie expiry...\n'
+SLOW_JAR="$TMP_DIR/slow-cookies.txt"
+state=$(login_start "$SLOW_JAR" "$TMP_DIR/slow-login.headers")
+seed_otp allowed@example.com 222222
+mint_tokens allowed@example.com 222222 "$TMP_DIR/slow-tokens.json"
+callback_session "$SLOW_JAR" "$TMP_DIR/slow-tokens.json" "$state" 200
+expected_expiry=$(shorten_active_deadline)
+status=$(curl -sS -o /dev/null -D "$TMP_DIR/slow.headers" -b "$SLOW_JAR" -c "$SLOW_JAR" -w '%{http_code}' "$PUBLIC_BASE/slow")
+if [[ "$status" != "200" ]]; then
+  printf 'slow-upstream request failed before response-delay assertion\n' >&2
+  exit 1
+fi
+python3 - "$TMP_DIR/slow.headers" "$SLOW_JAR" "$expected_expiry" <<'PY'
+import sys
+headers_path, jar_path, expected = sys.argv[1:]
+headers = open(headers_path, encoding="utf-8").read().splitlines()
+cookies = [line.split(":", 1)[1].strip() for line in headers if line.lower().startswith("set-cookie: amg_session=")]
+if len(cookies) != 1 or f"Expires={expected}" not in cookies[0] or "max-age=" in cookies[0].lower():
+    raise SystemExit("slow response changed the absolute session expiry")
+jar = open(jar_path, encoding="utf-8").read()
+if "amg_session" in jar:
+    raise SystemExit("receipt-time cookie jar retained an already expired renewal")
+PY
 
 printf 'E2E passed: real auth-mini, Rust gateway, nginx, protected HTTP/WebSocket upstream.\n'

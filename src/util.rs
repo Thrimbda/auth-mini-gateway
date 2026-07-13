@@ -1,15 +1,53 @@
 use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 use base64::Engine as _;
-use chrono::{SecondsFormat, Utc};
+use std::sync::{Arc, Mutex};
+
+use chrono::{DateTime, SecondsFormat, Utc};
 use rand::{rngs::OsRng, RngCore};
 use sha2::{Digest, Sha256};
 
-pub fn now_text() -> String {
-    Utc::now().to_rfc3339_opts(SecondsFormat::Millis, true)
+pub trait Clock: Send + Sync {
+    fn now(&self) -> DateTime<Utc>;
 }
 
-pub fn now_unix() -> i64 {
-    Utc::now().timestamp()
+#[derive(Clone, Default)]
+pub struct SystemClock;
+
+impl Clock for SystemClock {
+    fn now(&self) -> DateTime<Utc> {
+        Utc::now()
+    }
+}
+
+#[derive(Clone)]
+pub struct ManualClock {
+    now: Arc<Mutex<DateTime<Utc>>>,
+}
+
+impl ManualClock {
+    pub fn new(now: DateTime<Utc>) -> Self {
+        Self {
+            now: Arc::new(Mutex::new(now)),
+        }
+    }
+
+    pub fn set(&self, now: DateTime<Utc>) {
+        *self.now.lock().expect("manual clock lock") = now;
+    }
+}
+
+impl Clock for ManualClock {
+    fn now(&self) -> DateTime<Utc> {
+        *self.now.lock().expect("manual clock lock")
+    }
+}
+
+pub fn format_time(value: DateTime<Utc>) -> String {
+    value.to_rfc3339_opts(SecondsFormat::Millis, true)
+}
+
+pub fn parse_time(value: &str) -> Result<DateTime<Utc>, chrono::ParseError> {
+    Ok(DateTime::parse_from_rfc3339(value)?.with_timezone(&Utc))
 }
 
 pub fn random_token(bytes: usize) -> String {

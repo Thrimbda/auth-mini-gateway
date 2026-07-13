@@ -49,7 +49,7 @@ sequenceDiagram
     Gateway-->>Browser: Opaque gateway cookie
     Browser->>Nginx: Request protected app with cookie
     Nginx->>Gateway: auth_request /auth/check
-    Gateway-->>Nginx: 204 + identity headers
+    Gateway-->>Nginx: 204 + identity headers and optional absolute-expiry renewal
     Nginx->>Upstream: Proxy request
 ```
 
@@ -63,9 +63,22 @@ sequenceDiagram
 6. Set `COOKIE_SECURE=true` behind HTTPS and use a strong `GATEWAY_COOKIE_SECRET`.
 7. Verify login, refresh, logout, allowlist denial, and WebSocket behavior before rollout.
 
+## Session and failure model
+
+- New sessions have a 7-day idle timeout and a hard 30-day lifetime from callback creation.
+- Only successful protected-request authorization advances idle time, at most once per hour.
+- Access refresh is request-driven; it does not require browser background execution.
+- A rotated token is stored as identity `Pending` before `/me` is fetched. Pending sessions fail closed until a fresh matching identity is available.
+- Temporary or uncertain refresh and identity failures return `503` without clearing the browser session.
+- Local logout/expiry is terminal. Remote revocation is trusted only for the refresh endpoint's exact `session_invalidated` or `session_superseded` response.
+- `/me` failures, including `401 invalid_access_token`, never revoke a session.
+
+Silent SSO is currently **unsupported** by the pinned auth-mini capability evidence. It is not implemented or simulated in the gateway.
+
 ## Documentation
 
 - [Production deployment](production-deployment.md)
+- [Silent SSO capability gate](silent-sso-capability.md)
 
 ## Repository References
 
@@ -73,3 +86,5 @@ sequenceDiagram
 - Example nginx config: `../examples/nginx.conf`
 - Example Docker Compose topology: `../examples/docker-compose.yml`
 - Real auth-mini E2E harness: `../scripts/e2e-real-auth-mini.sh`
+- Actual pre-change binary compatibility harness: `../scripts/e2e-old-binary-compat.sh`
+- WAL-consistent backup/restore drill: `../scripts/e2e-wal-backup-restore.sh`

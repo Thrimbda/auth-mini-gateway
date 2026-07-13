@@ -2,9 +2,9 @@ use ed25519_dalek::{Signature, Verifier, VerifyingKey};
 use serde::Deserialize;
 use serde_json::Value;
 
-use crate::util::{b64_decode, now_unix};
+use crate::util::b64_decode;
 
-#[derive(Clone, Debug)]
+#[derive(Clone)]
 pub struct VerifiedAccessToken {
     pub user_id: String,
     pub auth_session_id: String,
@@ -30,6 +30,7 @@ pub fn verify_access_token(
     token: &str,
     jwks: &Jwks,
     expected_issuer: &str,
+    now_unix: i64,
 ) -> Result<VerifiedAccessToken, Box<dyn std::error::Error>> {
     let parts: Vec<&str> = token.split('.').collect();
     if parts.len() != 3 {
@@ -77,7 +78,7 @@ pub fn verify_access_token(
         .get("exp")
         .and_then(Value::as_i64)
         .ok_or("missing exp")?;
-    if exp <= now_unix() {
+    if exp <= now_unix {
         return Err("token expired".into());
     }
     let user_id = payload
