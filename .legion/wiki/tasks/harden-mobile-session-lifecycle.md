@@ -3,7 +3,7 @@
 ## Metadata
 
 - `task-id`: `harden-mobile-session-lifecycle`
-- `status`: `active`
+- `status`: `completed`
 - `risk`: `high`
 - `schema-version`: `gateway-session-v2`
 - `historical`: `false`
