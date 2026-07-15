@@ -1,0 +1,13 @@
+# frps v0.64.0+ on Acorn.
+bindAddr = "0.0.0.0"
+bindPort = 7000
+proxyBindAddr = "127.0.0.1"
+allowPorts = [{ single = 18081 }]
+
+auth.method = "token"
+auth.tokenSource.type = "file"
+auth.tokenSource.file.path = "/etc/frp/token"
+
+transport.tls.force = true
+transport.tls.certFile = "/etc/frp/tls/server.crt"
+transport.tls.keyFile = "/etc/frp/tls/server.key"

@@ -8,6 +8,10 @@ services:
       # Empty keeps this checked-in nginx auth_request topology. Set one fixed
       # URL only when using the gateway itself as the application proxy.
       UPSTREAM_URL: ${UPSTREAM_URL:-}
+      GATEWAY_MAX_DOWNSTREAM_CONNECTIONS: ${GATEWAY_MAX_DOWNSTREAM_CONNECTIONS:-256}
+      GATEWAY_MAX_ACTIVE_UPSTREAMS: ${GATEWAY_MAX_ACTIVE_UPSTREAMS:-128}
+      GATEWAY_MAX_BLOCKING_RESOLVERS: ${GATEWAY_MAX_BLOCKING_RESOLVERS:-8}
+      TRUSTED_PROXY_CIDRS: ${TRUSTED_PROXY_CIDRS:-}
       GATEWAY_PUBLIC_BASE_URL: http://localhost:${NGINX_PORT:-8080}
       AUTH_MINI_ISSUER: ${AUTH_MINI_ISSUER:-http://auth-mini:7777}
       AUTH_MINI_PUBLIC_BASE_URL: ${AUTH_MINI_PUBLIC_BASE_URL:-http://localhost:7777}

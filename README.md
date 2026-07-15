@@ -52,6 +52,14 @@ The gateway expects a real auth-mini server at `AUTH_MINI_ISSUER`. For local bro
 - `UPSTREAM_URL`: optional absolute `http`/`https` URL. Empty or unset selects
   adapter mode. A non-empty value selects proxy mode and may include a fixed
   base path, but must not contain credentials, a query, or a fragment.
+- `GATEWAY_MAX_DOWNSTREAM_CONNECTIONS`: accepted downstream connection limit,
+  default `256`.
+- `GATEWAY_MAX_ACTIVE_UPSTREAMS`: active proxy exchange/connection limit,
+  default `128`. Proxy mode requires at least 16 more downstream slots.
+- `GATEWAY_MAX_BLOCKING_RESOLVERS`: blocking domain resolver limit, default `8`,
+  valid range `1..=32`.
+- `TRUSTED_PROXY_CIDRS`: comma-separated direct-peer CIDRs with explicit
+  prefixes. Empty (the default) trusts no forwarding peer.
 - `GATEWAY_PUBLIC_BASE_URL`: public origin serving gateway routes through nginx.
 - `AUTH_MINI_ISSUER`: auth-mini issuer used for JWT `iss` validation and for `/jwks`, `/me`, refresh, and logout; it must be reachable by the gateway.
 - `AUTH_MINI_PUBLIC_BASE_URL`: browser-visible auth-mini origin; defaults to `AUTH_MINI_ISSUER`.
@@ -101,14 +109,45 @@ parameters, absolute-form authorities, cookies, and application redirects
 cannot select another destination. Browser cookies, Authorization,
 Proxy-Authorization, spoofed `X-Auth-Mini-*`, inbound forwarding fields, and
 hop-by-hop headers are removed. The gateway injects only verified user ID/email
-and forwarding metadata derived from the direct peer and configured public
-origin. The direct peer is not necessarily the browser IP when FRP/nginx sits
-in front.
+and regenerated forwarding metadata. An untrusted peer always becomes the
+client IP. A configured trusted direct peer may supply exactly one bare IPv4 or
+IPv6 value; malformed, repeated, list, port, bracket, zone, or opaque values are
+rejected. Forwarding data never affects authentication, routing, DNS, TLS, or
+pooling.
 
-The protected application must bind only to loopback. Expose the gateway—not
-the application—through FRP. For OpenCode, map the gateway listener `7780`,
-which proxies to OpenCode `127.0.0.1:4096`; never expose `4096` or the adapter
-gateway port `3000`. Public TLS remains terminated by Acorn nginx.
+Proxy fallback rejects every request-header name containing `_` before
+authentication or upstream contact. Gateway-owned routes and adapter fallback
+retain their compatibility behavior.
+
+The production OpenCode chain is exact:
+
+```text
+Browser -> Acorn nginx :443
+        -> Acorn 127.0.0.1:18081 (frps remote port)
+        -> Axiom frpc -> 127.0.0.1:7780 (gateway)
+        -> 127.0.0.1:4096 (OpenCode)
+```
+
+Only nginx `:443` and the firewalled FRP control port are public. Never map
+gateway adapter port `3000` or OpenCode `4096` through FRP.
+
+### Capacity and process budgets
+
+Downstream capacity is acquired before `accept()`. Active-upstream capacity is
+held through response bodies, SSE, cleanup, and complete WebSocket bridges.
+Saturation returns `503` with `Retry-After: 5`; requests are never replayed.
+
+Startup validates the effective soft `RLIMIT_NOFILE` using exact budgets:
+
+```text
+proxy:  D + U + 8 idle + 1 listener + 512 reserve
+adapter: D + 1 listener + 512 reserve
+```
+
+Defaults require `905` FDs in proxy mode and `769` in adapter mode. Production
+uses `LimitNOFILE=4096`. Tokio's blocking ceiling is exactly
+`64 auth + R resolver + 16 margin` (default `88`, maximum `112`); thread,
+`TasksMax`, and memory checks remain separate from FD checks.
 
 ## nginx adapter configuration
 
@@ -116,8 +155,12 @@ gateway port `3000`. Public TLS remains terminated by Acorn nginx.
 routes and keeps `/auth/check` internal through `/_auth`. Protected upstream
 requests use nginx `auth_request`; denied requests do not reach upstream.
 WebSocket upgrade headers are forwarded only after auth succeeds. In proxy
-mode nginx/FRP sends application traffic to the gateway itself; the gateway
-replaces node-local nginx only for application proxying, not Acorn public TLS.
+mode use `examples/nginx-proxy.conf`, `examples/frps.toml`, and
+`examples/frpc.toml`. The proxy server sends every path to the gateway,
+preserves Cookie/Host/protocol and WebSocket, disables request/response
+buffering and retry, and contains no `auth_request` or Cookie clear.
+`examples/nginx-proxy-rollback.conf` is the maintenance-only old-binary alias
+gate; follow the production guide before using it.
 
 ## Docs
 

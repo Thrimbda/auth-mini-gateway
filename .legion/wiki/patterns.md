@@ -82,3 +82,28 @@ For a gateway that optionally becomes the protected application proxy:
 - validate both sides of a WebSocket handshake before committing downstream `101`; reject nomination of required handshake fields
 - cancel incomplete uploads and disable connection reuse when an upstream returns a final response before request EOS
 - verify denial paths with an upstream hit counter, and verify SSE/large-body/WebSocket behavior with timing and raw-wire assertions
+
+## Lifetime-owned capacity pattern
+
+For an async proxy that must bound tasks and file descriptors:
+
+- acquire downstream capacity before `accept()` so saturation creates no accepted FD or rejection task
+- model one accepted socket as one cloneable private lease that survives Hyper upgrade into the WebSocket bridge
+- separate active-upstream capacity from the bounded idle pool; idle capacity is not an active-work bound
+- own the complete HTTP client connection as sender plus driver handle, and observe driver termination before returning active capacity on non-idle paths
+- make DNS resolution explicit and bounded; retain resolver handle plus capacity through timeout/cancellation cleanup instead of using hidden hostname resolution
+- reserve blocking execution for authentication independently from resolver capacity
+- return immediate no-body-poll `503` when upstream/resolver capacity is full; never queue request bodies behind long-lived SSE/WebSocket work
+- treat panic hooks, runtime shutdown, pool cleanup, and every Drop/cancellation path as part of the resource-lifetime design
+- test ownership with deterministic barriers, counters, raw `Expect: 100-continue`, child-process timeouts, and repeated cancellation runs rather than host FD exhaustion
+
+## Trusted forwarding handoff pattern
+
+For a known nginx-to-FRP-to-gateway chain:
+
+- default to trusting no forwarded client metadata
+- authenticate trust using only the immediate socket peer and explicit CIDRs
+- have the edge proxy overwrite XFF with its own observed `$remote_addr`, never append an inbound chain
+- accept one strict bare IP only, remove every inbound forwarding field, and regenerate one canonical value
+- keep client IP out of authentication, authorization, session, return-target, route, DNS, TLS, and pool interfaces
+- verify that varying accepted XFF changes only the application metadata header and never logs the raw value
