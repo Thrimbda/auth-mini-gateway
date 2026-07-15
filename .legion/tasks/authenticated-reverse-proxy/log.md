@@ -18,6 +18,9 @@
 - Security readiness review passed after fixing early-final cancellation, non-ASCII identity parity, WebSocket nominated headers, and HTTP root initialization.
 - Generated reviewer walkthrough and PR body.
 - Completed Legion wiki task summary and cross-task decision/pattern writeback.
+- Implementation, verification, security review, walkthrough, and wiki writeback completed.
+- Primary PR #7 merged into origin/master with no required checks reported.
+- Auto-merge was attempted; the PR reached merged terminal state immediately.
 
 (暂无)
 ### 🟡 进行中
@@ -28,6 +31,7 @@
 - Run independent verification and record evidence.
 - Run readiness and security review.
 - Commit, push, open PR, follow checks/review, and complete cleanup/refresh.
+- Merge this docs-only closeout update, then remove the worktree and refresh the main workspace.
 ### ⚠️ 阻塞/待定
 
 - Real-auth-mini composed E2E requires an auth-mini checkout not currently present at its expected path.
@@ -48,18 +52,20 @@
 
 | 决策 | 原因 | 替代方案 | 日期 |
 |------|------|----------|------|
-| Adapter mode remains the default rollback path; proxy mode is enabled only by one valid startup UPSTREAM_URL. | This preserves existing deployments, supports fail-closed rollback, and prevents request-controlled routing. | Removing adapter mode or adding dynamic/multiple upstream routing were rejected. | 2026-07-15 |
+| Primary delivery PR #7 is the successful terminal implementation state. | GitHub reports state MERGED at 2026-07-15T10:44:55Z with no required checks or blocking review. | No abandonment or closed-without-merge path was needed. | 2026-07-15 |
 ---
 
 ## 快速交接
 
 **下次继续从这里开始：**
 
-1. Commit the reviewed scope, rebase on origin/master, push the Legion branch, open the PR, enable auto-merge, and follow required checks/review to terminal state.
+1. Merge the docs-only closeout update.
+2. Remove .worktrees/authenticated-reverse-proxy and refresh the main workspace to origin/master.
 
 **注意事项：**
 
-- Final verification and security review are PASS; walkthrough, PR body, and wiki writeback are complete.
+- Primary PR: https://github.com/Thrimbda/auth-mini-gateway/pull/7.
+- External auth-mini and physical Acorn/FRP evidence remain deployment follow-ups recorded in wiki maintenance.
 ---
 
-*最后更新: 2026-07-15 10:43 by Legion CLI*
+*最后更新: 2026-07-15 10:45 by Legion CLI*
