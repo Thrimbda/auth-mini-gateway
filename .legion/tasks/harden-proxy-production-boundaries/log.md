@@ -21,6 +21,9 @@
 - Final security review PASS with no code finding.
 - Reviewer walkthrough and PR body created.
 - Legion wiki task summary, current decisions, patterns, and rollout maintenance gates updated.
+- Implementation, verification, security review, walkthrough, and wiki writeback completed.
+- Primary delivery PR #9 merged into origin/master with no required checks reported.
+- Auto-merge was attempted; GitHub reached merged terminal state.
 
 (暂无)
 ### 🟡 进行中
@@ -33,6 +36,7 @@
 - Run final security/readiness review.
 - Fix final review blockers in runtime terminal shutdown, panic hook lock safety, and composed auth/TLS/pool evidence.
 - Commit, rebase, push, open PR, follow checks/review, and complete cleanup.
+- Merge docs-only closeout, then remove worktree and refresh main workspace.
 ### ⚠️ 阻塞/待定
 
 - Native nginx/FRP verification requires deployment files/binaries; physical Acorn/Axiom evidence remains rollout-time.
@@ -40,6 +44,7 @@
 - Production rollout remains blocked pending native Acorn/Axiom nginx, FRP, systemd, effective-limit, firewall, and physical topology evidence.
 - review-change verdict FAIL until runtime exit and panic hook blockers are resolved.
 - Production rollout remains blocked on native Acorn/Axiom evidence, independent of merge readiness.
+- Production rollout remains blocked on native Acorn/Axiom gates recorded in task evidence and wiki maintenance.
 
 (暂无)
 (暂无)
@@ -55,20 +60,21 @@
 
 | 决策 | 原因 | 替代方案 | 日期 |
 |------|------|----------|------|
-| Mark code merge-ready while retaining production rollout as explicitly blocked. | All deterministic implementation/security gates pass, but native nginx/FRP credentials, service limits, physical topology, direct peer, and resource measurements require deployment hosts. | Conflating merge and rollout readiness would either block reviewed code indefinitely or overstate deployment safety. | 2026-07-16 |
+| Primary implementation PR #9 is the successful code-delivery terminal state, not production rollout approval. | GitHub reports merged with implementation verification and review PASS; deployment-host evidence remains intentionally outstanding. | No closed/abandoned delivery path was needed, and no rollout claim is made. | 2026-07-16 |
 ---
 
 ## 快速交接
 
 **下次继续从这里开始：**
 
-1. Commit reviewed scope, rebase latest origin/master, push and create PR.
-2. Enable auto-merge and follow checks/review to terminal state.
-3. After merge, record terminal state, remove worktree, and refresh main.
+1. Merge docs-only task closeout.
+2. Remove worktree and refresh main workspace to origin/master.
+3. Execute native rollout checklist before any Axiom public cutover.
 
 **注意事项：**
 
-- PR body keeps native rollout checklist explicitly unchecked.
+- Primary PR: https://github.com/Thrimbda/auth-mini-gateway/pull/9.
+- No GitHub required checks were configured.
 ---
 
-*最后更新: 2026-07-15 17:59 by Legion CLI*
+*最后更新: 2026-07-15 18:01 by Legion CLI*
