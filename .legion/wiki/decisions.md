@@ -8,6 +8,14 @@
 - Gateway-owned login, callback, auth-check, logout, and health routes always remain local before proxy fallback.
 - `/auth/check` and proxy mode share one session/refresh/policy/touch decision; only their HTTP response mapping differs.
 - Before proxying, remove browser cookies/authorization, caller identity, inbound forwarding, and hop-by-hop fields; preserve external Host only as app metadata and inject only verified user ID/email.
+- Bound proxy resources with independent startup budgets: downstream connections D=256, active upstreams U=128, and blocking resolvers R=8 by default. Proxy mode requires at least 16 downstream slots beyond U.
+- Hold D through the accepted HTTP/SSE/WebSocket lifetime. Hold U through explicit DNS, TCP/TLS/HTTP, complete sender+driver cleanup, response/SSE body, or tunnel completion. Hold R and U until a resolver handle is observed complete.
+- Configure Tokio blocking capacity as 64 auth workers plus R resolver workers plus 16 runtime margin; resolver saturation must not queue hidden blocking work or starve authentication.
+- Validate the effective soft `RLIMIT_NOFILE` against exact adapter/proxy budgets at startup and refuse impossible configurations rather than silently shrinking limits.
+- Recoverable listener errors retry with bounded backoff and globally suppressed logs. Fatal listener errors use non-waiting runtime shutdown, one sanitized event, and nonzero exit so unabortable resolver work cannot block systemd restart.
+- Reject every underscore-containing request header on non-owned proxy fallback before authentication or upstream access. Gateway-owned routes and adapter fallback keep compatibility behavior.
+- `TRUSTED_PROXY_CIDRS` defaults empty. Only a trusted immediate peer may supply exactly one bare client IP; forwarding metadata remains informational and cannot influence authentication, return targets, destination, TLS, or pooling.
+- Panic-time logging is a static payload-free direct write; logs must never include panic payloads, locations, forwarding values, identities, cookies, tokens, or internal paths.
 - Browser stores only opaque signed gateway cookies. auth-mini access/refresh tokens stay server-side in gateway sessions.
 - Use a first-party callback bridge page for auth-mini fragment redirects because URL fragments are never sent to servers.
 - Deny unknown users by default through exact email/user-id allowlists. Auth-mini is the sole authority for authentication methods; gateway authorization must not branch on JWT `amr`.
@@ -20,6 +28,7 @@
 - Production deployment docs live under `docs/`; `docs/README.md` is the docs entry point and `docs/production-deployment.md` is the operational deployment guide.
 - `AUTH_MINI_ISSUER` must match auth-mini's JWT `iss` and be reachable by the gateway for `/jwks`, `/me`, refresh, and logout.
 - Rollback guidance must keep a verified access-control layer in place; do not expose protected upstreams directly as a rollback shortcut.
+- Proxy rollout requires native Acorn/Axiom nginx, FRP, firewall, direct-peer, systemd-limit, and thread/memory evidence. Passing repository tests makes the change merge-ready, not production-rollout-ready.
 - New gateway sessions use a 7-day inactivity deadline under a non-sliding 30-day absolute deadline; only successful `204` authorization checks may advance inactivity, coalesced to once per hour by default.
 - Session schema v2 migration must never extend a legacy session deadline, and old binaries must remain fail-closed for identity-pending sessions.
 - Temporary or indeterminate refresh failures return authentication-unavailable without revoking or clearing the local session. Only exact refresh-endpoint `session_invalidated` or unrecovered `session_superseded` responses may conditionally revoke it.

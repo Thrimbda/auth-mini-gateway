@@ -214,6 +214,10 @@ mod tests {
             allow_user_ids: HashSet::new(),
             logout_redirect: "/".to_string(),
             upstream: None,
+            max_downstream_connections: 256,
+            max_active_upstreams: 128,
+            max_blocking_resolvers: 8,
+            trusted_proxy_cidrs: crate::config::TrustedProxySet::default(),
         }
     }
 }

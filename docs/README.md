@@ -67,6 +67,11 @@ sequenceDiagram
 6. Set `COOKIE_SECURE=true` behind HTTPS and use a strong `GATEWAY_COOKIE_SECRET`.
 7. Verify login, refresh, logout, allowlist denial, and WebSocket behavior before rollout.
 
+Proxy-mode production uses one fixed chain: Acorn nginx `:443` -> Acorn
+loopback frps `18081` -> Axiom gateway `7780` -> loopback OpenCode `4096`.
+Use the checked `nginx-proxy.conf`, `frps.toml`, `frpc.toml`, and systemd
+examples below; do not expose `7780` or `4096` publicly.
+
 ## Session and failure model
 
 - New sessions have a 7-day idle timeout and a hard 30-day lifetime from callback creation.
@@ -88,6 +93,10 @@ Silent SSO is currently **unsupported** by the pinned auth-mini capability evide
 
 - Root README: `../README.md`
 - Example nginx config: `../examples/nginx.conf`
+- Acorn proxy nginx config: `../examples/nginx-proxy.conf`
+- Maintenance-only old-binary nginx config: `../examples/nginx-proxy-rollback.conf`
+- FRP server/client configs: `../examples/frps.toml`, `../examples/frpc.toml`
+- systemd service with `LimitNOFILE=4096`: `../examples/auth-mini-gateway.service`
 - Example Docker Compose topology: `../examples/docker-compose.yml`
 - Real auth-mini E2E harness: `../scripts/e2e-real-auth-mini.sh`
 - Direct proxy-mode harness: `../scripts/e2e-proxy-mode.sh`

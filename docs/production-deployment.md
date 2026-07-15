@@ -44,17 +44,18 @@ auth-mini public issuer: https://auth.example.com
 ```text
 Browser
   -> Acorn nginx :443 (public TLS)
-  -> FRP target 127.0.0.1:7780
-  -> auth-mini-gateway proxy 127.0.0.1:7780
+  -> Acorn loopback 127.0.0.1:18081 (frps TCP remotePort)
+  -> authenticated TLS FRP tunnel
+  -> Axiom frpc local target 127.0.0.1:7780
+  -> auth-mini-gateway 127.0.0.1:7780
   -> OpenCode 127.0.0.1:4096
 
 auth-mini-gateway -> auth-mini issuer (JWKS, /me, refresh, logout)
 ```
 
-OpenCode must listen only on `127.0.0.1:4096`. FRP maps `7780`, not `4096`.
-It must also have no public mapping for the adapter-only gateway port `3000`.
-Acorn nginx remains the public TLS endpoint; the gateway does not terminate
-public TLS.
+Only nginx `:443` and the firewalled frps control port are externally reachable.
+Acorn `18081`, Axiom `7780`, and OpenCode `4096` are loopback-only. FRP never
+maps `3000` or `4096`. Acorn nginx remains the public TLS endpoint.
 
 Minimal proxy-mode listener settings:
 
@@ -63,7 +64,14 @@ HOST=127.0.0.1
 PORT=7780
 UPSTREAM_URL=http://127.0.0.1:4096
 GATEWAY_PUBLIC_BASE_URL=https://app.example.com
+GATEWAY_MAX_DOWNSTREAM_CONNECTIONS=256
+GATEWAY_MAX_ACTIVE_UPSTREAMS=128
+GATEWAY_MAX_BLOCKING_RESOLVERS=8
+TRUSTED_PROXY_CIDRS=
 ```
+
+Leave trust empty for initial rollout. Enable the exact observed frpc peer CIDR
+only after Acorn nginx is proven to overwrite XFF with one `$remote_addr` value.
 
 Production assumptions for both modes:
 
@@ -105,6 +113,10 @@ Use these variables as the production baseline:
 HOST=0.0.0.0
 PORT=3000
 UPSTREAM_URL=
+GATEWAY_MAX_DOWNSTREAM_CONNECTIONS=256
+GATEWAY_MAX_ACTIVE_UPSTREAMS=128
+GATEWAY_MAX_BLOCKING_RESOLVERS=8
+TRUSTED_PROXY_CIDRS=
 GATEWAY_PUBLIC_BASE_URL=https://app.example.com
 AUTH_MINI_ISSUER=https://auth.example.com
 AUTH_MINI_PUBLIC_BASE_URL=https://auth.example.com
@@ -129,6 +141,13 @@ Important settings:
 - `UPSTREAM_URL` empty selects adapter mode. In proxy mode use one fixed
   loopback target, such as `http://127.0.0.1:4096`; invalid values stop startup
   without making a reachability request.
+- `GATEWAY_MAX_DOWNSTREAM_CONNECTIONS` and `GATEWAY_MAX_ACTIVE_UPSTREAMS`
+  default to `256` and `128`. Proxy mode requires `D >= U + 16`.
+- `GATEWAY_MAX_BLOCKING_RESOLVERS` defaults to `8` and accepts `1..=32`.
+  Domain resolution concurrency is `min(U,R)`; IPv4/IPv6 literals do not use R.
+- `TRUSTED_PROXY_CIDRS` defaults empty. Every entry must include an explicit
+  prefix. Trust applies only to the immediate socket peer and never changes
+  authentication, routing, DNS, TLS, or pooling.
 - `AUTH_MINI_ISSUER` must exactly match auth-mini's JWT issuer and must be reachable by the gateway.
 - `AUTH_MINI_PUBLIC_BASE_URL` is the browser-visible auth-mini origin used to build the default login URL.
 - `AUTH_MINI_LOGIN_URL` is optional. Set it only if the default `${AUTH_MINI_PUBLIC_BASE_URL}/web/#/login` is not correct for your auth-mini UI.
@@ -155,6 +174,9 @@ docker run -d \
   -v auth-mini-gateway-data:/data \
   -e HOST=0.0.0.0 \
   -e PORT=3000 \
+  -e GATEWAY_MAX_DOWNSTREAM_CONNECTIONS=256 \
+  -e GATEWAY_MAX_ACTIVE_UPSTREAMS=128 \
+  -e GATEWAY_MAX_BLOCKING_RESOLVERS=8 \
   -e GATEWAY_PUBLIC_BASE_URL=https://app.example.com \
   -e AUTH_MINI_ISSUER=https://auth.example.com \
   -e AUTH_MINI_PUBLIC_BASE_URL=https://auth.example.com \
@@ -221,6 +243,10 @@ Create `/etc/auth-mini-gateway/env`:
 ```env
 HOST=127.0.0.1
 PORT=3000
+GATEWAY_MAX_DOWNSTREAM_CONNECTIONS=256
+GATEWAY_MAX_ACTIVE_UPSTREAMS=128
+GATEWAY_MAX_BLOCKING_RESOLVERS=8
+TRUSTED_PROXY_CIDRS=
 GATEWAY_PUBLIC_BASE_URL=https://app.example.com
 AUTH_MINI_ISSUER=https://auth.example.com
 AUTH_MINI_PUBLIC_BASE_URL=https://auth.example.com
@@ -257,6 +283,7 @@ User=auth-mini-gateway
 Group=auth-mini-gateway
 EnvironmentFile=/etc/auth-mini-gateway/env
 ExecStart=/usr/local/bin/auth-mini-gateway
+LimitNOFILE=4096
 Restart=on-failure
 RestartSec=5
 NoNewPrivileges=true
@@ -279,10 +306,7 @@ sudo systemctl status auth-mini-gateway
 
 ## nginx Configuration
 
-This section is for **adapter mode**. In proxy mode, node-local nginx does not
-proxy the application: Acorn nginx/FRP forwards to gateway `7780`, and the
-gateway forwards to the fixed loopback app. Keep Acorn Host canonicalization
-and public TLS in place.
+### Adapter mode
 
 Start from `examples/nginx.conf` and adjust upstream names, TLS, and server names.
 
@@ -357,6 +381,138 @@ location @auth_unavailable {
 `auth_request` turns a subrequest status other than `2xx`, `401`, or `403` into a main-request `500`; the `error_page 500` mapping above deliberately converts that authentication-phase failure to `503`. Keep `proxy_intercept_errors off` so a protected upstream's own `500` remains `500`. Do not log `$http_cookie`, `$auth_set_cookie`, `Authorization`, callback bodies, or identity headers.
 
 The first `add_header` propagates an idle-touch renewal to successful HTTP and WebSocket handshake responses. The redirect location's `add_header` preserves the independent `amg_session` clear header while proxied `/login` sets `amg_login_state`; both `Set-Cookie` headers are required.
+
+### Acorn proxy mode
+
+Use `examples/nginx-proxy.conf` as the directly deployable server. Its `map`
+belongs in the `http` context. The relevant server is:
+
+```nginx
+map $http_upgrade $gateway_connection {
+    default upgrade;
+    ''      close;
+}
+
+server {
+    listen 443 ssl;
+    server_name app.example.com;
+    ssl_certificate     /etc/nginx/tls/app.example.com.crt;
+    ssl_certificate_key /etc/nginx/tls/app.example.com.key;
+
+    underscores_in_headers on;
+    ignore_invalid_headers on;
+    client_max_body_size 0;
+    client_body_timeout 24h;
+    send_timeout 24h;
+
+    location / {
+        proxy_pass http://127.0.0.1:18081;
+        proxy_http_version 1.1;
+        proxy_set_header Cookie $http_cookie;
+        proxy_pass_header Set-Cookie;
+        proxy_set_header Host $host;
+        proxy_set_header X-Forwarded-Host $host;
+        proxy_set_header X-Forwarded-Proto https;
+        proxy_set_header X-Forwarded-For $remote_addr;
+        proxy_set_header Forwarded "";
+        proxy_set_header X-Real-IP "";
+        proxy_set_header X-Forwarded-Port "";
+        proxy_set_header Upgrade $http_upgrade;
+        proxy_set_header Connection $gateway_connection;
+
+        proxy_request_buffering off;
+        proxy_buffering off;
+        proxy_cache off;
+        gzip off;
+        proxy_connect_timeout 10s;
+        proxy_send_timeout 24h;
+        proxy_read_timeout 24h;
+        proxy_socket_keepalive on;
+        proxy_intercept_errors off;
+        proxy_next_upstream off;
+        proxy_redirect off;
+    }
+}
+```
+
+This is one all-path gateway location. It deliberately has no `auth_request`,
+Cookie clear, `$proxy_add_x_forwarded_for`, response buffering, request
+buffering, or proxy retry. Both header directives are explicit: underscore
+aliases reach the hardened gateway for rejection, while other nginx-invalid
+headers remain discarded.
+
+## FRP v0.64.0+ configuration
+
+`auth.tokenSource` requires frp v0.64.0 or newer. Pin matching frps/frpc
+versions. Use `examples/frps.toml` on Acorn:
+
+```toml
+bindAddr = "0.0.0.0"
+bindPort = 7000
+proxyBindAddr = "127.0.0.1"
+allowPorts = [{ single = 18081 }]
+auth.method = "token"
+auth.tokenSource.type = "file"
+auth.tokenSource.file.path = "/etc/frp/token"
+transport.tls.force = true
+transport.tls.certFile = "/etc/frp/tls/server.crt"
+transport.tls.keyFile = "/etc/frp/tls/server.key"
+```
+
+Use `examples/frpc.toml` on Axiom:
+
+```toml
+serverAddr = "frp.example.com"
+serverPort = 7000
+auth.method = "token"
+auth.tokenSource.type = "file"
+auth.tokenSource.file.path = "/etc/frp/token"
+transport.tls.enable = true
+transport.tls.trustedCaFile = "/etc/frp/tls/ca.crt"
+transport.tls.serverName = "frp.example.com"
+
+[[proxies]]
+name = "auth-mini-gateway"
+type = "tcp"
+localIP = "127.0.0.1"
+localPort = 7780
+remotePort = 18081
+```
+
+There is no PROXY protocol. Firewall frps `7000` to Axiom. Validate before
+cutover:
+
+```bash
+nginx -t
+frps verify -c /etc/frp/frps.toml
+frpc verify -c /etc/frp/frpc.toml
+frps --version
+frpc --version
+```
+
+## Capacity, FD, thread, and memory gates
+
+Startup refuses a finite soft `RLIMIT_NOFILE` below the checked mode budget:
+
+```text
+proxy required  = D + U + 8 + 1 + 512  # defaults: 905
+adapter required = D + 1 + 512           # defaults: 769
+```
+
+Keep `LimitNOFILE=4096`. Resolver work adds no separate FD term because it is
+already one U phase. The Tokio blocking ceiling is exactly `64 + R + 16`, so
+defaults log `88` and R=32 logs `112`. FD capacity does not prove thread or
+memory capacity. Record these independently:
+
+```bash
+systemctl show auth-mini-gateway -p LimitNOFILE -p TasksMax -p MemoryMax
+grep -E '^(Threads|VmRSS|VmSize):' /proc/$(pidof auth-mini-gateway)/status
+```
+
+Under the R-resolver plus 64-auth stress gate, record peak thread and memory
+values. If `MemoryMax` is finite, retain at least 25% above measured peak RSS.
+If `TasksMax` is finite, leave room for main + Tokio async workers + the logged
+blocking maximum + 32 non-Tokio/process slots.
 
 ## Verification Before Rollout
 
@@ -458,32 +614,62 @@ and starts the real gateway against the restored copy.
 5. If the database is suspect, restore the WAL-consistent backup. A token rotated after that backup may be superseded and require login again.
 6. Never repair Pending rows by manually copying tokens, email, or revocation values.
 
-### Proxy-mode rollout and rollback ports
+### Proxy-mode rollout and old-binary rollback
 
-Keep these listeners unambiguous:
+The proxy listeners never change meaning:
 
-- proxy gateway: `127.0.0.1:7780`, with
+- Acorn nginx public TLS: `:443`;
+- Acorn frps remote listener: `127.0.0.1:18081`;
+- Axiom gateway: `127.0.0.1:7780`, with
   `UPSTREAM_URL=http://127.0.0.1:4096`;
-- adapter gateway: `127.0.0.1:3000`, with `UPSTREAM_URL` empty;
-- retained node nginx adapter: `127.0.0.1:7781`, using `/auth/check` on `3000`
-  and proxying allowed traffic to `4096`;
 - OpenCode: `127.0.0.1:4096` only.
 
-Never run the proxy and adapter gateway simultaneously against the same SQLite
-database. To switch adapter -> proxy:
+For hardened rollout, keep public traffic maintenance-denied, start the new
+gateway, and set the candidate nginx server explicitly to:
 
-1. Enable an Acorn maintenance deny (`503`) so no request can bypass an
-   incomplete switch.
-2. Stop gateway `3000` and wait for exit/SQLite release.
-3. Start gateway `7780`; locally verify health, anonymous redirect, denied
-   `403`, HTTP/SSE/WebSocket, header stripping, and unreachable-upstream `502`.
-4. Change the single FRP target from node nginx `7781` to gateway `7780`.
-5. Verify through the public origin, then remove the maintenance deny.
+```nginx
+underscores_in_headers on;
+ignore_invalid_headers on;
+```
 
-To roll back, enable maintenance deny, stop `7780`, start adapter gateway
-`3000`, verify node nginx `7781`, switch FRP from `7780` to `7781`, and only
-then remove the deny. In-flight uploads, SSE, and WebSockets close during a
-switch. Never point FRP at OpenCode `4096` as a shortcut.
+Run `nginx -t`, reload, verify the exact `18081 -> 7780 -> 4096` path, and test
+HTTP, streaming upload, SSE, WebSocket, U/R saturation, trusted XFF, and the
+underscore `400` before removing maintenance.
+
+An old proxy binary cannot safely receive underscore aliases. Rollback is
+therefore ordered and fail-closed:
+
+1. Enable maintenance deny while retaining a loopback/operator path through
+   the candidate server block. Do not use a local `return 503` path that skips
+   proxy header parsing.
+2. Apply `examples/nginx-proxy-rollback.conf`, which pins:
+
+   ```nginx
+   underscores_in_headers off;
+   ignore_invalid_headers on;
+   ```
+
+3. Run `nginx -t`. On failure, remain denied and stop.
+4. Reload nginx under maintenance and verify reload success.
+5. While the hardened gateway still serves `7780`, send a raw anonymous,
+   non-owned request through that exact candidate server path:
+
+   ```bash
+   printf 'GET /rollback-alias-probe HTTP/1.1\r\nHost: app.example.com\r\nX_Auth_Mini_User_Id: attacker\r\nConnection: close\r\n\r\n' \
+     | openssl s_client -quiet -connect 127.0.0.1:443 -servername app.example.com
+   ```
+
+   Require the normal anonymous `302`, zero OpenCode hit, and not the hardened
+   underscore `400`. This proves nginx discarded the alias.
+6. If the probe is missing or inconclusive, remain denied. Otherwise stop the
+   hardened gateway, wait for process/SQLite release, start the prior verified
+   binary on `127.0.0.1:7780`, and verify auth/cookies/HTTP/SSE/WebSocket.
+7. Keep `LimitNOFILE=4096`, canonical XFF overwrite, FRP `18081 -> 7780`, and
+   loopback OpenCode. Remove maintenance only after all checks pass.
+
+If the prior proxy fails, use the separately approved adapter rollback. Never
+point FRP at OpenCode `4096`. In-flight streams and tunnels close on switch; no
+database restore is required solely for this binary rollback.
 
 ## Security Notes
 
@@ -496,12 +682,14 @@ switch. Never point FRP at OpenCode `4096` as a shortcut.
 - In proxy mode, the gateway strips browser `Cookie`, `Authorization`,
   `Proxy-Authorization`, inbound `Forwarded`/`X-Forwarded-*`, spoofed
   `X-Auth-Mini-*`, fixed hop-by-hop fields, and every field nominated by
-  `Connection`. It injects only verified user ID/email.
+  `Connection`. It rejects underscore header names before auth and injects only
+  verified user ID/email.
 - The proxy preserves the external Host for application semantics but never
   uses it to select the upstream. `X-Forwarded-Proto` comes from
-  `GATEWAY_PUBLIC_BASE_URL`, `X-Forwarded-Host` from the accepted Host, and
-  `X-Forwarded-For` is only the direct gateway peer (often FRP/nginx, not the
-  browser).
+  `GATEWAY_PUBLIC_BASE_URL`, `X-Forwarded-Host` from the accepted Host, and one
+  canonical `X-Forwarded-For` from the direct peer by default. An explicitly
+  trusted immediate peer may supply exactly one strict bare IP. The value never
+  influences gateway auth, routing, DNS, TLS, or pooling.
 - Established WebSockets are authorized at handshake time. A later logout
   blocks new handshakes but does not terminate an already established tunnel.
 - Do not configure the protected app to rely on browser cookies or a generic

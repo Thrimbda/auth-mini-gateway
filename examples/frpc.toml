@@ -1,0 +1,18 @@
+# frpc v0.64.0+ on Axiom.
+serverAddr = "frp.example.com"
+serverPort = 7000
+
+auth.method = "token"
+auth.tokenSource.type = "file"
+auth.tokenSource.file.path = "/etc/frp/token"
+
+transport.tls.enable = true
+transport.tls.trustedCaFile = "/etc/frp/tls/ca.crt"
+transport.tls.serverName = "frp.example.com"
+
+[[proxies]]
+name = "auth-mini-gateway"
+type = "tcp"
+localIP = "127.0.0.1"
+localPort = 7780
+remotePort = 18081

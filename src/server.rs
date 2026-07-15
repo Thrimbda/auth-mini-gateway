@@ -1,8 +1,13 @@
 use std::convert::Infallible;
+use std::future::Future;
+use std::io;
 use std::net::SocketAddr;
 use std::panic::{catch_unwind, AssertUnwindSafe};
+use std::pin::Pin;
+#[cfg(debug_assertions)]
+use std::sync::atomic::{AtomicBool, Ordering as AtomicOrdering};
 use std::sync::Arc;
-use std::time::Duration as StdDuration;
+use std::time::{Duration as StdDuration, Instant as StdInstant};
 
 use bytes::Bytes;
 use chrono::{DateTime, Duration, TimeZone, Utc};
@@ -24,6 +29,7 @@ use crate::auth_mini::{
     AuthMini, AuthMiniClient, IdentityFetchOutcome, IdentityUnavailable, IndeterminateClass,
     RefreshError,
 };
+use crate::capacity::DownstreamLease;
 use crate::config::Config;
 use crate::cookies::{
     clear_cookie, read_signed_cookie, serialize_signed_cookie, LOGIN_STATE_COOKIE, SESSION_COOKIE,
@@ -32,15 +38,55 @@ use crate::db::{
     CasResult, GatewaySession, IdentityState, NewSession, ObservedVersion, PendingTokens,
     SessionLookup, Store, TouchResult,
 };
+use crate::exit::{ListenerErrnoClass, SanitizedExit};
 use crate::flight::{Acquire, FlightCoordinator, FlightLeader, FlightOutcome, RejectedReason};
 use crate::http::{is_safe_header_value, Request, Response};
 use crate::policy::{evaluate, Identity, PolicyDecision};
 use crate::proxy::{
-    empty_body, full_body, parse_websocket_request, GatewayBody, Proxy, ProxyError, ProxyIdentity,
+    derive_client_ip, empty_body, full_body, parse_websocket_request, CapacityClass, GatewayBody,
+    Proxy, ProxyError, ProxyIdentity,
 };
 use crate::return_target::{normalize_return_target, ReturnTargetMode};
+use crate::runtime_plan::{AUTH_BLOCKING_ADMISSION, AUTH_BLOCKING_WORKERS};
 
 const MAX_LOCAL_BODY: usize = 64 * 1024;
+#[cfg(debug_assertions)]
+const PROCESS_TEST_TERMINAL_ENV: &str = "AMG_TEST_FATAL_ACCEPT_WITH_UNFINISHABLE_RESOLVER";
+#[cfg(debug_assertions)]
+static PROCESS_TEST_RESOLVER_STARTED: AtomicBool = AtomicBool::new(false);
+
+#[cfg(debug_assertions)]
+struct ProcessTestUnfinishableResolver;
+
+#[cfg(debug_assertions)]
+struct ProcessTestResolverReleaseProbe;
+
+#[cfg(debug_assertions)]
+impl Drop for ProcessTestResolverReleaseProbe {
+    fn drop(&mut self) {
+        const RELEASE_MARKER: &[u8] = b"raw-unfinishable-resolver-release-marker\n";
+        // SAFETY: immutable static bytes are written only by this debug-only
+        // negative probe if the deliberately unfinishable resolver is released.
+        unsafe {
+            libc::write(
+                libc::STDERR_FILENO,
+                RELEASE_MARKER.as_ptr().cast(),
+                RELEASE_MARKER.len(),
+            );
+        }
+    }
+}
+
+#[cfg(debug_assertions)]
+impl crate::proxy::HostResolver for ProcessTestUnfinishableResolver {
+    fn resolve(&self, _domain: Box<str>, _port: u16) -> io::Result<Vec<SocketAddr>> {
+        let _release_probe = ProcessTestResolverReleaseProbe;
+        PROCESS_TEST_RESOLVER_STARTED.store(true, AtomicOrdering::Release);
+        loop {
+            std::thread::park();
+        }
+    }
+}
 const OWNED_PATHS: [&str; 6] = [
     "/healthz",
     "/login",
@@ -57,8 +103,22 @@ struct AppState {
     auth_mini: Arc<dyn AuthMini>,
     flights: Arc<FlightCoordinator>,
     executor: AuthExecutor,
+    login_builder: Arc<dyn LoginStateBuilder>,
+    before_auth_decision: Arc<dyn Fn() + Send + Sync>,
     proxy: Option<Proxy>,
     public_proto: String,
+}
+
+trait LoginStateBuilder: Send + Sync {
+    fn build(&self, return_to: &str, config: &Config, store: &Store) -> Result<Response, ()>;
+}
+
+struct StoreLoginStateBuilder;
+
+impl LoginStateBuilder for StoreLoginStateBuilder {
+    fn build(&self, return_to: &str, config: &Config, store: &Store) -> Result<Response, ()> {
+        create_login_response(return_to, config, store).map_err(|_| ())
+    }
 }
 
 #[derive(Clone)]
@@ -75,7 +135,7 @@ enum AuthExecutionError {
 
 impl AuthExecutor {
     fn new() -> Self {
-        Self::with_limits(64, 128)
+        Self::with_limits(AUTH_BLOCKING_WORKERS, AUTH_BLOCKING_ADMISSION)
     }
 
     fn with_limits(work: usize, admission: usize) -> Self {
@@ -106,12 +166,355 @@ impl AuthExecutor {
     }
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum RecoverableAcceptClass {
+    ResourceFd,
+    ResourceMemory,
+    Transient,
+}
+
+impl RecoverableAcceptClass {
+    const fn as_str(self) -> &'static str {
+        match self {
+            Self::ResourceFd => "resource_fd",
+            Self::ResourceMemory => "resource_memory",
+            Self::Transient => "transient",
+        }
+    }
+
+    const fn is_resource(self) -> bool {
+        matches!(self, Self::ResourceFd | Self::ResourceMemory)
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum AcceptErrorClass {
+    Recoverable(RecoverableAcceptClass),
+    Fatal(ListenerErrnoClass),
+}
+
+#[derive(Default)]
+struct AcceptBackoff {
+    class: Option<RecoverableAcceptClass>,
+    same_class_streak: usize,
+}
+
+impl AcceptBackoff {
+    fn next_delay(&mut self, class: RecoverableAcceptClass) -> StdDuration {
+        if self.class == Some(class) {
+            self.same_class_streak = self.same_class_streak.saturating_add(1);
+        } else {
+            self.class = Some(class);
+            self.same_class_streak = 1;
+        }
+        let milliseconds = if class.is_resource() {
+            const RESOURCE: [u64; 7] = [100, 200, 400, 800, 1_600, 3_200, 5_000];
+            RESOURCE[(self.same_class_streak - 1).min(RESOURCE.len() - 1)]
+        } else {
+            const TRANSIENT: [u64; 6] = [10, 20, 40, 80, 160, 250];
+            TRANSIENT[(self.same_class_streak - 1).min(TRANSIENT.len() - 1)]
+        };
+        StdDuration::from_millis(milliseconds)
+    }
+
+    fn reset(&mut self) {
+        self.class = None;
+        self.same_class_streak = 0;
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct AcceptFailureEvent {
+    failures: u64,
+    suppressed: u64,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct AcceptRecoveryEvent {
+    failures: u64,
+    suppressed: u64,
+    duration: StdDuration,
+}
+
+#[derive(Default)]
+struct AcceptFailureLogState {
+    failures: u64,
+    first_failure_at: Option<StdDuration>,
+    last_emission_at: Option<StdDuration>,
+    suppressed_since_last: u64,
+}
+
+impl AcceptFailureLogState {
+    fn failure(&mut self, now: StdDuration) -> Option<AcceptFailureEvent> {
+        self.failures = self.failures.saturating_add(1);
+        self.first_failure_at.get_or_insert(now);
+        let scheduled_power = matches!(self.failures, 1 | 2 | 4 | 8 | 16 | 32);
+        let periodic = self.failures > 32
+            && self
+                .last_emission_at
+                .is_none_or(|last| now.saturating_sub(last) >= StdDuration::from_secs(60));
+        if scheduled_power || periodic {
+            let event = AcceptFailureEvent {
+                failures: self.failures,
+                suppressed: self.suppressed_since_last,
+            };
+            self.suppressed_since_last = 0;
+            self.last_emission_at = Some(now);
+            Some(event)
+        } else {
+            self.suppressed_since_last = self.suppressed_since_last.saturating_add(1);
+            None
+        }
+    }
+
+    fn recovered(&mut self, now: StdDuration) -> Option<AcceptRecoveryEvent> {
+        if self.failures == 0 {
+            return None;
+        }
+        let event = AcceptRecoveryEvent {
+            failures: self.failures,
+            suppressed: self.suppressed_since_last,
+            duration: now.saturating_sub(self.first_failure_at.unwrap_or(now)),
+        };
+        *self = Self::default();
+        Some(event)
+    }
+
+    const fn summary(&self) -> (u64, u64) {
+        (self.failures, self.suppressed_since_last)
+    }
+}
+
+fn classify_accept_error(error: &io::Error) -> AcceptErrorClass {
+    #[cfg(target_os = "linux")]
+    if let Some(code) = error.raw_os_error() {
+        if [libc::EMFILE, libc::ENFILE].contains(&code) {
+            return AcceptErrorClass::Recoverable(RecoverableAcceptClass::ResourceFd);
+        }
+        if [libc::ENOBUFS, libc::ENOMEM].contains(&code) {
+            return AcceptErrorClass::Recoverable(RecoverableAcceptClass::ResourceMemory);
+        }
+        if [
+            libc::EINTR,
+            libc::ECONNABORTED,
+            libc::EAGAIN,
+            libc::EWOULDBLOCK,
+            libc::ENETDOWN,
+            libc::EPROTO,
+            libc::ENOPROTOOPT,
+            libc::EHOSTDOWN,
+            libc::ENONET,
+            libc::EHOSTUNREACH,
+            libc::EOPNOTSUPP,
+            libc::ENETUNREACH,
+            libc::EPERM,
+            libc::ENOSR,
+            libc::ESOCKTNOSUPPORT,
+            libc::EPROTONOSUPPORT,
+            libc::ETIMEDOUT,
+        ]
+        .contains(&code)
+        {
+            return AcceptErrorClass::Recoverable(RecoverableAcceptClass::Transient);
+        }
+        return AcceptErrorClass::Fatal(match code {
+            libc::EBADF => ListenerErrnoClass::BadFd,
+            libc::EFAULT => ListenerErrnoClass::Fault,
+            libc::EINVAL => ListenerErrnoClass::Invalid,
+            libc::ENOTSOCK => ListenerErrnoClass::NotSocket,
+            _ => ListenerErrnoClass::Unknown,
+        });
+    }
+
+    match error.kind() {
+        io::ErrorKind::Interrupted
+        | io::ErrorKind::ConnectionAborted
+        | io::ErrorKind::WouldBlock
+        | io::ErrorKind::TimedOut => {
+            AcceptErrorClass::Recoverable(RecoverableAcceptClass::Transient)
+        }
+        io::ErrorKind::OutOfMemory => {
+            AcceptErrorClass::Recoverable(RecoverableAcceptClass::ResourceMemory)
+        }
+        _ => AcceptErrorClass::Fatal(ListenerErrnoClass::Unknown),
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum AcceptLoopEvent {
+    Recoverable {
+        class: RecoverableAcceptClass,
+        delay: StdDuration,
+        failures: u64,
+        suppressed: u64,
+    },
+    Recovered(AcceptRecoveryEvent),
+}
+
+type BoxAcceptFuture<'a, T> =
+    Pin<Box<dyn Future<Output = io::Result<(T, SocketAddr)>> + Send + 'a>>;
+
+trait AcceptSource {
+    type Connection: Send + 'static;
+
+    fn accept(&self) -> BoxAcceptFuture<'_, Self::Connection>;
+}
+
+trait AcceptSleeper {
+    fn sleep(&self, delay: StdDuration) -> Pin<Box<dyn Future<Output = ()> + Send + '_>>;
+}
+
+trait AcceptClock {
+    fn elapsed(&self) -> StdDuration;
+}
+
+struct TcpAcceptSource {
+    listener: TcpListener,
+    #[cfg(debug_assertions)]
+    fatal_after_unfinishable_resolver: bool,
+    #[cfg(debug_assertions)]
+    accepted_once: AtomicBool,
+}
+
+impl AcceptSource for TcpAcceptSource {
+    type Connection = tokio::net::TcpStream;
+
+    fn accept(&self) -> BoxAcceptFuture<'_, Self::Connection> {
+        Box::pin(async move {
+            #[cfg(debug_assertions)]
+            if self.fatal_after_unfinishable_resolver
+                && self.accepted_once.load(AtomicOrdering::Acquire)
+            {
+                while !PROCESS_TEST_RESOLVER_STARTED.load(AtomicOrdering::Acquire) {
+                    tokio::task::yield_now().await;
+                }
+                return Err(io::Error::from_raw_os_error(libc::EBADF));
+            }
+
+            let result = self.listener.accept().await;
+            #[cfg(debug_assertions)]
+            if self.fatal_after_unfinishable_resolver && result.is_ok() {
+                self.accepted_once.store(true, AtomicOrdering::Release);
+            }
+            result
+        })
+    }
+}
+
+struct TokioAcceptSleeper;
+
+impl AcceptSleeper for TokioAcceptSleeper {
+    fn sleep(&self, delay: StdDuration) -> Pin<Box<dyn Future<Output = ()> + Send + '_>> {
+        Box::pin(tokio::time::sleep(delay))
+    }
+}
+
+struct MonotonicAcceptClock(StdInstant);
+
+impl MonotonicAcceptClock {
+    fn new() -> Self {
+        Self(StdInstant::now())
+    }
+}
+
+impl AcceptClock for MonotonicAcceptClock {
+    fn elapsed(&self) -> StdDuration {
+        self.0.elapsed()
+    }
+}
+
+async fn drive_accept_loop<S, L, C, E, A>(
+    downstream: Arc<Semaphore>,
+    source: &S,
+    sleeper: &L,
+    clock: &C,
+    mut event_sink: E,
+    mut accepted: A,
+) -> Result<(), SanitizedExit>
+where
+    S: AcceptSource,
+    L: AcceptSleeper,
+    C: AcceptClock,
+    E: FnMut(AcceptLoopEvent),
+    A: FnMut(S::Connection, SocketAddr, DownstreamLease),
+{
+    let mut backoff = AcceptBackoff::default();
+    let mut failure_log = AcceptFailureLogState::default();
+    loop {
+        let permit = Arc::clone(&downstream).acquire_owned().await.map_err(|_| {
+            SanitizedExit::RuntimeInvariant {
+                class: "downstream_semaphore_closed",
+            }
+        })?;
+        match source.accept().await {
+            Ok((connection, peer)) => {
+                if let Some(recovered) = failure_log.recovered(clock.elapsed()) {
+                    event_sink(AcceptLoopEvent::Recovered(recovered));
+                }
+                backoff.reset();
+                accepted(connection, peer, DownstreamLease::new(permit));
+            }
+            Err(error) => {
+                drop(permit);
+                match classify_accept_error(&error) {
+                    AcceptErrorClass::Recoverable(class) => {
+                        let delay = backoff.next_delay(class);
+                        if let Some(event) = failure_log.failure(clock.elapsed()) {
+                            event_sink(AcceptLoopEvent::Recoverable {
+                                class,
+                                delay,
+                                failures: event.failures,
+                                suppressed: event.suppressed,
+                            });
+                        }
+                        sleeper.sleep(delay).await;
+                    }
+                    AcceptErrorClass::Fatal(errno_class) => {
+                        let (failures, suppressed) = failure_log.summary();
+                        return Err(SanitizedExit::ListenerFatal {
+                            errno_class,
+                            errno_code: error.raw_os_error(),
+                            prior_recoverable_failures: failures,
+                            suppressed_failures: suppressed,
+                        });
+                    }
+                }
+            }
+        }
+    }
+}
+
+fn emit_accept_loop_event(event: AcceptLoopEvent) {
+    match event {
+        AcceptLoopEvent::Recoverable {
+            class,
+            delay,
+            failures,
+            suppressed,
+        } => tracing::warn!(
+            event = "accept_error",
+            class = class.as_str(),
+            backoff_ms = delay.as_millis() as u64,
+            failures,
+            suppressed_since_last = suppressed
+        ),
+        AcceptLoopEvent::Recovered(recovered) => tracing::info!(
+            event = "accept_recovered",
+            failures = recovered.failures,
+            suppressed_since_last = recovered.suppressed,
+            duration_ms = recovered.duration.as_millis() as u64
+        ),
+    }
+}
+
 pub async fn run_server(
     config: Config,
     auth_mini: Arc<AuthMiniClient>,
-) -> Result<(), Box<dyn std::error::Error>> {
+) -> Result<(), SanitizedExit> {
     let address = format!("{}:{}", config.host, config.port);
-    let listener = TcpListener::bind(address).await?;
+    let listener = TcpListener::bind(address)
+        .await
+        .map_err(|_| SanitizedExit::ListenerBindFailed)?;
     let auth_mini: Arc<dyn AuthMini> = auth_mini;
     run_server_with_listener(config, auth_mini, listener).await
 }
@@ -120,7 +523,7 @@ pub async fn run_server_with_listener(
     config: Config,
     auth_mini: Arc<dyn AuthMini>,
     listener: TcpListener,
-) -> Result<(), Box<dyn std::error::Error>> {
+) -> Result<(), SanitizedExit> {
     run_server_with_listener_and_roots(config, auth_mini, listener, None).await
 }
 
@@ -129,59 +532,175 @@ pub async fn run_server_with_listener_and_roots(
     auth_mini: Arc<dyn AuthMini>,
     listener: TcpListener,
     test_roots: Option<rustls::RootCertStore>,
-) -> Result<(), Box<dyn std::error::Error>> {
+) -> Result<(), SanitizedExit> {
+    config
+        .validate()
+        .map_err(|error| SanitizedExit::ConfigurationInvalid {
+            class: error.class(),
+        })?;
+    let max_active_upstreams = config.max_active_upstreams;
+    let max_blocking_resolvers = config.max_blocking_resolvers;
+    #[cfg(not(debug_assertions))]
     let proxy = match (config.upstream.clone(), test_roots) {
-        (Some(upstream), Some(roots)) => Some(Proxy::with_root_store(upstream, roots)),
-        (Some(upstream), None) => Some(Proxy::new(upstream)),
+        (Some(upstream), Some(roots)) => Some(Proxy::with_root_store(
+            upstream,
+            roots,
+            max_active_upstreams,
+            max_blocking_resolvers,
+        )),
+        (Some(upstream), None) => Some(Proxy::new(
+            upstream,
+            max_active_upstreams,
+            max_blocking_resolvers,
+        )),
         (None, _) => None,
     }
     .transpose()
-    .map_err(|_| "failed to initialize UPSTREAM_URL transport")?;
-    let public_proto = Url::parse(&config.public_base_url)?.scheme().to_string();
+    .map_err(|_| SanitizedExit::ProxyInitializeFailed)?;
+    #[cfg(debug_assertions)]
+    let proxy = if std::env::var_os(PROCESS_TEST_TERMINAL_ENV).is_some() {
+        PROCESS_TEST_RESOLVER_STARTED.store(false, AtomicOrdering::Release);
+        let upstream = config
+            .upstream
+            .clone()
+            .ok_or(SanitizedExit::ProxyInitializeFailed)?;
+        let roots = test_roots.unwrap_or_else(rustls::RootCertStore::empty);
+        Some(
+            Proxy::with_root_store_and_resolver(
+                upstream,
+                roots,
+                max_active_upstreams,
+                max_blocking_resolvers,
+                Arc::new(ProcessTestUnfinishableResolver),
+                Arc::new(crate::proxy::ResolverAccounting::default()),
+            )
+            .map_err(|_| SanitizedExit::ProxyInitializeFailed)?,
+        )
+    } else {
+        match (config.upstream.clone(), test_roots) {
+            (Some(upstream), Some(roots)) => Some(Proxy::with_root_store(
+                upstream,
+                roots,
+                max_active_upstreams,
+                max_blocking_resolvers,
+            )),
+            (Some(upstream), None) => Some(Proxy::new(
+                upstream,
+                max_active_upstreams,
+                max_blocking_resolvers,
+            )),
+            (None, _) => None,
+        }
+        .transpose()
+        .map_err(|_| SanitizedExit::ProxyInitializeFailed)?
+    };
+    serve_with_components(
+        config,
+        auth_mini,
+        listener,
+        proxy,
+        AuthExecutor::new(),
+        Arc::new(StoreLoginStateBuilder),
+        Arc::new(|| {}),
+    )
+    .await
+}
+
+async fn serve_with_components(
+    config: Config,
+    auth_mini: Arc<dyn AuthMini>,
+    listener: TcpListener,
+    proxy: Option<Proxy>,
+    executor: AuthExecutor,
+    login_builder: Arc<dyn LoginStateBuilder>,
+    before_auth_decision: Arc<dyn Fn() + Send + Sync>,
+) -> Result<(), SanitizedExit> {
+    let public_proto = Url::parse(&config.public_base_url)
+        .map_err(|_| SanitizedExit::PublicBaseInvalid)?
+        .scheme()
+        .to_string();
     tracing::info!(
         event = "server_start",
         mode = if proxy.is_some() { "proxy" } else { "adapter" }
     );
+    tracing::info!(
+        event = "capacity_start",
+        downstream_limit = config.max_downstream_connections,
+        active_upstream_limit = config.max_active_upstreams,
+        blocking_resolver_limit = config.max_blocking_resolvers,
+        effective_domain_resolvers = config
+            .max_active_upstreams
+            .min(config.max_blocking_resolvers)
+    );
+    let downstream = Arc::new(Semaphore::new(config.max_downstream_connections));
     let config = Arc::new(config);
     let state = AppState {
         store: Arc::new(Store::new(config.database_path.clone())),
         config,
         auth_mini,
         flights: Arc::new(FlightCoordinator::default()),
-        executor: AuthExecutor::new(),
+        executor,
+        login_builder,
+        before_auth_decision,
         proxy,
         public_proto,
     };
 
-    loop {
-        let (stream, peer) = listener.accept().await?;
-        let state = state.clone();
-        tokio::spawn(async move {
-            let service = service_fn(move |request| {
-                let state = state.clone();
-                async move { Ok::<_, Infallible>(handle_hyper_request(request, peer, state).await) }
-            });
-            let mut builder = http1::Builder::new();
-            builder
-                .keep_alive(true)
-                .max_headers(100)
-                .header_read_timeout(StdDuration::from_secs(10))
-                .timer(TokioTimer::new())
-                .ignore_invalid_headers(false);
-            let connection = builder
-                .serve_connection(TokioIo::new(stream), service)
-                .with_upgrades();
-            if connection.await.is_err() {
-                tracing::debug!(event = "downstream_connection", outcome = "closed");
-            }
+    let source = TcpAcceptSource {
+        listener,
+        #[cfg(debug_assertions)]
+        fatal_after_unfinishable_resolver: std::env::var_os(PROCESS_TEST_TERMINAL_ENV).is_some(),
+        #[cfg(debug_assertions)]
+        accepted_once: AtomicBool::new(false),
+    };
+    let sleeper = TokioAcceptSleeper;
+    let clock = MonotonicAcceptClock::new();
+    drive_accept_loop(
+        downstream,
+        &source,
+        &sleeper,
+        &clock,
+        emit_accept_loop_event,
+        move |stream, peer, lease| spawn_downstream_connection(stream, peer, state.clone(), lease),
+    )
+    .await
+}
+
+fn spawn_downstream_connection(
+    stream: tokio::net::TcpStream,
+    peer: SocketAddr,
+    state: AppState,
+    lease: DownstreamLease,
+) {
+    let service_lease = lease.clone();
+    tokio::spawn(async move {
+        let service = service_fn(move |request| {
+            let state = state.clone();
+            let lease = service_lease.clone();
+            async move { Ok::<_, Infallible>(handle_hyper_request(request, peer, state, lease).await) }
         });
-    }
+        let mut builder = http1::Builder::new();
+        builder
+            .keep_alive(true)
+            .max_headers(100)
+            .header_read_timeout(StdDuration::from_secs(10))
+            .timer(TokioTimer::new())
+            .ignore_invalid_headers(false);
+        let connection = builder
+            .serve_connection(TokioIo::new(stream), service)
+            .with_upgrades();
+        if connection.await.is_err() {
+            tracing::debug!(event = "downstream_connection", outcome = "closed");
+        }
+        drop(lease);
+    });
 }
 
 async fn handle_hyper_request(
     request: HyperRequest<Incoming>,
     peer: SocketAddr,
     state: AppState,
+    downstream_lease: DownstreamLease,
 ) -> HyperResponse<GatewayBody> {
     let path = request.uri().path().to_string();
     if OWNED_PATHS.contains(&path.as_str()) {
@@ -190,7 +709,7 @@ async fn handle_hyper_request(
     if state.proxy.is_none() {
         return handle_local_request(request, state, true).await;
     }
-    handle_proxy_fallback(request, peer, state).await
+    handle_proxy_fallback(request, peer, state, downstream_lease).await
 }
 
 async fn handle_local_request(
@@ -289,8 +808,16 @@ async fn handle_proxy_fallback(
     request: HyperRequest<Incoming>,
     peer: SocketAddr,
     state: AppState,
+    downstream_lease: DownstreamLease,
 ) -> HyperResponse<GatewayBody> {
     let body_bearing = request_has_body(&request);
+    if request
+        .headers()
+        .keys()
+        .any(|name| name.as_str().as_bytes().contains(&b'_'))
+    {
+        return generated_response(400, "Bad request", true, None);
+    }
     let path_and_query = match classify_fallback_target(&request) {
         Ok(value) => value,
         Err((status, body)) => return generated_response(status, body, true, None),
@@ -308,6 +835,14 @@ async fn handle_proxy_fallback(
     if request.headers().get_all(HOST).iter().count() != 1 {
         return generated_response(400, "Bad request", true, None);
     }
+    let client_ip = match derive_client_ip(
+        peer.ip(),
+        request.headers(),
+        &state.config.trusted_proxy_cidrs,
+    ) {
+        Ok(client_ip) => client_ip,
+        Err(_) => return generated_response(400, "Bad request", true, None),
+    };
     let websocket = match parse_websocket_request(&request) {
         Ok(websocket) => websocket,
         Err(_) => return generated_response(400, "Bad request", true, None),
@@ -317,57 +852,14 @@ async fn handle_proxy_fallback(
         .get(COOKIE)
         .and_then(|value| value.to_str().ok())
         .map(ToOwned::to_owned);
-    let config = Arc::clone(&state.config);
-    let store = Arc::clone(&state.store);
-    let auth_mini = Arc::clone(&state.auth_mini);
-    let flights = Arc::clone(&state.flights);
-    let decision = match state
-        .executor
-        .run(move || {
-            auth_decision(
-                cookie.as_deref(),
-                &config,
-                &store,
-                auth_mini.as_ref(),
-                &flights,
-            )
-        })
-        .await
-    {
-        Ok(decision) => decision,
-        Err(AuthExecutionError::Overloaded) => return auth_unavailable_hyper(body_bearing, None),
-        Err(AuthExecutionError::Internal) => {
-            return generated_response(500, "Internal server error", body_bearing, None)
-        }
+    let auth_result = match run_proxy_auth_operation(&state, cookie, path_and_query.clone()).await {
+        Ok(result) => result,
+        Err(error) => return proxy_auth_execution_error_response(error, body_bearing),
     };
 
-    let (identity, renewal) = match decision {
-        AuthDecision::Allow {
-            identity,
-            session_renewal,
-        } => (identity, session_renewal),
-        AuthDecision::Unauthenticated { clear_session } => {
-            let config = Arc::clone(&state.config);
-            let store = Arc::clone(&state.store);
-            let return_to = path_and_query.clone();
-            let login = state
-                .executor
-                .run(move || create_login_response(&return_to, &config, &store).map_err(|_| ()))
-                .await;
-            return match login {
-                Ok(Ok(response)) => {
-                    local_into_hyper(response.prepend_cookie(clear_session), body_bearing)
-                }
-                Ok(Err(_)) | Err(_) => generated_response(
-                    500,
-                    "Internal server error",
-                    body_bearing,
-                    Some(clear_session),
-                ),
-            };
-        }
-        AuthDecision::Forbidden => return generated_response(403, "Forbidden", body_bearing, None),
-        AuthDecision::Unavailable => return auth_unavailable_hyper(body_bearing, None),
+    let (identity, renewal) = match proxy_auth_result_outcome(auth_result, body_bearing) {
+        ProxyAuthOutcome::Allowed(identity, renewal) => (identity, renewal),
+        ProxyAuthOutcome::Response(response) => return response,
     };
 
     let proxy = state.proxy.as_ref().expect("proxy mode");
@@ -375,7 +867,7 @@ async fn handle_proxy_fallback(
         .forward(
             request,
             &path_and_query,
-            peer,
+            client_ip,
             &state.public_proto,
             ProxyIdentity {
                 user_id: identity.user_id,
@@ -384,6 +876,7 @@ async fn handle_proxy_fallback(
             renewal.clone(),
             body_bearing,
             websocket,
+            downstream_lease,
         )
         .await;
     match result {
@@ -395,7 +888,104 @@ async fn handle_proxy_fallback(
         Err(ProxyError::Internal) => {
             generated_response(500, "Internal server error", body_bearing, renewal)
         }
+        Err(ProxyError::Capacity(class)) => {
+            tracing::info!(
+                event = "proxy_capacity",
+                class = match class {
+                    CapacityClass::ActiveUpstream => "active_upstream",
+                    CapacityClass::BlockingResolver => "blocking_resolver",
+                },
+                outcome = "saturated"
+            );
+            service_capacity_hyper(body_bearing, renewal)
+        }
     }
+}
+
+fn proxy_auth_execution_error_response(
+    error: AuthExecutionError,
+    body_bearing: bool,
+) -> HyperResponse<GatewayBody> {
+    match error {
+        AuthExecutionError::Overloaded => auth_unavailable_hyper(body_bearing, None),
+        AuthExecutionError::Internal => {
+            generated_response(500, "Internal server error", body_bearing, None)
+        }
+    }
+}
+
+enum ProxyAuthOutcome {
+    Allowed(VerifiedIdentity, Option<String>),
+    Response(HyperResponse<GatewayBody>),
+}
+
+fn proxy_auth_result_outcome(auth_result: ProxyAuthResult, body_bearing: bool) -> ProxyAuthOutcome {
+    match auth_result {
+        ProxyAuthResult::Decision(AuthDecision::Allow {
+            identity,
+            session_renewal,
+        }) => ProxyAuthOutcome::Allowed(identity, session_renewal),
+        ProxyAuthResult::Decision(AuthDecision::Forbidden) => {
+            ProxyAuthOutcome::Response(generated_response(403, "Forbidden", body_bearing, None))
+        }
+        ProxyAuthResult::Decision(AuthDecision::Unavailable) => {
+            ProxyAuthOutcome::Response(auth_unavailable_hyper(body_bearing, None))
+        }
+        ProxyAuthResult::Decision(AuthDecision::Unauthenticated { .. }) => {
+            ProxyAuthOutcome::Response(generated_response(
+                500,
+                "Internal server error",
+                body_bearing,
+                None,
+            ))
+        }
+        ProxyAuthResult::LoginReady {
+            clear_session,
+            login_response,
+        } => ProxyAuthOutcome::Response(local_into_hyper(
+            login_response.prepend_cookie(clear_session),
+            body_bearing,
+        )),
+        ProxyAuthResult::LoginInternal { clear_session } => {
+            ProxyAuthOutcome::Response(generated_response(
+                500,
+                "Internal server error",
+                body_bearing,
+                Some(clear_session),
+            ))
+        }
+    }
+}
+
+async fn run_proxy_auth_operation(
+    state: &AppState,
+    cookie: Option<String>,
+    return_to: String,
+) -> Result<ProxyAuthResult, AuthExecutionError> {
+    let config = Arc::clone(&state.config);
+    let store = Arc::clone(&state.store);
+    let auth_mini = Arc::clone(&state.auth_mini);
+    let flights = Arc::clone(&state.flights);
+    let login_builder = Arc::clone(&state.login_builder);
+    let before_auth_decision = Arc::clone(&state.before_auth_decision);
+    state
+        .executor
+        .run(move || {
+            execute_proxy_auth(
+                || {
+                    before_auth_decision();
+                    auth_decision(
+                        cookie.as_deref(),
+                        &config,
+                        &store,
+                        auth_mini.as_ref(),
+                        &flights,
+                    )
+                },
+                || login_builder.build(&return_to, &config, &store),
+            )
+        })
+        .await
 }
 
 fn classify_fallback_target(
@@ -498,6 +1088,17 @@ fn auth_unavailable_hyper(close: bool, cookie: Option<String>) -> HyperResponse<
     response
         .headers_mut()
         .insert(http::header::RETRY_AFTER, HeaderValue::from_static("5"));
+    response
+}
+
+fn service_capacity_hyper(close: bool, renewal: Option<String>) -> HyperResponse<GatewayBody> {
+    let mut response = generated_response(503, "Service temporarily unavailable", close, renewal);
+    response
+        .headers_mut()
+        .insert(http::header::RETRY_AFTER, HeaderValue::from_static("5"));
+    response
+        .headers_mut()
+        .insert(CONTENT_LENGTH, HeaderValue::from_static("31"));
     response
 }
 
@@ -684,6 +1285,37 @@ enum AuthDecision {
     },
     Forbidden,
     Unavailable,
+}
+
+enum ProxyAuthResult {
+    Decision(AuthDecision),
+    LoginReady {
+        clear_session: String,
+        login_response: Response,
+    },
+    LoginInternal {
+        clear_session: String,
+    },
+}
+
+fn execute_proxy_auth<D, L, E>(decide: D, build_login: L) -> ProxyAuthResult
+where
+    D: FnOnce() -> AuthDecision,
+    L: FnOnce() -> Result<Response, E>,
+{
+    // Deliberately outside the unwind catcher: a panic before the shared
+    // decision exists has no trustworthy cookie-cleanup metadata.
+    let decision = decide();
+    let AuthDecision::Unauthenticated { clear_session } = decision else {
+        return ProxyAuthResult::Decision(decision);
+    };
+    match catch_unwind(AssertUnwindSafe(build_login)) {
+        Ok(Ok(login_response)) => ProxyAuthResult::LoginReady {
+            clear_session,
+            login_response,
+        },
+        Ok(Err(_)) | Err(_) => ProxyAuthResult::LoginInternal { clear_session },
+    }
 }
 
 fn handle_auth_check(
@@ -1238,12 +1870,13 @@ mod tests {
     use std::io::{Read as _, Write as _};
     use std::net::TcpListener;
     use std::path::PathBuf;
-    use std::sync::atomic::{AtomicUsize, Ordering};
-    use std::sync::{Arc, Barrier, Mutex};
+    use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
+    use std::sync::{Arc, Barrier, Condvar, Mutex};
     use std::thread;
 
     use chrono::TimeZone;
     use tempfile::tempdir;
+    use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
 
     use crate::auth_mini::{
         AuthMiniClient, AuthMiniOperationError, IdentityUnavailable, MeResponse, RefreshRejected,
@@ -1251,9 +1884,122 @@ mod tests {
     };
     use crate::config::SameSite;
     use crate::jwt::{Jwks, VerifiedAccessToken};
+    use crate::runtime_plan::RuntimePlan;
     use crate::util::ManualClock;
 
     use super::*;
+
+    struct ScriptedAcceptSource {
+        results: Mutex<VecDeque<io::Result<(usize, SocketAddr)>>>,
+    }
+
+    impl AcceptSource for ScriptedAcceptSource {
+        type Connection = usize;
+
+        fn accept(&self) -> BoxAcceptFuture<'_, Self::Connection> {
+            let result = self
+                .results
+                .lock()
+                .expect("scripted accepts")
+                .pop_front()
+                .expect("scripted accept exhausted");
+            Box::pin(async move { result })
+        }
+    }
+
+    struct ManualAcceptClock {
+        millis: AtomicU64,
+    }
+
+    impl AcceptClock for ManualAcceptClock {
+        fn elapsed(&self) -> StdDuration {
+            StdDuration::from_millis(self.millis.load(Ordering::Acquire))
+        }
+    }
+
+    struct RecordingAcceptSleeper {
+        clock: Arc<ManualAcceptClock>,
+        downstream: Arc<Semaphore>,
+        delays: Mutex<Vec<StdDuration>>,
+        available_during_sleep: Mutex<Vec<usize>>,
+    }
+
+    #[derive(Clone, Copy)]
+    enum TestLoginBehavior {
+        Success,
+        Error,
+        Panic,
+    }
+
+    struct ObservingLoginBuilder {
+        behavior: TestLoginBehavior,
+        calls: Arc<AtomicUsize>,
+        observed_admission_available: Arc<AtomicUsize>,
+        admission: Arc<Semaphore>,
+    }
+
+    struct BlockingTestResolver {
+        address: SocketAddr,
+        submissions: Arc<AtomicUsize>,
+        started: Arc<AtomicBool>,
+        gate: Arc<(Mutex<bool>, Condvar)>,
+    }
+
+    struct CountingTestResolver {
+        address: SocketAddr,
+        submissions: Arc<AtomicUsize>,
+    }
+
+    impl crate::proxy::HostResolver for CountingTestResolver {
+        fn resolve(&self, _domain: Box<str>, _port: u16) -> io::Result<Vec<SocketAddr>> {
+            self.submissions.fetch_add(1, Ordering::SeqCst);
+            Ok(vec![self.address])
+        }
+    }
+
+    impl crate::proxy::HostResolver for BlockingTestResolver {
+        fn resolve(&self, _domain: Box<str>, _port: u16) -> io::Result<Vec<SocketAddr>> {
+            self.submissions.fetch_add(1, Ordering::SeqCst);
+            self.started.store(true, Ordering::Release);
+            let (lock, condition) = &*self.gate;
+            let mut released = lock.lock().expect("resolver gate");
+            while !*released {
+                released = condition.wait(released).expect("resolver wait");
+            }
+            Ok(vec![self.address])
+        }
+    }
+
+    impl LoginStateBuilder for ObservingLoginBuilder {
+        fn build(&self, return_to: &str, config: &Config, store: &Store) -> Result<Response, ()> {
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            self.observed_admission_available
+                .store(self.admission.available_permits(), Ordering::SeqCst);
+            match self.behavior {
+                TestLoginBehavior::Success => {
+                    create_login_response(return_to, config, store).map_err(|_| ())
+                }
+                TestLoginBehavior::Error => Err(()),
+                TestLoginBehavior::Panic => {
+                    std::panic::panic_any("post-unauth-login-payload-marker")
+                }
+            }
+        }
+    }
+
+    impl AcceptSleeper for RecordingAcceptSleeper {
+        fn sleep(&self, delay: StdDuration) -> Pin<Box<dyn Future<Output = ()> + Send + '_>> {
+            self.delays.lock().expect("delays").push(delay);
+            self.available_during_sleep
+                .lock()
+                .expect("sleep permits")
+                .push(self.downstream.available_permits());
+            self.clock
+                .millis
+                .fetch_add(delay.as_millis() as u64, Ordering::AcqRel);
+            Box::pin(async {})
+        }
+    }
 
     #[test]
     fn normalizes_safe_return_targets() {
@@ -1293,6 +2039,1225 @@ mod tests {
         assert!(login_url.starts_with("http://localhost:7777/web/#/login?"));
         assert!(login_url.contains("redirect_uri=http%3A%2F%2Flocalhost%3A8080%2Fauth%2Fcallback"));
         assert!(login_url.contains("state=state-1"));
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn linux_accept_errors_have_exact_recoverable_and_fatal_classes() {
+        for (errno, expected) in [
+            (
+                libc::EMFILE,
+                AcceptErrorClass::Recoverable(RecoverableAcceptClass::ResourceFd),
+            ),
+            (
+                libc::ENFILE,
+                AcceptErrorClass::Recoverable(RecoverableAcceptClass::ResourceFd),
+            ),
+            (
+                libc::ENOMEM,
+                AcceptErrorClass::Recoverable(RecoverableAcceptClass::ResourceMemory),
+            ),
+            (
+                libc::ECONNABORTED,
+                AcceptErrorClass::Recoverable(RecoverableAcceptClass::Transient),
+            ),
+            (
+                libc::ENETUNREACH,
+                AcceptErrorClass::Recoverable(RecoverableAcceptClass::Transient),
+            ),
+            (
+                libc::EBADF,
+                AcceptErrorClass::Fatal(ListenerErrnoClass::BadFd),
+            ),
+            (
+                libc::EFAULT,
+                AcceptErrorClass::Fatal(ListenerErrnoClass::Fault),
+            ),
+            (
+                libc::EINVAL,
+                AcceptErrorClass::Fatal(ListenerErrnoClass::Invalid),
+            ),
+            (
+                libc::ENOTSOCK,
+                AcceptErrorClass::Fatal(ListenerErrnoClass::NotSocket),
+            ),
+            (
+                1_000_000,
+                AcceptErrorClass::Fatal(ListenerErrnoClass::Unknown),
+            ),
+        ] {
+            assert_eq!(
+                classify_accept_error(&io::Error::from_raw_os_error(errno)),
+                expected
+            );
+        }
+    }
+
+    #[test]
+    fn accept_backoff_is_bounded_class_local_and_success_resettable() {
+        let mut backoff = AcceptBackoff::default();
+        let transient: Vec<_> = (0..8)
+            .map(|_| {
+                backoff
+                    .next_delay(RecoverableAcceptClass::Transient)
+                    .as_millis()
+            })
+            .collect();
+        assert_eq!(transient, [10, 20, 40, 80, 160, 250, 250, 250]);
+        assert_eq!(
+            backoff
+                .next_delay(RecoverableAcceptClass::ResourceFd)
+                .as_millis(),
+            100
+        );
+        let resource_tail: Vec<_> = (0..8)
+            .map(|_| {
+                backoff
+                    .next_delay(RecoverableAcceptClass::ResourceFd)
+                    .as_millis()
+            })
+            .collect();
+        assert_eq!(
+            resource_tail,
+            [200, 400, 800, 1_600, 3_200, 5_000, 5_000, 5_000]
+        );
+        assert_eq!(
+            backoff
+                .next_delay(RecoverableAcceptClass::ResourceMemory)
+                .as_millis(),
+            100
+        );
+        backoff.reset();
+        assert_eq!(
+            backoff
+                .next_delay(RecoverableAcceptClass::Transient)
+                .as_millis(),
+            10
+        );
+    }
+
+    #[test]
+    fn accept_logging_is_global_across_classes_and_rate_limited() {
+        let mut state = AcceptFailureLogState::default();
+        let mut emitted = Vec::new();
+        for index in 0..100u64 {
+            if let Some(event) = state.failure(StdDuration::from_secs(index)) {
+                emitted.push((event.failures, event.suppressed));
+            }
+        }
+        assert_eq!(
+            emitted.iter().map(|event| event.0).collect::<Vec<_>>(),
+            [1, 2, 4, 8, 16, 32, 92]
+        );
+        assert_eq!(emitted[3], (8, 3));
+        let recovered = state
+            .recovered(StdDuration::from_secs(100))
+            .expect("recovery summary");
+        assert_eq!(recovered.failures, 100);
+        assert_eq!(recovered.suppressed, 8);
+        assert_eq!(recovered.duration, StdDuration::from_secs(100));
+        assert_eq!(state.summary(), (0, 0));
+        assert_eq!(
+            state
+                .failure(StdDuration::from_secs(101))
+                .expect("fresh first event")
+                .failures,
+            1
+        );
+    }
+
+    #[tokio::test]
+    async fn injected_accept_loop_retries_recovers_resets_and_fails_sanitized() {
+        let peer = "127.0.0.1:12345".parse().expect("peer");
+        let mut script = VecDeque::new();
+        for index in 0..40 {
+            let errno = if index % 2 == 0 {
+                libc::ECONNABORTED
+            } else {
+                libc::EMFILE
+            };
+            script.push_back(Err(io::Error::from_raw_os_error(errno)));
+        }
+        script.push_back(Ok((7, peer)));
+        script.push_back(Err(io::Error::from_raw_os_error(libc::EINTR)));
+        script.push_back(Err(io::Error::from_raw_os_error(libc::EBADF)));
+        let source = ScriptedAcceptSource {
+            results: Mutex::new(script),
+        };
+        let downstream = Arc::new(Semaphore::new(1));
+        let clock = Arc::new(ManualAcceptClock {
+            millis: AtomicU64::new(0),
+        });
+        let sleeper = RecordingAcceptSleeper {
+            clock: Arc::clone(&clock),
+            downstream: Arc::clone(&downstream),
+            delays: Mutex::new(Vec::new()),
+            available_during_sleep: Mutex::new(Vec::new()),
+        };
+        let events = Arc::new(Mutex::new(Vec::new()));
+        let event_capture = Arc::clone(&events);
+        let accepted = Arc::new(Mutex::new(Vec::new()));
+        let accepted_capture = Arc::clone(&accepted);
+        let result = drive_accept_loop(
+            Arc::clone(&downstream),
+            &source,
+            &sleeper,
+            clock.as_ref(),
+            move |event| event_capture.lock().expect("events").push(event),
+            move |connection, accepted_peer, lease| {
+                accepted_capture
+                    .lock()
+                    .expect("accepted")
+                    .push((connection, accepted_peer));
+                drop(lease);
+            },
+        )
+        .await;
+        assert_eq!(
+            result,
+            Err(SanitizedExit::ListenerFatal {
+                errno_class: ListenerErrnoClass::BadFd,
+                errno_code: Some(libc::EBADF),
+                prior_recoverable_failures: 1,
+                suppressed_failures: 0,
+            })
+        );
+        assert_eq!(*accepted.lock().expect("accepted result"), [(7, peer)]);
+        assert_eq!(downstream.available_permits(), 1);
+        let delays = sleeper.delays.lock().expect("recorded delays");
+        assert_eq!(delays.len(), 41);
+        for (index, delay) in delays[..40].iter().enumerate() {
+            assert_eq!(delay.as_millis(), if index % 2 == 0 { 10 } else { 100 });
+        }
+        assert_eq!(delays[40], StdDuration::from_millis(10));
+        assert!(sleeper
+            .available_during_sleep
+            .lock()
+            .expect("sleep reservations")
+            .iter()
+            .all(|available| *available == 1));
+
+        let events = events.lock().expect("captured events");
+        let failures: Vec<_> = events
+            .iter()
+            .filter_map(|event| match event {
+                AcceptLoopEvent::Recoverable { failures, .. } => Some(*failures),
+                AcceptLoopEvent::Recovered(_) => None,
+            })
+            .collect();
+        assert_eq!(failures, [1, 2, 4, 8, 16, 32, 1]);
+        assert_eq!(
+            events
+                .iter()
+                .filter(|event| matches!(event, AcceptLoopEvent::Recovered(_)))
+                .count(),
+            1
+        );
+        let recovered = events
+            .iter()
+            .find_map(|event| match event {
+                AcceptLoopEvent::Recovered(event) => Some(*event),
+                _ => None,
+            })
+            .expect("recovery event");
+        assert_eq!(recovered.failures, 40);
+        assert_eq!(recovered.suppressed, 8);
+    }
+
+    #[test]
+    fn proxy_auth_phase_maps_login_errors_and_panics_without_catching_decision_panics() {
+        crate::exit::install_sanitized_panic_hook();
+        let clear = "amg_session=; Max-Age=0".to_string();
+        let ready = execute_proxy_auth(
+            || AuthDecision::Unauthenticated {
+                clear_session: clear.clone(),
+            },
+            || Ok::<_, ()>(Response::redirect("/login")),
+        );
+        assert!(matches!(
+            ready,
+            ProxyAuthResult::LoginReady { clear_session, .. } if clear_session == clear
+        ));
+
+        let failed = execute_proxy_auth(
+            || AuthDecision::Unauthenticated {
+                clear_session: clear.clone(),
+            },
+            || Err::<Response, _>("database failure marker"),
+        );
+        assert!(matches!(
+            failed,
+            ProxyAuthResult::LoginInternal { clear_session } if clear_session == clear
+        ));
+
+        let panicked = execute_proxy_auth(
+            || AuthDecision::Unauthenticated {
+                clear_session: clear.clone(),
+            },
+            || -> Result<Response, ()> { panic!("post-decision marker") },
+        );
+        assert!(matches!(
+            panicked,
+            ProxyAuthResult::LoginInternal { clear_session } if clear_session == clear
+        ));
+
+        let pre_decision = catch_unwind(AssertUnwindSafe(|| {
+            execute_proxy_auth(
+                || -> AuthDecision { panic!("pre-decision marker") },
+                || Ok::<_, ()>(Response::empty(204)),
+            )
+        }));
+        assert!(pre_decision.is_err());
+    }
+
+    #[tokio::test]
+    async fn service_capacity_response_is_exact_and_cookie_optional() {
+        let response = service_capacity_hyper(true, None);
+        assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(
+            response.headers()[CONTENT_TYPE],
+            "text/plain; charset=utf-8"
+        );
+        assert_eq!(response.headers()[http::header::CACHE_CONTROL], "no-store");
+        assert_eq!(response.headers()[http::header::RETRY_AFTER], "5");
+        assert_eq!(response.headers()[CONTENT_LENGTH], "31");
+        assert_eq!(response.headers()[CONNECTION], "close");
+        assert!(!response.headers().contains_key(SET_COOKIE));
+        let body = response
+            .into_body()
+            .collect()
+            .await
+            .expect("capacity body")
+            .to_bytes();
+        assert_eq!(body, Bytes::from_static(b"Service temporarily unavailable"));
+
+        let renewed = service_capacity_hyper(false, Some("amg_session=renewed".to_string()));
+        assert_eq!(renewed.headers().get_all(SET_COOKIE).iter().count(), 1);
+        assert!(!renewed.headers().contains_key(CONNECTION));
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn raw_resolver_saturation_is_immediate_no_wait_and_control_plane_safe() {
+        let upstream_listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("resolver upstream bind");
+        let upstream_address = upstream_listener.local_addr().expect("upstream address");
+        let upstream_hits = Arc::new(AtomicUsize::new(0));
+        let task_hits = Arc::clone(&upstream_hits);
+        let upstream_task = tokio::spawn(async move {
+            if let Ok((mut stream, _)) = upstream_listener.accept().await {
+                let mut head = Vec::new();
+                let mut byte = [0u8; 1];
+                while !head.ends_with(b"\r\n\r\n") {
+                    if stream.read_exact(&mut byte).await.is_err() {
+                        return;
+                    }
+                    head.push(byte[0]);
+                }
+                task_hits.fetch_add(1, Ordering::SeqCst);
+                let _ = stream
+                    .write_all(
+                        b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\nok",
+                    )
+                    .await;
+            }
+        });
+
+        let dir = tempdir().expect("resolver gateway tempdir");
+        let database = dir.path().join("gateway.sqlite");
+        Store::initialize(&database).expect("resolver gateway store");
+        let mut config = test_config();
+        config.database_path = database.clone();
+        config.port = 0;
+        config.public_base_url = "http://public.example".to_string();
+        config.upstream = crate::config::parse_upstream_url(Some(&format!(
+            "http://blocked-resolver.example:{}/base",
+            upstream_address.port()
+        )))
+        .expect("domain upstream URL");
+        config.max_downstream_connections = 18;
+        config.max_active_upstreams = 2;
+        config.max_blocking_resolvers = 1;
+        config.allow_user_ids.insert("resolver-user".to_string());
+        config.validate().expect("resolver test config");
+        let store = Store::new(database);
+        let session = store
+            .create_session(NewSession {
+                auth_session_id: "resolver-auth-session".to_string(),
+                access_token: "resolver-access".to_string(),
+                refresh_token: "resolver-refresh".to_string(),
+                user_id: "resolver-user".to_string(),
+                email: None,
+                amr: vec!["fixture".to_string()],
+                access_expires_at: Utc::now() + Duration::hours(2),
+                idle_ttl_seconds: config.session_ttl_seconds,
+                absolute_ttl_seconds: config.session_absolute_ttl_seconds,
+            })
+            .expect("resolver session");
+        let cookie = crate::cookies::sign_value(&session.id, &config.cookie_secret);
+
+        let submissions = Arc::new(AtomicUsize::new(0));
+        let resolver_started = Arc::new(AtomicBool::new(false));
+        let resolver_gate = Arc::new((Mutex::new(false), Condvar::new()));
+        let accounting = Arc::new(crate::proxy::ResolverAccounting::default());
+        let resolver = Arc::new(BlockingTestResolver {
+            address: upstream_address,
+            submissions: Arc::clone(&submissions),
+            started: Arc::clone(&resolver_started),
+            gate: Arc::clone(&resolver_gate),
+        });
+        let proxy = Proxy::with_root_store_and_resolver(
+            config.upstream.clone().expect("upstream"),
+            rustls::RootCertStore::empty(),
+            2,
+            1,
+            resolver,
+            Arc::clone(&accounting),
+        )
+        .expect("resolver proxy");
+        let gateway_listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("resolver gateway bind");
+        let gateway_address = gateway_listener.local_addr().expect("gateway address");
+        let gateway_task = tokio::spawn(serve_with_components(
+            config,
+            Arc::new(MockAuthMini::new(
+                Vec::new(),
+                Vec::new(),
+                "unused-user".to_string(),
+                "unused-session".to_string(),
+            )),
+            gateway_listener,
+            Some(proxy),
+            AuthExecutor::new(),
+            Arc::new(StoreLoginStateBuilder),
+            Arc::new(|| {}),
+        ));
+
+        let mut first = tokio::net::TcpStream::connect(gateway_address)
+            .await
+            .expect("first resolver request");
+        first
+            .write_all(
+                format!(
+                    "GET /first HTTP/1.1\r\nHost: public.example\r\nCookie: amg_session={cookie}\r\nConnection: close\r\n\r\n"
+                )
+                .as_bytes(),
+            )
+            .await
+            .expect("first resolver head");
+        tokio::time::timeout(StdDuration::from_secs(5), async {
+            while !resolver_started.load(Ordering::Acquire) {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("first resolver started");
+        assert_eq!(submissions.load(Ordering::SeqCst), 1);
+        let snapshot = accounting.snapshot();
+        assert_eq!(snapshot.held_r, 1);
+        assert_eq!(snapshot.submitted_unobserved, 1);
+        assert_eq!(snapshot.request_owned, 1);
+        assert_eq!(snapshot.cleanup_owned, 0);
+        assert_eq!(snapshot.live_blocking, 1);
+
+        let mut second = tokio::net::TcpStream::connect(gateway_address)
+            .await
+            .expect("second resolver request");
+        second
+            .write_all(
+                format!(
+                    "POST /second HTTP/1.1\r\nHost: public.example\r\nCookie: amg_session={cookie}\r\nContent-Length: 24\r\nExpect: 100-continue\r\nConnection: close\r\n\r\n"
+                )
+                .as_bytes(),
+            )
+            .await
+            .expect("second resolver head");
+        let marker = b"never-send-resolver-body";
+        let mut response = Vec::new();
+        tokio::time::timeout(StdDuration::from_secs(2), async {
+            let mut byte = [0u8; 1];
+            while !response.ends_with(b"\r\n\r\n") {
+                second
+                    .read_exact(&mut byte)
+                    .await
+                    .expect("capacity response head");
+                response.push(byte[0]);
+            }
+        })
+        .await
+        .expect("resolver saturation head was immediate");
+        let marker_sent = response.starts_with(b"HTTP/1.1 100");
+        if marker_sent {
+            second
+                .write_all(marker)
+                .await
+                .expect("send marker only after 100");
+        }
+        tokio::time::timeout(StdDuration::from_secs(2), second.read_to_end(&mut response))
+            .await
+            .expect("resolver saturation EOF")
+            .expect("resolver saturation response");
+        let split = response
+            .windows(4)
+            .position(|window| window == b"\r\n\r\n")
+            .expect("capacity response delimiter");
+        let head = String::from_utf8_lossy(&response[..split + 4]).to_ascii_lowercase();
+        assert!(head.starts_with("http/1.1 503 service unavailable"));
+        assert!(!head.contains("100 continue"));
+        assert!(!marker_sent);
+        assert!(head.contains("content-length: 31"));
+        assert!(head.contains("content-type: text/plain; charset=utf-8"));
+        assert!(head.contains("cache-control: no-store"));
+        assert!(head.contains("retry-after: 5"));
+        assert!(head.contains("connection: close"));
+        assert!(!head.contains("set-cookie:"));
+        assert_eq!(&response[split + 4..], b"Service temporarily unavailable");
+        assert!(!response
+            .windows(marker.len())
+            .any(|window| window == marker));
+        assert_eq!(submissions.load(Ordering::SeqCst), 1);
+        assert_eq!(upstream_hits.load(Ordering::SeqCst), 0);
+        assert_eq!(accounting.snapshot(), snapshot);
+
+        let mut canceled = tokio::net::TcpStream::connect(gateway_address)
+            .await
+            .expect("canceled R+1 request");
+        canceled
+            .write_all(
+                format!(
+                    "GET /canceled-r-plus-one HTTP/1.1\r\nHost: public.example\r\nCookie: amg_session={cookie}\r\n\r\n"
+                )
+                .as_bytes(),
+            )
+            .await
+            .expect("canceled request head");
+        drop(canceled);
+        tokio::task::yield_now().await;
+        assert_eq!(submissions.load(Ordering::SeqCst), 1);
+        assert_eq!(accounting.snapshot(), snapshot);
+
+        let mut health = tokio::net::TcpStream::connect(gateway_address)
+            .await
+            .expect("health connection");
+        health
+            .write_all(
+                b"GET /healthz HTTP/1.1\r\nHost: public.example\r\nConnection: close\r\n\r\n",
+            )
+            .await
+            .expect("health request");
+        let mut health_response = Vec::new();
+        health
+            .read_to_end(&mut health_response)
+            .await
+            .expect("health response");
+        assert!(health_response.starts_with(b"HTTP/1.1 204"));
+
+        {
+            let (lock, condition) = &*resolver_gate;
+            *lock.lock().expect("resolver release") = true;
+            condition.notify_all();
+        }
+        let mut first_response = Vec::new();
+        first
+            .read_to_end(&mut first_response)
+            .await
+            .expect("first resolver response");
+        assert!(first_response.starts_with(b"HTTP/1.1 200"));
+        assert_eq!(upstream_hits.load(Ordering::SeqCst), 1);
+        tokio::time::timeout(StdDuration::from_secs(5), async {
+            loop {
+                let snapshot = accounting.snapshot();
+                if snapshot.held_r == 0
+                    && snapshot.submitted_unobserved == 0
+                    && snapshot.request_owned == 0
+                    && snapshot.cleanup_owned == 0
+                    && snapshot.live_blocking == 0
+                {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("resolver accounting drained");
+        assert_eq!(accounting.snapshot().total_submitted, 1);
+
+        gateway_task.abort();
+        upstream_task.abort();
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn warm_domain_pool_reuse_bypasses_occupied_r_without_accounting_change() {
+        let upstream_listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("pooled domain upstream bind");
+        let upstream_address = upstream_listener
+            .local_addr()
+            .expect("pooled upstream address");
+        let upstream_connections = Arc::new(AtomicUsize::new(0));
+        let upstream_hits = Arc::new(AtomicUsize::new(0));
+        let task_connections = Arc::clone(&upstream_connections);
+        let task_hits = Arc::clone(&upstream_hits);
+        let upstream_task = tokio::spawn(async move {
+            let (stream, _) = upstream_listener.accept().await.expect("pooled accept");
+            task_connections.fetch_add(1, Ordering::SeqCst);
+            let service = service_fn(move |_request: HyperRequest<Incoming>| {
+                let hits = Arc::clone(&task_hits);
+                async move {
+                    hits.fetch_add(1, Ordering::SeqCst);
+                    Ok::<_, Infallible>(HyperResponse::new(full_body("ok")))
+                }
+            });
+            let _ = http1::Builder::new()
+                .serve_connection(TokioIo::new(stream), service)
+                .await;
+        });
+
+        let dir = tempdir().expect("pooled domain tempdir");
+        let database = dir.path().join("gateway.sqlite");
+        Store::initialize(&database).expect("pooled domain store");
+        let mut config = test_config();
+        config.database_path = database.clone();
+        config.public_base_url = "http://public.example".to_string();
+        config.upstream = crate::config::parse_upstream_url(Some(&format!(
+            "http://pooled-domain.example:{}/base",
+            upstream_address.port()
+        )))
+        .expect("pooled domain URL");
+        config.max_downstream_connections = 18;
+        config.max_active_upstreams = 2;
+        config.max_blocking_resolvers = 1;
+        config.allow_user_ids.insert("pooled-user".to_string());
+        config.validate().expect("pooled domain config");
+        let session = Store::new(database)
+            .create_session(NewSession {
+                auth_session_id: "pooled-auth-session".to_string(),
+                access_token: "pooled-access".to_string(),
+                refresh_token: "pooled-refresh".to_string(),
+                user_id: "pooled-user".to_string(),
+                email: None,
+                amr: vec!["fixture".to_string()],
+                access_expires_at: Utc::now() + Duration::hours(2),
+                idle_ttl_seconds: config.session_ttl_seconds,
+                absolute_ttl_seconds: config.session_absolute_ttl_seconds,
+            })
+            .expect("pooled domain session");
+        let cookie = crate::cookies::sign_value(&session.id, &config.cookie_secret);
+        let resolver_submissions = Arc::new(AtomicUsize::new(0));
+        let accounting = Arc::new(crate::proxy::ResolverAccounting::default());
+        let proxy = Proxy::with_root_store_and_resolver(
+            config.upstream.clone().expect("pooled upstream"),
+            rustls::RootCertStore::empty(),
+            2,
+            1,
+            Arc::new(CountingTestResolver {
+                address: upstream_address,
+                submissions: Arc::clone(&resolver_submissions),
+            }),
+            Arc::clone(&accounting),
+        )
+        .expect("pooled domain proxy");
+        let proxy_probe = proxy.clone();
+        let gateway_listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("pooled gateway bind");
+        let gateway_address = gateway_listener
+            .local_addr()
+            .expect("pooled gateway address");
+        let gateway_task = tokio::spawn(serve_with_components(
+            config,
+            Arc::new(MockAuthMini::new(
+                Vec::new(),
+                Vec::new(),
+                "unused-user".to_string(),
+                "unused-session".to_string(),
+            )),
+            gateway_listener,
+            Some(proxy),
+            AuthExecutor::new(),
+            Arc::new(StoreLoginStateBuilder),
+            Arc::new(|| {}),
+        ));
+
+        let mut first = tokio::net::TcpStream::connect(gateway_address)
+            .await
+            .expect("first pooled request");
+        first
+            .write_all(
+                format!(
+                    "GET /first HTTP/1.1\r\nHost: public.example\r\nCookie: amg_session={cookie}\r\nConnection: close\r\n\r\n"
+                )
+                .as_bytes(),
+            )
+            .await
+            .expect("first pooled request head");
+        let mut first_response = Vec::new();
+        first
+            .read_to_end(&mut first_response)
+            .await
+            .expect("first pooled response");
+        assert!(first_response.starts_with(b"HTTP/1.1 200"));
+        tokio::time::timeout(StdDuration::from_secs(5), async {
+            while proxy_probe.idle_owner_count() != 1 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("domain owner parked");
+        assert_eq!(resolver_submissions.load(Ordering::SeqCst), 1);
+        assert_eq!(upstream_connections.load(Ordering::SeqCst), 1);
+        let drained = accounting.snapshot();
+        assert_eq!(
+            drained,
+            crate::proxy::ResolverSnapshot {
+                total_submitted: 1,
+                ..crate::proxy::ResolverSnapshot::default()
+            }
+        );
+
+        let resolver_occupancy = proxy_probe.occupy_resolver_for_test();
+        let occupied = accounting.snapshot();
+        assert_eq!(occupied.held_r, 1);
+        assert_eq!(occupied.total_submitted, 1);
+        assert_eq!(occupied.submitted_unobserved, 0);
+        let mut second = tokio::net::TcpStream::connect(gateway_address)
+            .await
+            .expect("second pooled request");
+        second
+            .write_all(
+                format!(
+                    "GET /second HTTP/1.1\r\nHost: public.example\r\nCookie: amg_session={cookie}\r\nConnection: close\r\n\r\n"
+                )
+                .as_bytes(),
+            )
+            .await
+            .expect("second pooled request head");
+        let mut second_response = Vec::new();
+        second
+            .read_to_end(&mut second_response)
+            .await
+            .expect("second pooled response");
+        assert!(second_response.starts_with(b"HTTP/1.1 200"));
+        tokio::time::timeout(StdDuration::from_secs(5), async {
+            while proxy_probe.idle_owner_count() != 1 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("reused domain owner reparked");
+        assert_eq!(resolver_submissions.load(Ordering::SeqCst), 1);
+        assert_eq!(upstream_connections.load(Ordering::SeqCst), 1);
+        assert_eq!(upstream_hits.load(Ordering::SeqCst), 2);
+        assert_eq!(accounting.snapshot(), occupied);
+        drop(resolver_occupancy);
+        assert_eq!(accounting.snapshot(), drained);
+
+        gateway_task.abort();
+        upstream_task.abort();
+    }
+
+    #[tokio::test]
+    async fn predecision_overload_and_internal_responses_are_cookie_neutral() {
+        let overloaded = auth_unavailable_hyper(true, None);
+        assert_eq!(overloaded.status(), StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(overloaded.headers()[http::header::RETRY_AFTER], "5");
+        assert!(!overloaded.headers().contains_key(SET_COOKIE));
+        let body = overloaded
+            .into_body()
+            .collect()
+            .await
+            .expect("auth overload body")
+            .to_bytes();
+        assert_eq!(
+            body,
+            Bytes::from_static(b"Authentication service temporarily unavailable")
+        );
+
+        let internal = generated_response(500, "Internal server error", true, None);
+        assert_eq!(internal.status(), StatusCode::INTERNAL_SERVER_ERROR);
+        assert!(!internal.headers().contains_key(SET_COOKIE));
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn handler_auth_login_seams_pin_single_admission_and_cookie_phases() {
+        crate::exit::install_sanitized_panic_hook();
+        let dir = tempdir().expect("handler auth tempdir");
+        let database = dir.path().join("gateway.sqlite");
+        Store::initialize(&database).expect("handler auth store");
+        let mut config = test_config();
+        config.database_path = database.clone();
+        let config = Arc::new(config);
+        let store = Arc::new(Store::new(database.clone()));
+        let count_login_states = || {
+            rusqlite::Connection::open(&database)
+                .expect("open handler auth database")
+                .query_row("SELECT COUNT(*) FROM login_states", [], |row| {
+                    row.get::<_, usize>(0)
+                })
+                .expect("count login states")
+        };
+        assert_eq!(count_login_states(), 0);
+        let auth: Arc<dyn AuthMini> = Arc::new(MockAuthMini::new(
+            Vec::new(),
+            Vec::new(),
+            "unused-user".to_string(),
+            "unused-session".to_string(),
+        ));
+
+        let make_state = |executor: AuthExecutor,
+                          behavior: TestLoginBehavior,
+                          before_auth_decision: Arc<dyn Fn() + Send + Sync>,
+                          calls: Arc<AtomicUsize>,
+                          observed: Arc<AtomicUsize>| {
+            let builder = Arc::new(ObservingLoginBuilder {
+                behavior,
+                calls,
+                observed_admission_available: observed,
+                admission: Arc::clone(&executor.admission),
+            });
+            AppState {
+                config: Arc::clone(&config),
+                store: Arc::clone(&store),
+                auth_mini: Arc::clone(&auth),
+                flights: Arc::new(FlightCoordinator::default()),
+                executor,
+                login_builder: builder,
+                before_auth_decision,
+                proxy: None,
+                public_proto: "http".to_string(),
+            }
+        };
+
+        let calls = Arc::new(AtomicUsize::new(0));
+        let observed = Arc::new(AtomicUsize::new(usize::MAX));
+        let state = make_state(
+            AuthExecutor::with_limits(1, 1),
+            TestLoginBehavior::Success,
+            Arc::new(|| {}),
+            Arc::clone(&calls),
+            Arc::clone(&observed),
+        );
+        let ready = run_proxy_auth_operation(&state, None, "/private".to_string())
+            .await
+            .expect("single admitted login");
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+        assert_eq!(observed.load(Ordering::SeqCst), 0);
+        let ProxyAuthOutcome::Response(response) = proxy_auth_result_outcome(ready, false) else {
+            panic!("login unexpectedly allowed upstream");
+        };
+        assert_eq!(response.status(), StatusCode::FOUND);
+        assert_eq!(response.headers().get_all(SET_COOKIE).iter().count(), 2);
+        let cookies: Vec<_> = response
+            .headers()
+            .get_all(SET_COOKIE)
+            .iter()
+            .map(|value| value.to_str().expect("cookie"))
+            .collect();
+        assert!(cookies[0].contains("amg_session="));
+        assert!(cookies[0].contains("Max-Age=0"));
+        assert!(cookies[1].contains("amg_login_state="));
+        assert_eq!(count_login_states(), 1);
+
+        let calls = Arc::new(AtomicUsize::new(0));
+        let overloaded = make_state(
+            AuthExecutor::with_limits(1, 0),
+            TestLoginBehavior::Success,
+            Arc::new(|| {}),
+            Arc::clone(&calls),
+            Arc::new(AtomicUsize::new(usize::MAX)),
+        );
+        let error =
+            match run_proxy_auth_operation(&overloaded, None, "/overloaded".to_string()).await {
+                Err(error) => error,
+                Ok(_) => panic!("admission unexpectedly succeeded"),
+            };
+        assert!(matches!(error, AuthExecutionError::Overloaded));
+        assert_eq!(calls.load(Ordering::SeqCst), 0);
+        let response = proxy_auth_execution_error_response(error, true);
+        assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(response.headers()[http::header::RETRY_AFTER], "5");
+        assert_eq!(response.headers()[http::header::CACHE_CONTROL], "no-store");
+        assert_eq!(response.headers()[CONNECTION], "close");
+        assert!(!response.headers().contains_key(SET_COOKIE));
+        assert_eq!(
+            response
+                .into_body()
+                .collect()
+                .await
+                .expect("overload body")
+                .to_bytes(),
+            Bytes::from_static(b"Authentication service temporarily unavailable")
+        );
+        assert_eq!(count_login_states(), 1);
+
+        for behavior in [TestLoginBehavior::Error, TestLoginBehavior::Panic] {
+            let calls = Arc::new(AtomicUsize::new(0));
+            let state = make_state(
+                AuthExecutor::with_limits(1, 1),
+                behavior,
+                Arc::new(|| {}),
+                Arc::clone(&calls),
+                Arc::new(AtomicUsize::new(usize::MAX)),
+            );
+            let result = run_proxy_auth_operation(&state, None, "/failure".to_string())
+                .await
+                .expect("post-decision failure contained");
+            assert_eq!(calls.load(Ordering::SeqCst), 1);
+            let ProxyAuthOutcome::Response(response) = proxy_auth_result_outcome(result, true)
+            else {
+                panic!("post-decision failure unexpectedly allowed upstream");
+            };
+            assert_eq!(response.status(), StatusCode::INTERNAL_SERVER_ERROR);
+            let cookies: Vec<_> = response.headers().get_all(SET_COOKIE).iter().collect();
+            assert_eq!(cookies.len(), 1);
+            assert!(cookies[0]
+                .to_str()
+                .expect("clear cookie")
+                .contains("amg_session="));
+            assert!(!cookies[0]
+                .to_str()
+                .expect("clear cookie")
+                .contains("amg_login_state"));
+            assert_eq!(
+                response
+                    .into_body()
+                    .collect()
+                    .await
+                    .expect("post-Unauth body")
+                    .to_bytes(),
+                Bytes::from_static(b"Internal server error")
+            );
+            assert_eq!(count_login_states(), 1);
+        }
+
+        let calls = Arc::new(AtomicUsize::new(0));
+        let predecision = make_state(
+            AuthExecutor::with_limits(1, 1),
+            TestLoginBehavior::Success,
+            Arc::new(|| std::panic::panic_any("pre-decision-payload-marker")),
+            Arc::clone(&calls),
+            Arc::new(AtomicUsize::new(usize::MAX)),
+        );
+        let error =
+            match run_proxy_auth_operation(&predecision, None, "/prepanic".to_string()).await {
+                Err(error) => error,
+                Ok(_) => panic!("pre-decision panic unexpectedly succeeded"),
+            };
+        assert!(matches!(error, AuthExecutionError::Internal));
+        assert_eq!(calls.load(Ordering::SeqCst), 0);
+        let response = proxy_auth_execution_error_response(error, true);
+        assert_eq!(response.status(), StatusCode::INTERNAL_SERVER_ERROR);
+        assert!(!response.headers().contains_key(SET_COOKIE));
+        assert_eq!(
+            response
+                .into_body()
+                .collect()
+                .await
+                .expect("pre-decision panic body")
+                .to_bytes(),
+            Bytes::from_static(b"Internal server error")
+        );
+        assert_eq!(count_login_states(), 1);
+    }
+
+    #[test]
+    fn budgeted_blocking_runtime_keeps_all_64_auth_workers_available() {
+        let plan = RuntimePlan::new(8).expect("runtime plan");
+        assert_eq!(plan.max_blocking_threads, 88);
+        let runtime = tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(4)
+            .max_blocking_threads(plan.max_blocking_threads)
+            .enable_all()
+            .build()
+            .expect("dedicated runtime");
+        runtime.block_on(async {
+            let blocker_gate = Arc::new((Mutex::new(false), Condvar::new()));
+            let resolver_started = Arc::new(AtomicUsize::new(0));
+            let margin_started = Arc::new(AtomicUsize::new(0));
+            let blockers_completed = Arc::new(AtomicUsize::new(0));
+            let mut blockers = Vec::new();
+            for (count, started) in [
+                (8, Arc::clone(&resolver_started)),
+                (16, Arc::clone(&margin_started)),
+            ] {
+                for _ in 0..count {
+                    let gate = Arc::clone(&blocker_gate);
+                    let started = Arc::clone(&started);
+                    let completed = Arc::clone(&blockers_completed);
+                    blockers.push(tokio::task::spawn_blocking(move || {
+                        started.fetch_add(1, Ordering::SeqCst);
+                        let (lock, condition) = &*gate;
+                        let mut released = lock.lock().expect("blocker lock");
+                        while !*released {
+                            released = condition.wait(released).expect("blocker wait");
+                        }
+                        completed.fetch_add(1, Ordering::SeqCst);
+                    }));
+                }
+            }
+            tokio::time::timeout(StdDuration::from_secs(5), async {
+                while resolver_started.load(Ordering::SeqCst) != 8
+                    || margin_started.load(Ordering::SeqCst) != 16
+                {
+                    tokio::task::yield_now().await;
+                }
+            })
+            .await
+            .expect("all resolver and margin fixtures started");
+
+            let executor = AuthExecutor::new();
+            let auth_gate = Arc::new((Mutex::new(false), Condvar::new()));
+            let auth_entered = Arc::new(AtomicUsize::new(0));
+            let mut auth_tasks = Vec::new();
+            for _ in 0..63 {
+                let executor = executor.clone();
+                let gate = Arc::clone(&auth_gate);
+                let entered = Arc::clone(&auth_entered);
+                auth_tasks.push(tokio::spawn(async move {
+                    executor
+                        .run(move || {
+                            entered.fetch_add(1, Ordering::SeqCst);
+                            let (lock, condition) = &*gate;
+                            let mut released = lock.lock().expect("auth gate");
+                            while !*released {
+                                released = condition.wait(released).expect("auth wait");
+                            }
+                            204u16
+                        })
+                        .await
+                }));
+            }
+            let dir = tempdir().expect("auth isolation tempdir");
+            let database = dir.path().join("gateway.sqlite");
+            Store::initialize(&database).expect("auth isolation store");
+            let mut config = test_config();
+            config.database_path = database.clone();
+            let config = Arc::new(config);
+            let store = Arc::new(Store::new(database));
+            let flights = Arc::new(FlightCoordinator::default());
+            let auth = Arc::new(MockAuthMini::new(
+                Vec::new(),
+                Vec::new(),
+                "unused-user".to_string(),
+                "unused-session".to_string(),
+            ));
+            let control_executor = executor.clone();
+            let control_gate = Arc::clone(&auth_gate);
+            let control_entered = Arc::clone(&auth_entered);
+            auth_tasks.push(tokio::spawn(async move {
+                control_executor
+                    .run(move || {
+                        control_entered.fetch_add(1, Ordering::SeqCst);
+                        let (lock, condition) = &*control_gate;
+                        let mut released = lock.lock().expect("control auth gate");
+                        while !*released {
+                            released = condition.wait(released).expect("control auth wait");
+                        }
+                        let request = Request::new(
+                            "GET".to_string(),
+                            "/auth/check".to_string(),
+                            Vec::new(),
+                            Vec::new(),
+                        );
+                        handle_auth_check(&request, &config, &store, auth.as_ref(), &flights)
+                            .status()
+                    })
+                    .await
+            }));
+
+            let all_auth_entered = tokio::time::timeout(StdDuration::from_secs(5), async {
+                while auth_entered.load(Ordering::SeqCst) != 64 {
+                    tokio::task::yield_now().await;
+                }
+            })
+            .await;
+            if all_auth_entered.is_err() {
+                for gate in [&auth_gate, &blocker_gate] {
+                    let (lock, condition) = &**gate;
+                    *lock.lock().expect("failure release") = true;
+                    condition.notify_all();
+                }
+                panic!("all 64 auth closures did not enter under R+16 load");
+            }
+            assert_eq!(auth_entered.load(Ordering::SeqCst), 64);
+            assert_eq!(resolver_started.load(Ordering::SeqCst), 8);
+            assert_eq!(margin_started.load(Ordering::SeqCst), 16);
+            assert_eq!(blockers_completed.load(Ordering::SeqCst), 0);
+
+            {
+                let (lock, condition) = &*auth_gate;
+                *lock.lock().expect("release auth lock") = true;
+                condition.notify_all();
+            }
+            let auth_outcome = tokio::time::timeout(StdDuration::from_secs(5), async {
+                let mut statuses = Vec::new();
+                for task in auth_tasks {
+                    statuses.push(task.await.expect("auth task").expect("auth admitted"));
+                }
+                statuses
+            })
+            .await;
+            if auth_outcome.is_err() {
+                let (lock, condition) = &*blocker_gate;
+                *lock.lock().expect("failure blocker release") = true;
+                condition.notify_all();
+                panic!("64 entered auth closures did not complete after auth release");
+            }
+            let statuses = auth_outcome.expect("checked auth outcome");
+            assert_eq!(blockers_completed.load(Ordering::SeqCst), 0);
+            assert_eq!(statuses.len(), 64);
+            assert_eq!(statuses.iter().filter(|status| **status == 204).count(), 63);
+            assert_eq!(statuses.iter().filter(|status| **status == 401).count(), 1);
+
+            {
+                let (lock, condition) = &*blocker_gate;
+                *lock.lock().expect("release lock") = true;
+                condition.notify_all();
+            }
+            for blocker in blockers {
+                blocker.await.expect("blocking fixture");
+            }
+            assert_eq!(blockers_completed.load(Ordering::SeqCst), 24);
+        });
+    }
+
+    #[test]
+    fn production_blocking_and_dial_sites_are_source_budgeted() {
+        let server = include_str!("server.rs")
+            .split("#[cfg(test)]\nmod tests")
+            .next()
+            .expect("server production source");
+        let proxy = include_str!("proxy.rs")
+            .split("#[cfg(test)]\nmod tests")
+            .next()
+            .expect("proxy production source");
+        assert_eq!(server.matches("spawn_blocking").count(), 1);
+        assert_eq!(proxy.matches("spawn_blocking").count(), 1);
+        assert!(!server.contains("block_in_place"));
+        assert!(!proxy.contains("block_in_place"));
+        for forbidden in [
+            "lookup_host",
+            "HttpConnector",
+            "Url::socket_addrs",
+            "connect_uri.host()",
+            "TcpStream::connect((",
+        ] {
+            assert!(
+                !proxy.contains(forbidden),
+                "forbidden dial API: {forbidden}"
+            );
+        }
+        let main_source = include_str!("main.rs");
+        assert!(main_source.contains(".max_blocking_threads(runtime_plan.max_blocking_threads)"));
+        assert!(
+            main_source
+                .find("install_sanitized_panic_hook()")
+                .expect("panic hook")
+                < main_source
+                    .find("tracing_subscriber::fmt()")
+                    .expect("logging init")
+        );
+        let block_on = main_source
+            .find("let terminal_result = runtime.block_on")
+            .expect("terminal result preservation");
+        let background_shutdown = main_source
+            .find("runtime.shutdown_background()")
+            .expect("non-waiting runtime shutdown");
+        assert!(block_on < background_shutdown);
+        let exit_source = include_str!("exit.rs")
+            .split("#[cfg(test)]\nmod tests")
+            .next()
+            .expect("exit production source");
+        let panic_hook = exit_source
+            .split("pub fn install_sanitized_panic_hook")
+            .nth(1)
+            .expect("panic hook source")
+            .split("#[cfg(test)]")
+            .next()
+            .expect("panic hook boundary");
+        assert!(panic_hook.contains("libc::write"));
+        assert!(!panic_hook.contains("stderr().lock"));
+        assert!(!panic_hook.contains("writeln!"));
+        assert!(!panic_hook.contains("tracing::"));
+
+        let fallback = server
+            .split("async fn handle_proxy_fallback")
+            .nth(1)
+            .expect("proxy fallback source")
+            .split("fn classify_fallback_target")
+            .next()
+            .expect("proxy fallback boundary");
+        assert_eq!(fallback.matches(".executor").count(), 1);
+        assert_eq!(fallback.matches("execute_proxy_auth").count(), 1);
+        assert_eq!(fallback.matches("login_builder.build").count(), 1);
+        let underscore = fallback.find("contains(&b'_')").expect("underscore gate");
+        let forwarding = fallback.find("derive_client_ip").expect("forwarding gate");
+        let auth_admission = fallback.find(".executor").expect("auth admission");
+        assert!(underscore < auth_admission);
+        assert!(forwarding < auth_admission);
+
+        let connect = proxy
+            .split("async fn connect")
+            .nth(1)
+            .expect("connect source")
+            .split("struct ActivePhase")
+            .next()
+            .expect("connect boundary");
+        assert!(!connect.contains("ClientIp"));
+        assert!(!connect.contains("x-forwarded"));
+        assert!(!connect.contains("request.headers"));
+        for reason in [
+            "RequestCancellation",
+            "ReadyFailure",
+            "SendFailure",
+            "InvalidUpgrade",
+            "ResponseBodyError",
+            "ResponseBodyDrop",
+            "NonReusableResponse",
+            "PoolReadyTimeout",
+            "PoolReadyFailure",
+            "PoolFull",
+            "PoolPoisoned",
+            "UpgradeFailure",
+            "WebSocketClosed",
+            "WebSocketError",
+            "WebSocketCancellation",
+            "IdleOwnerDrop",
+        ] {
+            assert!(
+                proxy
+                    .matches(&format!("RetirementReason::{reason}"))
+                    .count()
+                    >= 1,
+                "terminal reason is not wired: {reason}"
+            );
+        }
+    }
+
+    #[test]
+    fn proxy_capacity_validation_requires_exact_headroom_but_not_r_u_ordering() {
+        let mut config = test_config();
+        config.upstream = crate::config::parse_upstream_url(Some("http://127.0.0.1:4096"))
+            .expect("valid upstream");
+        config.max_active_upstreams = 128;
+        config.max_downstream_connections = 143;
+        assert_eq!(
+            config.validate().expect_err("missing headroom").class(),
+            "proxy_capacity_headroom_invalid"
+        );
+        config.max_downstream_connections = 144;
+        config.max_blocking_resolvers = 1;
+        assert!(config.validate().is_ok(), "U may exceed R");
+        config.max_active_upstreams = 1;
+        config.max_downstream_connections = 17;
+        config.max_blocking_resolvers = 32;
+        assert!(config.validate().is_ok(), "R may exceed U");
+        config.max_blocking_resolvers = 33;
+        assert_eq!(
+            config.validate().expect_err("R above maximum").class(),
+            "blocking_resolver_limit_invalid"
+        );
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -2523,6 +4488,10 @@ mod tests {
             allow_user_ids: HashSet::new(),
             logout_redirect: "/".to_string(),
             upstream: None,
+            max_downstream_connections: 256,
+            max_active_upstreams: 128,
+            max_blocking_resolvers: 8,
+            trusted_proxy_cidrs: crate::config::TrustedProxySet::default(),
         }
     }
 }

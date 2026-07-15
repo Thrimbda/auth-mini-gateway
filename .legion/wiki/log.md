@@ -31,3 +31,11 @@
 - Added durable decisions for shared authentication, static destination authority, local control-route precedence, browser-secret stripping, and verified identity injection.
 - Added the authenticated fixed-upstream proxy pattern covering streaming, one-attempt pooling, WebSocket validation, and early-final upload cancellation.
 - Recorded environment follow-ups for the external real-auth-mini composed run, physical Acorn/FRP mode switch, and richer secret-safe observability.
+
+## 2026-07-16
+
+- Added the `harden-proxy-production-boundaries` task summary after repeated RFC review, implementation, independent verification, security remediation, and walkthrough.
+- Added current decisions for D/U/R capacity, full sender/driver/resolver ownership, auth-worker isolation, exact RLIMIT startup validation, recoverable accept backoff, and sanitized fatal/panic boundaries.
+- Added current trust decisions for underscore-header rejection and explicit immediate-peer CIDR plus one-value XFF handling.
+- Added reusable lifetime-owned capacity and trusted-forwarding handoff patterns.
+- Replaced the abstract proxy rollout follow-up with exact Acorn `18081`, Axiom `7780`, OpenCode `4096`, systemd resource, trusted-peer, and rollback evidence gates.
