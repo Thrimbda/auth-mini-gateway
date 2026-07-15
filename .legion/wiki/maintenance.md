@@ -12,3 +12,6 @@
 - Add auth-mini refresh idempotency, result lookup, or previous-token recovery to close the post-commit lost-response residual.
 - Make auth-mini internal refresh failures return 5xx instead of folding them into `401 session_invalidated`.
 - Run a physical mobile Safari smoke for overnight suspension, first-request recovery, and absolute `Expires` behavior.
+- Rerun `scripts/e2e-real-auth-mini.sh` with the pinned auth-mini checkout to capture direct proxy login, refresh outage/recovery, denial, WebSocket, and logout evidence.
+- Before OpenCode proxy rollout, execute the physical Acorn maintenance-deny and FRP `7780` to `7781` mode-switch drill; prove gateway adapter port `3000` and OpenCode port `4096` have no public/FRP route.
+- Expand structured proxy/admission observability toward the RFC recommendations without logging URI, Host, identity, cookies, tokens, upstream values, or raw transport errors.

@@ -213,6 +213,7 @@ mod tests {
             allow_emails: HashSet::new(),
             allow_user_ids: HashSet::new(),
             logout_redirect: "/".to_string(),
+            upstream: None,
         }
     }
 }

@@ -1,8 +1,26 @@
 # Production Deployment
 
-This guide describes how to deploy `auth-mini-gateway` in front of a protected app with nginx and a separately deployed auth-mini server.
+This guide describes both supported modes of `auth-mini-gateway` with a
+separately deployed auth-mini server. Public TLS remains terminated by Acorn
+nginx in both modes.
 
-## Target Topology
+## Choose a mode
+
+`UPSTREAM_URL` is the mode gate:
+
+- **Adapter mode:** leave it unset or exactly empty. The gateway serves auth
+  routes and `/auth/check`; node-local nginx enforces `auth_request` and proxies
+  the app. Unknown gateway routes remain `404`.
+- **Proxy mode:** set one absolute `http`/`https` URL without credentials,
+  query, or fragment. The gateway authenticates every non-owned route and
+  streams it to that fixed target. A fixed base path is allowed.
+
+The value is trusted operator configuration read only at startup. It is not a
+routing template: request Host, paths, queries, forwarding fields, cookies,
+redirects, and absolute-form authorities cannot change its scheme, authority,
+DNS destination, or TLS SNI.
+
+## Adapter topology
 
 ```text
 Browser
@@ -21,10 +39,36 @@ gateway private listener: 127.0.0.1:3000 or container network gateway:3000
 auth-mini public issuer: https://auth.example.com
 ```
 
-Production assumptions:
+## Proxy topology for NAT-hosted OpenCode
+
+```text
+Browser
+  -> Acorn nginx :443 (public TLS)
+  -> FRP target 127.0.0.1:7780
+  -> auth-mini-gateway proxy 127.0.0.1:7780
+  -> OpenCode 127.0.0.1:4096
+
+auth-mini-gateway -> auth-mini issuer (JWKS, /me, refresh, logout)
+```
+
+OpenCode must listen only on `127.0.0.1:4096`. FRP maps `7780`, not `4096`.
+It must also have no public mapping for the adapter-only gateway port `3000`.
+Acorn nginx remains the public TLS endpoint; the gateway does not terminate
+public TLS.
+
+Minimal proxy-mode listener settings:
+
+```env
+HOST=127.0.0.1
+PORT=7780
+UPSTREAM_URL=http://127.0.0.1:4096
+GATEWAY_PUBLIC_BASE_URL=https://app.example.com
+```
+
+Production assumptions for both modes:
 
 - One active gateway instance writes to one durable SQLite database.
-- nginx terminates TLS and proxies both HTTP and WebSocket traffic.
+- Acorn nginx terminates public TLS.
 - The protected upstream is not directly reachable from the public network.
 - auth-mini is already deployed and configured with the public issuer that appears in its access-token `iss` claim.
 
@@ -60,6 +104,7 @@ Use these variables as the production baseline:
 ```env
 HOST=0.0.0.0
 PORT=3000
+UPSTREAM_URL=
 GATEWAY_PUBLIC_BASE_URL=https://app.example.com
 AUTH_MINI_ISSUER=https://auth.example.com
 AUTH_MINI_PUBLIC_BASE_URL=https://auth.example.com
@@ -81,6 +126,9 @@ LOGOUT_REDIRECT=/
 Important settings:
 
 - `GATEWAY_PUBLIC_BASE_URL` is the protected app origin served by nginx. It is used for callback redirects and return target validation.
+- `UPSTREAM_URL` empty selects adapter mode. In proxy mode use one fixed
+  loopback target, such as `http://127.0.0.1:4096`; invalid values stop startup
+  without making a reachability request.
 - `AUTH_MINI_ISSUER` must exactly match auth-mini's JWT issuer and must be reachable by the gateway.
 - `AUTH_MINI_PUBLIC_BASE_URL` is the browser-visible auth-mini origin used to build the default login URL.
 - `AUTH_MINI_LOGIN_URL` is optional. Set it only if the default `${AUTH_MINI_PUBLIC_BASE_URL}/web/#/login` is not correct for your auth-mini UI.
@@ -123,6 +171,11 @@ docker run -d \
 ```
 
 Do not publish the gateway port directly to the internet. Let nginx reach it on a private interface or container network.
+
+For proxy mode on a NAT host, bind the gateway to `127.0.0.1:7780`, configure
+`UPSTREAM_URL=http://127.0.0.1:4096`, and let FRP map only `7780`. The statement
+above means the listener remains behind Acorn nginx/FRP rather than becoming a
+second public TLS endpoint.
 
 ## Docker Compose Deployment
 
@@ -225,6 +278,11 @@ sudo systemctl status auth-mini-gateway
 ```
 
 ## nginx Configuration
+
+This section is for **adapter mode**. In proxy mode, node-local nginx does not
+proxy the application: Acorn nginx/FRP forwards to gateway `7780`, and the
+gateway forwards to the fixed loopback app. Keep Acorn Host canonicalization
+and public TLS in place.
 
 Start from `examples/nginx.conf` and adjust upstream names, TLS, and server names.
 
@@ -340,6 +398,10 @@ Run these checks before moving real users:
 
    Confirm a logged-in browser can establish the app's WebSocket connection and an anonymous browser cannot.
 
+   In proxy mode, also test a long-lived SSE response and an upload larger than
+   64 KiB. Proxy request and response bodies are streamed; only the local login
+   callback body has the 64 KiB control-plane limit.
+
 7. Gateway restart persistence:
 
    Restart the gateway process while logged in.
@@ -375,7 +437,17 @@ Schema v2 is additive. It adds authoritative idle/absolute deadlines and identit
 5. Verify login, a touch renewal with absolute `Expires` and no positive `Max-Age`, refresh, `503` isolation, logout, and WebSocket handshake.
 6. Monitor pending-session count/age, SQLite errors, invalidation spikes, and refresh-flight outcomes.
 
-Before rollout, run `scripts/e2e-old-binary-compat.sh` against the intended base ref (default `origin/master`), `scripts/e2e-wal-backup-restore.sh`, and `scripts/e2e-real-auth-mini.sh` against the pinned auth-mini source. The old-binary harness builds and runs the actual pre-change binary; it does not simulate old behavior with new code. The WAL drill uses SQLite's backup API while committed data remains in WAL frames, restores to a separate database, checks integrity/schema/snapshot boundaries, and starts the real gateway against the restored copy.
+Before rollout, run `scripts/e2e-old-binary-compat.sh` against the pinned
+pre-lifecycle ref (default `f0519d1`, overridable with `OLD_GATEWAY_REF`),
+`scripts/e2e-wal-backup-restore.sh`, and `scripts/e2e-real-auth-mini.sh` against
+the pinned auth-mini source. Also run `scripts/e2e-proxy-mode.sh` and
+`scripts/e2e-mode-switch.sh`; they use local ephemeral fixtures and explicitly
+report missing prerequisites or operator-requested skips. The old-binary
+harness builds and runs the actual
+pre-change binary; it does not simulate old behavior with new code. The WAL
+drill uses SQLite's backup API while committed data remains in WAL frames,
+restores to a separate database, checks integrity/schema/snapshot boundaries,
+and starts the real gateway against the restored copy.
 
 ### Rollback
 
@@ -386,6 +458,33 @@ Before rollout, run `scripts/e2e-old-binary-compat.sh` against the intended base
 5. If the database is suspect, restore the WAL-consistent backup. A token rotated after that backup may be superseded and require login again.
 6. Never repair Pending rows by manually copying tokens, email, or revocation values.
 
+### Proxy-mode rollout and rollback ports
+
+Keep these listeners unambiguous:
+
+- proxy gateway: `127.0.0.1:7780`, with
+  `UPSTREAM_URL=http://127.0.0.1:4096`;
+- adapter gateway: `127.0.0.1:3000`, with `UPSTREAM_URL` empty;
+- retained node nginx adapter: `127.0.0.1:7781`, using `/auth/check` on `3000`
+  and proxying allowed traffic to `4096`;
+- OpenCode: `127.0.0.1:4096` only.
+
+Never run the proxy and adapter gateway simultaneously against the same SQLite
+database. To switch adapter -> proxy:
+
+1. Enable an Acorn maintenance deny (`503`) so no request can bypass an
+   incomplete switch.
+2. Stop gateway `3000` and wait for exit/SQLite release.
+3. Start gateway `7780`; locally verify health, anonymous redirect, denied
+   `403`, HTTP/SSE/WebSocket, header stripping, and unreachable-upstream `502`.
+4. Change the single FRP target from node nginx `7781` to gateway `7780`.
+5. Verify through the public origin, then remove the maintenance deny.
+
+To roll back, enable maintenance deny, stop `7780`, start adapter gateway
+`3000`, verify node nginx `7781`, switch FRP from `7780` to `7781`, and only
+then remove the deny. In-flight uploads, SSE, and WebSockets close during a
+switch. Never point FRP at OpenCode `4096` as a shortcut.
+
 ## Security Notes
 
 - Do not log `Authorization` headers, callback bodies, access tokens, refresh tokens, signed gateway cookies, or `GATEWAY_COOKIE_SECRET`.
@@ -394,6 +493,20 @@ Before rollout, run `scripts/e2e-old-binary-compat.sh` against the intended base
 - Use HTTPS in production and set `COOKIE_SECURE=true`.
 - Treat auth-mini as the authority for authentication methods. The gateway authorizes verified identities through exact email/user-id allowlists.
 - Treat identity headers from `/auth/check` as data for the upstream, not as proof outside the nginx-protected path.
+- In proxy mode, the gateway strips browser `Cookie`, `Authorization`,
+  `Proxy-Authorization`, inbound `Forwarded`/`X-Forwarded-*`, spoofed
+  `X-Auth-Mini-*`, fixed hop-by-hop fields, and every field nominated by
+  `Connection`. It injects only verified user ID/email.
+- The proxy preserves the external Host for application semantics but never
+  uses it to select the upstream. `X-Forwarded-Proto` comes from
+  `GATEWAY_PUBLIC_BASE_URL`, `X-Forwarded-Host` from the accepted Host, and
+  `X-Forwarded-For` is only the direct gateway peer (often FRP/nginx, not the
+  browser).
+- Established WebSockets are authorized at handshake time. A later logout
+  blocks new handshakes but does not terminate an already established tunnel.
+- Do not configure the protected app to rely on browser cookies or a generic
+  Authorization header in proxy mode; those credentials are deliberately not
+  forwarded.
 
 ### Refresh and identity residuals
 
@@ -450,6 +563,9 @@ Check:
 
 Check:
 
-- nginx forwards `Upgrade` and `Connection` headers.
-- The WebSocket route is inside the protected location that uses `auth_request`.
+- In adapter mode, nginx forwards `Upgrade` and `Connection` and the route is
+  inside the protected `auth_request` location.
+- In proxy mode, FRP/Acorn preserve HTTP/1.1 upgrade traffic to gateway `7780`,
+  the app listens on loopback `4096`, and the app returns the exact RFC 6455
+  accept/subprotocol response.
 - The upstream supports WebSocket over the proxied path.

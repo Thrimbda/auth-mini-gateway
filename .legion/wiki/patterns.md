@@ -66,3 +66,19 @@ When returning identity headers from a gateway to nginx `auth_request`:
 - treat user id and email as untrusted even if they came from a verified token
 - reject CR, LF, and control bytes before writing response headers
 - deny the auth check rather than forwarding malformed identity data
+
+## Authenticated fixed-upstream proxy pattern
+
+For a gateway that optionally becomes the protected application proxy:
+
+- keep adapter mode as the configuration-only rollback path when no upstream is set
+- classify all gateway-owned authentication routes before proxy fallback
+- use one authentication decision for adapter and proxy mappings; do not duplicate refresh, policy, touch, or cookie cleanup
+- derive the destination authority and TLS SNI only from startup configuration; request data may contribute only a validated path/query
+- remove browser cookies, authorization, caller identity, inbound forwarding, fixed hop-by-hop fields, and all `Connection`-nominated fields before injecting verified identity
+- preserve the external Host for application semantics without using it for routing or authentication
+- stream request/response frames under HTTP backpressure; never collect application bodies or place them in an unbounded channel
+- use one upstream send attempt and return a sanitized `502` rather than replaying non-idempotent bodies after a stale connection failure
+- validate both sides of a WebSocket handshake before committing downstream `101`; reject nomination of required handshake fields
+- cancel incomplete uploads and disable connection reuse when an upstream returns a final response before request EOS
+- verify denial paths with an upstream hit counter, and verify SSE/large-body/WebSocket behavior with timing and raw-wire assertions

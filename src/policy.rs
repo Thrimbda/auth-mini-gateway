@@ -105,6 +105,7 @@ mod tests {
                 .map(ToOwned::to_owned)
                 .collect::<HashSet<_>>(),
             logout_redirect: "/".to_string(),
+            upstream: None,
         }
     }
 }

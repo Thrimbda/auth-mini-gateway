@@ -2,6 +2,7 @@
 
 ## Current Task Summaries
 
+- [authenticated-reverse-proxy](tasks/authenticated-reverse-proxy.md): optional fixed-upstream authenticated streaming proxy while preserving the nginx `auth_request` adapter mode.
 - [harden-mobile-session-lifecycle](tasks/harden-mobile-session-lifecycle.md): request-driven mobile sessions with 7-day inactivity, 30-day absolute lifetime, resilient refresh, and schema v2 migration.
 - [remove-auth-method-policy](tasks/remove-auth-method-policy.md): remove gateway-level Passkey enforcement and authorize verified auth-mini identities only through allowlists.
 - [production-deployment-docs](tasks/production-deployment-docs.md): production deployment docs for the Rust/SQLite auth-mini gateway.

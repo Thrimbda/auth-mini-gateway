@@ -23,3 +23,11 @@
 - Updated current decisions for 7-day inactivity, 30-day absolute lifetime, schema v2 no-extension migration, exact refresh rejection, no redirects, exact `200 OK`, absolute Cookie expiry, and non-redirecting `503` behavior.
 - Expanded refresh-race and real-E2E patterns with shared-result single-flight, durable identity pending, old-binary compatibility, and WAL backup/restore.
 - Recorded external auth-mini follow-ups for silent SSO, refresh result recovery, and internal-error status separation, plus a physical Safari smoke.
+
+## 2026-07-15
+
+- Added the `authenticated-reverse-proxy` task summary after Heavy RFC review, async implementation, full verification, security remediation, and reviewer walkthrough.
+- Superseded the nginx-only proxy decision with two explicit modes: default `auth_request` adapter or one fixed authenticated upstream proxy selected by `UPSTREAM_URL`.
+- Added durable decisions for shared authentication, static destination authority, local control-route precedence, browser-secret stripping, and verified identity injection.
+- Added the authenticated fixed-upstream proxy pattern covering streaming, one-attempt pooling, WebSocket validation, and early-final upload cancellation.
+- Recorded environment follow-ups for the external real-auth-mini composed run, physical Acorn/FRP mode switch, and richer secret-safe observability.

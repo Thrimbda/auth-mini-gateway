@@ -1,6 +1,4 @@
 use std::collections::HashMap;
-use std::io::{self, BufRead, BufReader, Read, Write};
-use std::net::TcpStream;
 
 pub struct Request {
     pub method: String,
@@ -19,52 +17,21 @@ pub struct Response {
 }
 
 impl Request {
-    pub fn read(stream: &mut TcpStream) -> io::Result<Self> {
-        let mut reader = BufReader::new(stream);
-        let mut request_line = String::new();
-        reader.read_line(&mut request_line)?;
-        let mut parts = request_line.split_whitespace();
-        let method = parts.next().unwrap_or_default().to_string();
-        let target = parts.next().unwrap_or("/").to_string();
-        let mut headers = Vec::new();
-        let mut content_length = 0usize;
-
-        for _ in 0..100 {
-            let mut line = String::new();
-            reader.read_line(&mut line)?;
-            if line == "\r\n" || line == "\n" || line.is_empty() {
-                break;
-            }
-            if let Some((name, value)) = line.split_once(':') {
-                let name = name.trim().to_string();
-                let value = value.trim().to_string();
-                if name.eq_ignore_ascii_case("content-length") {
-                    content_length = value.parse().map_err(|_| {
-                        io::Error::new(io::ErrorKind::InvalidInput, "invalid content-length")
-                    })?;
-                    if content_length > 64 * 1024 {
-                        return Err(io::Error::new(
-                            io::ErrorKind::InvalidInput,
-                            "body too large",
-                        ));
-                    }
-                }
-                headers.push((name, value));
-            }
-        }
-
-        let mut body = vec![0; content_length];
-        reader.read_exact(&mut body)?;
-
+    pub fn new(
+        method: String,
+        target: String,
+        headers: Vec<(String, String)>,
+        body: Vec<u8>,
+    ) -> Self {
         let (path, query) = parse_target(&target);
-        Ok(Self {
+        Self {
             method,
             target,
             path,
             query,
             headers,
             body,
-        })
+        }
     }
 
     pub fn header(&self, name: &str) -> Option<&str> {
@@ -128,23 +95,15 @@ impl Response {
         self.with_header("Set-Cookie", &cookie)
     }
 
-    pub fn write_to(self, stream: &mut TcpStream) -> io::Result<()> {
-        write!(
-            stream,
-            "HTTP/1.1 {} {}\r\n",
-            self.status,
-            reason(self.status)
-        )?;
-        write!(stream, "Content-Length: {}\r\n", self.body.len())?;
-        write!(stream, "Content-Type: {}\r\n", self.content_type)?;
-        write!(stream, "Connection: close\r\n")?;
-        for (name, value) in self.headers {
-            if is_safe_header_name(&name) && is_safe_header_value(&value) {
-                write!(stream, "{}: {}\r\n", name, value)?;
-            }
+    pub fn prepend_cookie(mut self, cookie: String) -> Self {
+        if is_safe_header_value(&cookie) {
+            self.headers.insert(0, ("Set-Cookie".to_string(), cookie));
         }
-        write!(stream, "\r\n")?;
-        stream.write_all(&self.body)
+        self
+    }
+
+    pub(crate) fn into_parts(self) -> (u16, String, Vec<(String, String)>, Vec<u8>) {
+        (self.status, self.content_type, self.headers, self.body)
     }
 
     #[cfg(test)]
@@ -198,21 +157,6 @@ pub fn url_decode(value: &str) -> Option<String> {
         }
     }
     String::from_utf8(out).ok()
-}
-
-fn reason(status: u16) -> &'static str {
-    match status {
-        200 => "OK",
-        204 => "No Content",
-        302 => "Found",
-        400 => "Bad Request",
-        401 => "Unauthorized",
-        403 => "Forbidden",
-        404 => "Not Found",
-        500 => "Internal Server Error",
-        503 => "Service Unavailable",
-        _ => "OK",
-    }
 }
 
 pub fn is_safe_header_value(value: &str) -> bool {

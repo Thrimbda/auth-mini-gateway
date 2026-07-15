@@ -24,6 +24,14 @@ pub struct Config {
     pub allow_emails: HashSet<String>,
     pub allow_user_ids: HashSet<String>,
     pub logout_redirect: String,
+    pub upstream: Option<UpstreamBase>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct UpstreamBase {
+    pub scheme: String,
+    pub authority: String,
+    pub path_prefix: String,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -81,6 +89,7 @@ impl Config {
             allow_emails: parse_csv_lower("ALLOW_EMAILS"),
             allow_user_ids: parse_csv("ALLOW_USER_IDS"),
             logout_redirect: env::var("LOGOUT_REDIRECT").unwrap_or_else(|_| "/".to_string()),
+            upstream: parse_upstream_url(env::var("UPSTREAM_URL").ok().as_deref())?,
         };
         config.validate()?;
         Ok(config)
@@ -94,6 +103,38 @@ impl Config {
         )
         .map_err(Into::into)
     }
+}
+
+pub fn parse_upstream_url(
+    value: Option<&str>,
+) -> Result<Option<UpstreamBase>, Box<dyn std::error::Error>> {
+    let Some(value) = value.filter(|value| !value.is_empty()) else {
+        return Ok(None);
+    };
+    let parsed = Url::parse(value).map_err(|_| "UPSTREAM_URL must be a valid absolute URL")?;
+    if !matches!(parsed.scheme(), "http" | "https") {
+        return Err("UPSTREAM_URL must use http or https".into());
+    }
+    if parsed.cannot_be_a_base() || parsed.host().is_none() {
+        return Err("UPSTREAM_URL must include an authority".into());
+    }
+    if !parsed.username().is_empty() || parsed.password().is_some() {
+        return Err("UPSTREAM_URL must not include credentials".into());
+    }
+    if parsed.query().is_some() {
+        return Err("UPSTREAM_URL must not include a query".into());
+    }
+    if parsed.fragment().is_some() {
+        return Err("UPSTREAM_URL must not include a fragment".into());
+    }
+
+    let authority = parsed[url::Position::BeforeHost..url::Position::AfterPort].to_string();
+    let path_prefix = parsed.path().trim_end_matches('/').to_string();
+    Ok(Some(UpstreamBase {
+        scheme: parsed.scheme().to_string(),
+        authority,
+        path_prefix,
+    }))
 }
 
 fn validate_session_lifetimes(touch: i64, idle: i64, absolute: i64) -> Result<(), &'static str> {
@@ -181,7 +222,7 @@ fn parse_csv_lower(name: &str) -> HashSet<String> {
 
 #[cfg(test)]
 mod tests {
-    use super::validate_session_lifetimes;
+    use super::{parse_upstream_url, validate_session_lifetimes, UpstreamBase};
 
     #[test]
     fn lifecycle_validation_enforces_positive_ordering() {
@@ -189,5 +230,39 @@ mod tests {
         assert!(validate_session_lifetimes(0, 604_800, 2_592_000).is_err());
         assert!(validate_session_lifetimes(604_801, 604_800, 2_592_000).is_err());
         assert!(validate_session_lifetimes(3_600, 2_592_001, 2_592_000).is_err());
+    }
+
+    #[test]
+    fn upstream_url_is_optional_and_preserves_a_fixed_base_path() {
+        assert_eq!(parse_upstream_url(None).expect("missing"), None);
+        assert_eq!(parse_upstream_url(Some("")).expect("empty"), None);
+        assert_eq!(
+            parse_upstream_url(Some("https://app.example:8443/base/")).expect("valid"),
+            Some(UpstreamBase {
+                scheme: "https".to_string(),
+                authority: "app.example:8443".to_string(),
+                path_prefix: "/base".to_string(),
+            })
+        );
+    }
+
+    #[test]
+    fn upstream_url_rejects_dynamic_or_ambiguous_parts_without_echoing_values() {
+        for value in [
+            "relative/path",
+            "ftp://127.0.0.1/app",
+            "http://user@127.0.0.1/app",
+            "http://user:password@127.0.0.1/app",
+            "http://127.0.0.1/app?",
+            "http://127.0.0.1/app#",
+            "http://",
+            "ws://127.0.0.1/socket",
+            "://malformed",
+            "   ",
+        ] {
+            let error = parse_upstream_url(Some(value)).expect_err("invalid upstream");
+            assert!(error.to_string().contains("UPSTREAM_URL"));
+            assert!(!error.to_string().contains(value));
+        }
     }
 }
