@@ -1,11 +1,23 @@
-use std::net::TcpListener;
+use std::convert::Infallible;
+use std::net::SocketAddr;
 use std::panic::{catch_unwind, AssertUnwindSafe};
 use std::sync::Arc;
-use std::thread;
+use std::time::Duration as StdDuration;
 
+use bytes::Bytes;
 use chrono::{DateTime, Duration, TimeZone, Utc};
+use http::header::{CONNECTION, CONTENT_LENGTH, CONTENT_TYPE, COOKIE, EXPECT, HOST, SET_COOKIE};
+use http::{HeaderValue, Method, StatusCode, Version};
+use http_body_util::{BodyExt as _, Limited};
+use hyper::body::{Body as _, Incoming};
+use hyper::server::conn::http1;
+use hyper::service::service_fn;
+use hyper::{Request as HyperRequest, Response as HyperResponse};
+use hyper_util::rt::{TokioIo, TokioTimer};
 use serde::Deserialize;
 use serde_json::json;
+use tokio::net::TcpListener;
+use tokio::sync::Semaphore;
 use url::{form_urlencoded, Url};
 
 use crate::auth_mini::{
@@ -23,39 +35,497 @@ use crate::db::{
 use crate::flight::{Acquire, FlightCoordinator, FlightLeader, FlightOutcome, RejectedReason};
 use crate::http::{is_safe_header_value, Request, Response};
 use crate::policy::{evaluate, Identity, PolicyDecision};
+use crate::proxy::{
+    empty_body, full_body, parse_websocket_request, GatewayBody, Proxy, ProxyError, ProxyIdentity,
+};
+use crate::return_target::{normalize_return_target, ReturnTargetMode};
 
-pub fn run_server(
-    config: Config,
-    auth_mini: AuthMiniClient,
-) -> Result<(), Box<dyn std::error::Error>> {
-    let address = format!("{}:{}", config.host, config.port);
-    let listener = TcpListener::bind(address)?;
-    let config = Arc::new(config);
-    let store = Arc::new(Store::new(config.database_path.clone()));
-    let auth_mini: Arc<dyn AuthMini> = Arc::new(auth_mini);
-    let flights = Arc::new(FlightCoordinator::default());
+const MAX_LOCAL_BODY: usize = 64 * 1024;
+const OWNED_PATHS: [&str; 6] = [
+    "/healthz",
+    "/login",
+    "/auth/callback",
+    "/auth/callback/session",
+    "/auth/check",
+    "/logout",
+];
 
-    for stream in listener.incoming() {
-        let Ok(mut stream) = stream else {
-            continue;
-        };
-        let config = Arc::clone(&config);
-        let store = Arc::clone(&store);
-        let auth_mini = Arc::clone(&auth_mini);
-        let flights = Arc::clone(&flights);
-        thread::spawn(move || {
-            let response = match Request::read(&mut stream) {
-                Ok(request) => {
-                    handle_request(request, &config, &store, auth_mini.as_ref(), &flights)
-                        .unwrap_or_else(|_| no_store(Response::text(500, "Internal server error")))
-                }
-                Err(_) => no_store(Response::text(400, "Bad request")),
-            };
-            let _ = response.write_to(&mut stream);
-        });
+#[derive(Clone)]
+struct AppState {
+    config: Arc<Config>,
+    store: Arc<Store>,
+    auth_mini: Arc<dyn AuthMini>,
+    flights: Arc<FlightCoordinator>,
+    executor: AuthExecutor,
+    proxy: Option<Proxy>,
+    public_proto: String,
+}
+
+#[derive(Clone)]
+struct AuthExecutor {
+    admission: Arc<Semaphore>,
+    work: Arc<Semaphore>,
+}
+
+#[derive(Debug)]
+enum AuthExecutionError {
+    Overloaded,
+    Internal,
+}
+
+impl AuthExecutor {
+    fn new() -> Self {
+        Self::with_limits(64, 128)
     }
 
+    fn with_limits(work: usize, admission: usize) -> Self {
+        Self {
+            admission: Arc::new(Semaphore::new(admission)),
+            work: Arc::new(Semaphore::new(work)),
+        }
+    }
+
+    async fn run<T, F>(&self, operation: F) -> Result<T, AuthExecutionError>
+    where
+        T: Send + 'static,
+        F: FnOnce() -> T + Send + 'static,
+    {
+        let admission = Arc::clone(&self.admission)
+            .try_acquire_owned()
+            .map_err(|_| AuthExecutionError::Overloaded)?;
+        let work = Arc::clone(&self.work)
+            .acquire_owned()
+            .await
+            .map_err(|_| AuthExecutionError::Internal)?;
+        tokio::task::spawn_blocking(move || {
+            let _permits = (admission, work);
+            operation()
+        })
+        .await
+        .map_err(|_| AuthExecutionError::Internal)
+    }
+}
+
+pub async fn run_server(
+    config: Config,
+    auth_mini: Arc<AuthMiniClient>,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let address = format!("{}:{}", config.host, config.port);
+    let listener = TcpListener::bind(address).await?;
+    let auth_mini: Arc<dyn AuthMini> = auth_mini;
+    run_server_with_listener(config, auth_mini, listener).await
+}
+
+pub async fn run_server_with_listener(
+    config: Config,
+    auth_mini: Arc<dyn AuthMini>,
+    listener: TcpListener,
+) -> Result<(), Box<dyn std::error::Error>> {
+    run_server_with_listener_and_roots(config, auth_mini, listener, None).await
+}
+
+pub async fn run_server_with_listener_and_roots(
+    config: Config,
+    auth_mini: Arc<dyn AuthMini>,
+    listener: TcpListener,
+    test_roots: Option<rustls::RootCertStore>,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let proxy = match (config.upstream.clone(), test_roots) {
+        (Some(upstream), Some(roots)) => Some(Proxy::with_root_store(upstream, roots)),
+        (Some(upstream), None) => Some(Proxy::new(upstream)),
+        (None, _) => None,
+    }
+    .transpose()
+    .map_err(|_| "failed to initialize UPSTREAM_URL transport")?;
+    let public_proto = Url::parse(&config.public_base_url)?.scheme().to_string();
+    tracing::info!(
+        event = "server_start",
+        mode = if proxy.is_some() { "proxy" } else { "adapter" }
+    );
+    let config = Arc::new(config);
+    let state = AppState {
+        store: Arc::new(Store::new(config.database_path.clone())),
+        config,
+        auth_mini,
+        flights: Arc::new(FlightCoordinator::default()),
+        executor: AuthExecutor::new(),
+        proxy,
+        public_proto,
+    };
+
+    loop {
+        let (stream, peer) = listener.accept().await?;
+        let state = state.clone();
+        tokio::spawn(async move {
+            let service = service_fn(move |request| {
+                let state = state.clone();
+                async move { Ok::<_, Infallible>(handle_hyper_request(request, peer, state).await) }
+            });
+            let mut builder = http1::Builder::new();
+            builder
+                .keep_alive(true)
+                .max_headers(100)
+                .header_read_timeout(StdDuration::from_secs(10))
+                .timer(TokioTimer::new())
+                .ignore_invalid_headers(false);
+            let connection = builder
+                .serve_connection(TokioIo::new(stream), service)
+                .with_upgrades();
+            if connection.await.is_err() {
+                tracing::debug!(event = "downstream_connection", outcome = "closed");
+            }
+        });
+    }
+}
+
+async fn handle_hyper_request(
+    request: HyperRequest<Incoming>,
+    peer: SocketAddr,
+    state: AppState,
+) -> HyperResponse<GatewayBody> {
+    let path = request.uri().path().to_string();
+    if OWNED_PATHS.contains(&path.as_str()) {
+        return handle_local_request(request, state, false).await;
+    }
+    if state.proxy.is_none() {
+        return handle_local_request(request, state, true).await;
+    }
+    handle_proxy_fallback(request, peer, state).await
+}
+
+async fn handle_local_request(
+    request: HyperRequest<Incoming>,
+    state: AppState,
+    adapter_fallback: bool,
+) -> HyperResponse<GatewayBody> {
+    let body_bearing = request_has_body(&request);
+    if validate_expect(&request, body_bearing).is_err() {
+        return generated_response(417, "Expectation failed", true, None);
+    }
+    let transfer_encoded = request
+        .headers()
+        .contains_key(http::header::TRANSFER_ENCODING);
+    let declared_length = request
+        .headers()
+        .get(CONTENT_LENGTH)
+        .and_then(|value| value.to_str().ok())
+        .and_then(|value| value.parse::<usize>().ok());
+    if declared_length.is_some_and(|length| length > MAX_LOCAL_BODY) {
+        return generated_response(400, "Bad request", true, None);
+    }
+
+    let (parts, body) = request.into_parts();
+    let body = if transfer_encoded {
+        Vec::new()
+    } else {
+        match Limited::new(body, MAX_LOCAL_BODY).collect().await {
+            Ok(collected) => collected.to_bytes().to_vec(),
+            Err(_) => return generated_response(400, "Bad request", true, None),
+        }
+    };
+    let headers = parts
+        .headers
+        .iter()
+        .map(|(name, value)| {
+            (
+                name.as_str().to_string(),
+                value.to_str().unwrap_or_default().to_string(),
+            )
+        })
+        .collect();
+    let local_request = Request::new(
+        parts.method.as_str().to_string(),
+        parts.uri.to_string(),
+        headers,
+        body,
+    );
+    if adapter_fallback {
+        return local_into_hyper(
+            no_store(Response::text(404, "Not found")),
+            body_bearing || transfer_encoded,
+        );
+    }
+
+    let blocking = matches!(
+        (local_request.method.as_str(), local_request.path.as_str()),
+        ("GET", "/login")
+            | ("POST", "/auth/callback/session")
+            | ("GET", "/auth/check")
+            | ("GET" | "POST", "/logout")
+    );
+    let response = if blocking {
+        let config = Arc::clone(&state.config);
+        let store = Arc::clone(&state.store);
+        let auth_mini = Arc::clone(&state.auth_mini);
+        let flights = Arc::clone(&state.flights);
+        match state
+            .executor
+            .run(move || {
+                handle_request(local_request, &config, &store, auth_mini.as_ref(), &flights)
+                    .map_err(|_| ())
+            })
+            .await
+        {
+            Ok(Ok(response)) => response,
+            Ok(Err(_)) | Err(AuthExecutionError::Internal) => {
+                no_store(Response::text(500, "Internal server error"))
+            }
+            Err(AuthExecutionError::Overloaded) => auth_unavailable(),
+        }
+    } else {
+        handle_request(
+            local_request,
+            &state.config,
+            &state.store,
+            state.auth_mini.as_ref(),
+            &state.flights,
+        )
+        .unwrap_or_else(|_| no_store(Response::text(500, "Internal server error")))
+    };
+    local_into_hyper(response, body_bearing || transfer_encoded)
+}
+
+async fn handle_proxy_fallback(
+    request: HyperRequest<Incoming>,
+    peer: SocketAddr,
+    state: AppState,
+) -> HyperResponse<GatewayBody> {
+    let body_bearing = request_has_body(&request);
+    let path_and_query = match classify_fallback_target(&request) {
+        Ok(value) => value,
+        Err((status, body)) => return generated_response(status, body, true, None),
+    };
+    let Some(path_and_query) = normalize_return_target(
+        Some(&path_and_query),
+        &state.config.public_base_url,
+        ReturnTargetMode::ProxyFallback,
+    ) else {
+        return generated_response(400, "Bad request", body_bearing, None);
+    };
+    if validate_expect(&request, body_bearing).is_err() {
+        return generated_response(417, "Expectation failed", true, None);
+    }
+    if request.headers().get_all(HOST).iter().count() != 1 {
+        return generated_response(400, "Bad request", true, None);
+    }
+    let websocket = match parse_websocket_request(&request) {
+        Ok(websocket) => websocket,
+        Err(_) => return generated_response(400, "Bad request", true, None),
+    };
+    let cookie = request
+        .headers()
+        .get(COOKIE)
+        .and_then(|value| value.to_str().ok())
+        .map(ToOwned::to_owned);
+    let config = Arc::clone(&state.config);
+    let store = Arc::clone(&state.store);
+    let auth_mini = Arc::clone(&state.auth_mini);
+    let flights = Arc::clone(&state.flights);
+    let decision = match state
+        .executor
+        .run(move || {
+            auth_decision(
+                cookie.as_deref(),
+                &config,
+                &store,
+                auth_mini.as_ref(),
+                &flights,
+            )
+        })
+        .await
+    {
+        Ok(decision) => decision,
+        Err(AuthExecutionError::Overloaded) => return auth_unavailable_hyper(body_bearing, None),
+        Err(AuthExecutionError::Internal) => {
+            return generated_response(500, "Internal server error", body_bearing, None)
+        }
+    };
+
+    let (identity, renewal) = match decision {
+        AuthDecision::Allow {
+            identity,
+            session_renewal,
+        } => (identity, session_renewal),
+        AuthDecision::Unauthenticated { clear_session } => {
+            let config = Arc::clone(&state.config);
+            let store = Arc::clone(&state.store);
+            let return_to = path_and_query.clone();
+            let login = state
+                .executor
+                .run(move || create_login_response(&return_to, &config, &store).map_err(|_| ()))
+                .await;
+            return match login {
+                Ok(Ok(response)) => {
+                    local_into_hyper(response.prepend_cookie(clear_session), body_bearing)
+                }
+                Ok(Err(_)) | Err(_) => generated_response(
+                    500,
+                    "Internal server error",
+                    body_bearing,
+                    Some(clear_session),
+                ),
+            };
+        }
+        AuthDecision::Forbidden => return generated_response(403, "Forbidden", body_bearing, None),
+        AuthDecision::Unavailable => return auth_unavailable_hyper(body_bearing, None),
+    };
+
+    let proxy = state.proxy.as_ref().expect("proxy mode");
+    let result = proxy
+        .forward(
+            request,
+            &path_and_query,
+            peer,
+            &state.public_proto,
+            ProxyIdentity {
+                user_id: identity.user_id,
+                email: identity.email,
+            },
+            renewal.clone(),
+            body_bearing,
+            websocket,
+        )
+        .await;
+    match result {
+        Ok(response) => response,
+        Err(ProxyError::BadRequest) => generated_response(400, "Bad request", true, renewal),
+        Err(ProxyError::BadGateway) => {
+            generated_response(502, "Bad gateway", body_bearing, renewal)
+        }
+        Err(ProxyError::Internal) => {
+            generated_response(500, "Internal server error", body_bearing, renewal)
+        }
+    }
+}
+
+fn classify_fallback_target(
+    request: &HyperRequest<Incoming>,
+) -> Result<String, (u16, &'static str)> {
+    if request.method() == Method::CONNECT {
+        return Err((405, "Method not allowed"));
+    }
+    if request.uri().path() == "*" {
+        return Err((400, "Bad request"));
+    }
+    if request.uri().scheme().is_some() {
+        if !matches!(request.uri().scheme_str(), Some("http" | "https")) {
+            return Err((400, "Bad request"));
+        }
+        return request
+            .uri()
+            .path_and_query()
+            .map(|value| value.as_str().to_string())
+            .filter(|value| value.starts_with('/'))
+            .ok_or((400, "Bad request"));
+    }
+    if request.uri().authority().is_some() {
+        return Err((400, "Bad request"));
+    }
+    request
+        .uri()
+        .path_and_query()
+        .map(|value| value.as_str().to_string())
+        .filter(|value| value.starts_with('/'))
+        .ok_or((400, "Bad request"))
+}
+
+fn validate_expect(request: &HyperRequest<Incoming>, body_bearing: bool) -> Result<(), ()> {
+    let values: Vec<_> = request.headers().get_all(EXPECT).iter().collect();
+    if values.is_empty() {
+        return Ok(());
+    }
+    if values.len() != 1
+        || request.version() != Version::HTTP_11
+        || !body_bearing
+        || !values[0]
+            .to_str()
+            .is_ok_and(|value| value.eq_ignore_ascii_case("100-continue"))
+    {
+        return Err(());
+    }
     Ok(())
+}
+
+fn request_has_body(request: &HyperRequest<Incoming>) -> bool {
+    !request.body().is_end_stream()
+        || request
+            .headers()
+            .get(CONTENT_LENGTH)
+            .and_then(|value| value.to_str().ok())
+            .and_then(|value| value.parse::<u64>().ok())
+            .is_some_and(|length| length > 0)
+        || request
+            .headers()
+            .contains_key(http::header::TRANSFER_ENCODING)
+}
+
+fn generated_response(
+    status: u16,
+    text: &'static str,
+    close: bool,
+    cookie: Option<String>,
+) -> HyperResponse<GatewayBody> {
+    let mut response = HyperResponse::new(full_body(Bytes::from_static(text.as_bytes())));
+    *response.status_mut() = StatusCode::from_u16(status).expect("fixed status");
+    response.headers_mut().insert(
+        CONTENT_TYPE,
+        HeaderValue::from_static("text/plain; charset=utf-8"),
+    );
+    response.headers_mut().insert(
+        http::header::CACHE_CONTROL,
+        HeaderValue::from_static("no-store"),
+    );
+    if close {
+        response
+            .headers_mut()
+            .insert(CONNECTION, HeaderValue::from_static("close"));
+    }
+    if let Some(cookie) = cookie {
+        if let Ok(value) = HeaderValue::from_str(&cookie) {
+            response.headers_mut().append(SET_COOKIE, value);
+        }
+    }
+    response
+}
+
+fn auth_unavailable_hyper(close: bool, cookie: Option<String>) -> HyperResponse<GatewayBody> {
+    let mut response = generated_response(
+        503,
+        "Authentication service temporarily unavailable",
+        close,
+        cookie,
+    );
+    response
+        .headers_mut()
+        .insert(http::header::RETRY_AFTER, HeaderValue::from_static("5"));
+    response
+}
+
+fn local_into_hyper(response: Response, close: bool) -> HyperResponse<GatewayBody> {
+    let (status, content_type, headers, body) = response.into_parts();
+    let mut response = HyperResponse::new(if body.is_empty() {
+        empty_body()
+    } else {
+        full_body(body)
+    });
+    *response.status_mut() =
+        StatusCode::from_u16(status).unwrap_or(StatusCode::INTERNAL_SERVER_ERROR);
+    if let Ok(value) = HeaderValue::from_str(&content_type) {
+        response.headers_mut().insert(CONTENT_TYPE, value);
+    }
+    for (name, value) in headers {
+        if let Ok(name) = http::HeaderName::from_bytes(name.as_bytes()) {
+            let value = HeaderValue::from_bytes(value.as_bytes())
+                .expect("Response stores only validated header bytes");
+            response.headers_mut().append(name, value);
+        }
+    }
+    if close {
+        response
+            .headers_mut()
+            .insert(CONNECTION, HeaderValue::from_static("close"));
+    }
+    response
 }
 
 fn handle_request(
@@ -96,7 +566,15 @@ fn handle_login(
     ) else {
         return Ok(no_store(Response::text(400, "Invalid return_to")));
     };
-    let state = store.create_login_state(&return_to, config.login_state_ttl_seconds)?;
+    create_login_response(&return_to, config, store)
+}
+
+fn create_login_response(
+    return_to: &str,
+    config: &Config,
+    store: &Store,
+) -> Result<Response, Box<dyn std::error::Error>> {
+    let state = store.create_login_state(return_to, config.login_state_ttl_seconds)?;
     Ok(
         Response::redirect(&build_auth_mini_login_url(&state.id, config)).with_cookie(
             serialize_signed_cookie(LOGIN_STATE_COOKIE, &state.id, state.expires_at, config),
@@ -189,6 +667,25 @@ fn create_session_from_tokens(
     })?)
 }
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct VerifiedIdentity {
+    user_id: String,
+    email: Option<String>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+enum AuthDecision {
+    Allow {
+        identity: VerifiedIdentity,
+        session_renewal: Option<String>,
+    },
+    Unauthenticated {
+        clear_session: String,
+    },
+    Forbidden,
+    Unavailable,
+}
+
 fn handle_auth_check(
     request: &Request,
     config: &Config,
@@ -196,19 +693,52 @@ fn handle_auth_check(
     auth_mini: &dyn AuthMini,
     flights: &FlightCoordinator,
 ) -> Response {
-    let Some(session_id) = read_signed_cookie(
-        request.header("Cookie"),
-        SESSION_COOKIE,
-        &config.cookie_secret,
-    ) else {
-        return unauthenticated(config);
+    match auth_decision(request.header("Cookie"), config, store, auth_mini, flights) {
+        AuthDecision::Allow {
+            identity,
+            session_renewal,
+        } => {
+            let mut response =
+                Response::empty(204).with_header("X-Auth-Mini-User-Id", &identity.user_id);
+            if let Some(email) = identity.email.as_deref() {
+                response = response.with_header("X-Auth-Mini-Email", email);
+            }
+            if let Some(cookie) = session_renewal {
+                response = response.with_cookie(cookie);
+            }
+            no_store(response)
+        }
+        AuthDecision::Unauthenticated { clear_session } => {
+            no_store(Response::text(401, "Unauthenticated")).with_cookie(clear_session)
+        }
+        AuthDecision::Forbidden => no_store(Response::text(403, "Forbidden")),
+        AuthDecision::Unavailable => auth_unavailable(),
+    }
+}
+
+fn auth_decision(
+    cookie_header: Option<&str>,
+    config: &Config,
+    store: &Store,
+    auth_mini: &dyn AuthMini,
+    flights: &FlightCoordinator,
+) -> AuthDecision {
+    let Some(session_id) = read_signed_cookie(cookie_header, SESSION_COOKIE, &config.cookie_secret)
+    else {
+        return AuthDecision::Unauthenticated {
+            clear_session: clear_cookie(SESSION_COOKIE, config),
+        };
     };
 
     for _ in 0..8 {
         let session = match store.lookup_session(&session_id) {
             Ok(SessionLookup::Active(session)) => session,
-            Ok(SessionLookup::Inactive) => return unauthenticated(config),
-            Err(_) => return auth_unavailable(),
+            Ok(SessionLookup::Inactive) => {
+                return AuthDecision::Unauthenticated {
+                    clear_session: clear_cookie(SESSION_COOKIE, config),
+                }
+            }
+            Err(_) => return AuthDecision::Unavailable,
         };
 
         if session.identity_state == IdentityState::Pending
@@ -241,24 +771,26 @@ fn handle_auth_check(
                 }
                 FlightOutcome::Rejected { .. } => {
                     eprintln!("event=refresh_flight outcome=rejected");
-                    return unauthenticated(config);
+                    return AuthDecision::Unauthenticated {
+                        clear_session: clear_cookie(SESSION_COOKIE, config),
+                    };
                 }
                 FlightOutcome::Temporary { .. } => {
                     eprintln!("event=refresh_flight outcome=temporary");
-                    return auth_unavailable();
+                    return AuthDecision::Unavailable;
                 }
                 FlightOutcome::Indeterminate { .. } => {
                     eprintln!("event=refresh_flight outcome=indeterminate");
-                    return auth_unavailable();
+                    return AuthDecision::Unavailable;
                 }
             }
         }
 
         if evaluate_session_policy(&session, config) == PolicyDecision::Deny {
-            return no_store(Response::text(403, "Forbidden"));
+            return AuthDecision::Forbidden;
         }
         if !identity_headers_are_safe(&session) {
-            return no_store(Response::text(403, "Forbidden"));
+            return AuthDecision::Forbidden;
         }
 
         let touched = match store.touch_ready(
@@ -269,25 +801,28 @@ fn handle_auth_check(
             Ok(TouchResult::NotDue(session)) => (session, false),
             Ok(TouchResult::Advanced(session)) => (session, true),
             Ok(TouchResult::Lost) => continue,
-            Err(_) => return auth_unavailable(),
+            Err(_) => return AuthDecision::Unavailable,
         };
-        let mut response =
-            Response::empty(204).with_header("X-Auth-Mini-User-Id", &touched.0.user_id);
-        if let Some(email) = touched.0.email.as_deref() {
-            response = response.with_header("X-Auth-Mini-Email", email);
-        }
-        if touched.1 {
+        let session_renewal = if touched.1 {
             eprintln!("event=session_touch outcome=advanced");
-            response = response.with_cookie(serialize_signed_cookie(
+            Some(serialize_signed_cookie(
                 SESSION_COOKIE,
                 &touched.0.id,
                 touched.0.idle_expires_at,
                 config,
-            ));
-        }
-        return no_store(response);
+            ))
+        } else {
+            None
+        };
+        return AuthDecision::Allow {
+            identity: VerifiedIdentity {
+                user_id: touched.0.user_id,
+                email: touched.0.email,
+            },
+            session_renewal,
+        };
     }
-    auth_unavailable()
+    AuthDecision::Unavailable
 }
 
 fn execute_flight(
@@ -570,11 +1105,6 @@ fn handle_logout(
     Ok(Response::redirect(&return_to).with_cookie(clear_cookie(SESSION_COOKIE, config)))
 }
 
-fn unauthenticated(config: &Config) -> Response {
-    no_store(Response::text(401, "Unauthenticated"))
-        .with_cookie(clear_cookie(SESSION_COOKIE, config))
-}
-
 fn auth_unavailable() -> Response {
     no_store(Response::text(
         503,
@@ -614,25 +1144,11 @@ fn callback_page() -> Response {
 }
 
 pub fn normalize_return_to(input: Option<&str>, config: &Config) -> Option<String> {
-    let raw = input
-        .map(str::trim)
-        .filter(|value| !value.is_empty())
-        .unwrap_or("/");
-    if raw.contains('\n') || raw.contains('\r') {
-        return None;
-    }
-
-    if raw.starts_with('/') && !raw.starts_with("//") {
-        let parsed = Url::parse(&config.public_base_url).ok()?.join(raw).ok()?;
-        return Some(format_path(&parsed));
-    }
-
-    let parsed = Url::parse(raw).ok()?;
-    let public = Url::parse(&config.public_base_url).ok()?;
-    if parsed.origin() != public.origin() {
-        return None;
-    }
-    Some(format_path(&parsed))
+    normalize_return_target(
+        input,
+        &config.public_base_url,
+        ReturnTargetMode::DirectLogin,
+    )
 }
 
 pub fn build_auth_mini_login_url(state: &str, config: &Config) -> String {
@@ -654,19 +1170,6 @@ pub fn build_auth_mini_login_url(state: &str, config: &Config) -> String {
         "{}/web/#/login?{}",
         config.auth_mini_public_base_url, params
     )
-}
-
-fn format_path(url: &Url) -> String {
-    let mut out = url.path().to_string();
-    if let Some(query) = url.query() {
-        out.push('?');
-        out.push_str(query);
-    }
-    if let Some(fragment) = url.fragment() {
-        out.push('#');
-        out.push_str(fragment);
-    }
-    out
 }
 
 fn evaluate_session_policy(session: &GatewaySession, config: &Config) -> PolicyDecision {
@@ -790,6 +1293,137 @@ mod tests {
         assert!(login_url.starts_with("http://localhost:7777/web/#/login?"));
         assert!(login_url.contains("redirect_uri=http%3A%2F%2Flocalhost%3A8080%2Fauth%2Fcallback"));
         assert!(login_url.contains("state=state-1"));
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn blocking_executor_bounds_admission_and_releases_permits_after_panic() {
+        let executor = AuthExecutor::with_limits(2, 4);
+        let gate = Arc::new(Barrier::new(3));
+        let entered = Arc::new(AtomicUsize::new(0));
+        let mut tasks = Vec::new();
+        for _ in 0..2 {
+            let executor = executor.clone();
+            let gate = Arc::clone(&gate);
+            let entered = Arc::clone(&entered);
+            tasks.push(tokio::spawn(async move {
+                executor
+                    .run(move || {
+                        entered.fetch_add(1, Ordering::SeqCst);
+                        gate.wait();
+                        1usize
+                    })
+                    .await
+            }));
+        }
+        while entered.load(Ordering::SeqCst) != 2 {
+            tokio::task::yield_now().await;
+        }
+        for _ in 0..2 {
+            let executor = executor.clone();
+            tasks.push(tokio::spawn(async move { executor.run(|| 1usize).await }));
+        }
+        while executor.admission.available_permits() != 0 {
+            tokio::task::yield_now().await;
+        }
+        assert!(matches!(
+            executor.run(|| 1usize).await,
+            Err(AuthExecutionError::Overloaded)
+        ));
+        gate.wait();
+        for task in tasks {
+            assert_eq!(task.await.expect("executor task").expect("admitted"), 1);
+        }
+        assert_eq!(executor.admission.available_permits(), 4);
+        assert_eq!(executor.work.available_permits(), 2);
+
+        assert!(matches!(
+            executor.run(|| -> usize { panic!("test panic") }).await,
+            Err(AuthExecutionError::Internal)
+        ));
+        assert_eq!(executor.admission.available_permits(), 4);
+        assert_eq!(executor.work.available_permits(), 2);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn blocking_executor_enforces_full_64_active_64_queued_contract() {
+        let executor = AuthExecutor::with_limits(64, 128);
+        let gate = Arc::new(Barrier::new(65));
+        let entered = Arc::new(AtomicUsize::new(0));
+        let mut active = Vec::new();
+        for _ in 0..64 {
+            let executor = executor.clone();
+            let gate = Arc::clone(&gate);
+            let entered = Arc::clone(&entered);
+            active.push(tokio::spawn(async move {
+                executor
+                    .run(move || {
+                        entered.fetch_add(1, Ordering::SeqCst);
+                        gate.wait();
+                        1usize
+                    })
+                    .await
+            }));
+        }
+        while entered.load(Ordering::SeqCst) != 64 {
+            tokio::task::yield_now().await;
+        }
+
+        let mut queued = Vec::new();
+        for _ in 0..64 {
+            let executor = executor.clone();
+            queued.push(tokio::spawn(async move { executor.run(|| 2usize).await }));
+        }
+        while executor.admission.available_permits() != 0 {
+            tokio::task::yield_now().await;
+        }
+        assert!(matches!(
+            executor.run(|| 3usize).await,
+            Err(AuthExecutionError::Overloaded)
+        ));
+
+        // Cancellation after spawn_blocking starts cannot release its owned
+        // permits while the blocking closure is still running.
+        active[0].abort();
+        tokio::task::yield_now().await;
+        assert_eq!(executor.admission.available_permits(), 0);
+        assert_eq!(executor.work.available_permits(), 0);
+
+        // Queued cancellation starts no blocking work and releases admission.
+        for task in queued.iter().take(8) {
+            task.abort();
+        }
+        while executor.admission.available_permits() != 8 {
+            tokio::task::yield_now().await;
+        }
+
+        gate.wait();
+        for (index, task) in active.into_iter().enumerate() {
+            let result = task.await;
+            if index == 0 {
+                assert!(result.expect_err("aborted active task").is_cancelled());
+            } else {
+                assert_eq!(result.expect("active task").expect("active admitted"), 1);
+            }
+        }
+        for (index, task) in queued.into_iter().enumerate() {
+            let result = task.await;
+            if index < 8 {
+                assert!(result.expect_err("aborted queued task").is_cancelled());
+            } else {
+                assert_eq!(result.expect("queued task").expect("queued admitted"), 2);
+            }
+        }
+        assert_eq!(executor.admission.available_permits(), 128);
+        assert_eq!(executor.work.available_permits(), 64);
+
+        assert!(matches!(
+            executor
+                .run(|| -> usize { panic!("full-contract panic") })
+                .await,
+            Err(AuthExecutionError::Internal)
+        ));
+        assert_eq!(executor.admission.available_permits(), 128);
+        assert_eq!(executor.work.available_permits(), 64);
     }
 
     #[test]
@@ -1888,6 +2522,7 @@ mod tests {
             allow_emails: HashSet::new(),
             allow_user_ids: HashSet::new(),
             logout_redirect: "/".to_string(),
+            upstream: None,
         }
     }
 }

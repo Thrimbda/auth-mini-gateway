@@ -130,6 +130,7 @@ start_gateway() {
   env \
     HOST=127.0.0.1 \
     PORT="$GATEWAY_PORT" \
+    UPSTREAM_URL="${GATEWAY_UPSTREAM_URL:-}" \
     GATEWAY_PUBLIC_BASE_URL="$PUBLIC_BASE" \
     AUTH_MINI_ISSUER="$AUTH_BASE" \
     AUTH_MINI_PUBLIC_BASE_URL="$AUTH_BASE" \
@@ -455,7 +456,8 @@ PY
 
 websocket_check() {
   local jar=$1
-  python3 - "$NGINX_PORT" "$jar" <<'PY'
+  local port=${2:-$NGINX_PORT}
+  python3 - "$port" "$jar" <<'PY'
 import base64, os, socket, sys
 port = int(sys.argv[1])
 jar = sys.argv[2]
@@ -660,6 +662,67 @@ if [[ "$status" != "403" || "$hits_before" != "$hits_after" ]]; then
   printf 'expected denied user to receive isolated 403, got %s\n' "$status" >&2
   exit 1
 fi
+
+printf 'Checking direct gateway proxy mode with real auth-mini state...\n'
+ADAPTER_PUBLIC_BASE="$PUBLIC_BASE"
+stop_gateway
+PUBLIC_BASE="http://127.0.0.1:$GATEWAY_PORT"
+GATEWAY_UPSTREAM_URL="http://127.0.0.1:$UPSTREAM_PORT"
+start_gateway
+PROXY_BASE="$PUBLIC_BASE"
+PROXY_JAR="$TMP_DIR/proxy-cookies.txt"
+state=$(login_start "$PROXY_JAR" "$TMP_DIR/proxy-login.headers")
+seed_otp allowed@example.com 333333
+mint_tokens allowed@example.com 333333 "$TMP_DIR/proxy-tokens.json"
+callback_session "$PROXY_JAR" "$TMP_DIR/proxy-tokens.json" "$state" 200
+force_touch_due
+status=$(curl -sS -o "$TMP_DIR/proxy-body.txt" -D "$TMP_DIR/proxy.headers" -b "$PROXY_JAR" -c "$PROXY_JAR" -w '%{http_code}' "$PROXY_BASE/")
+if [[ "$status" != "200" ]] || ! grep -q 'allowed@example.com' "$TMP_DIR/proxy-body.txt"; then
+  printf 'direct proxy-mode HTTP failed with status %s\n' "$status" >&2
+  exit 1
+fi
+assert_absolute_renewal "$TMP_DIR/proxy.headers"
+
+printf 'Checking direct proxy-mode refresh outage isolation and recovery...\n'
+proxy_before_refresh=$(active_refresh_token)
+expire_active_access
+hits_before=$(upstream_hits)
+stop_auth
+status=$(protected_status "$PROXY_JAR" "$TMP_DIR/proxy-auth-down.txt")
+hits_after=$(upstream_hits)
+if [[ "$status" != "503" || "$hits_before" != "$hits_after" ]]; then
+  printf 'direct proxy-mode auth outage isolation failed\n' >&2
+  exit 1
+fi
+start_auth
+status=$(protected_status "$PROXY_JAR" "$TMP_DIR/proxy-refreshed.txt")
+proxy_after_refresh=$(active_refresh_token)
+if [[ "$status" != "200" || -z "$proxy_after_refresh" || "$proxy_after_refresh" == "$proxy_before_refresh" ]]; then
+  printf 'direct proxy-mode refresh recovery failed\n' >&2
+  exit 1
+fi
+
+force_touch_due
+websocket_check "$PROXY_JAR" "$GATEWAY_PORT"
+hits_before=$(upstream_hits)
+status=$(curl -sS -o /dev/null -b "$DENIED_JAR" -w '%{http_code}' "$PROXY_BASE/")
+hits_after=$(upstream_hits)
+if [[ "$status" != "403" || "$hits_before" != "$hits_after" ]]; then
+  printf 'direct proxy-mode denial isolation failed\n' >&2
+  exit 1
+fi
+logout_status=$(curl -sS -o /dev/null -b "$PROXY_JAR" -c "$PROXY_JAR" -w '%{http_code}' "$PROXY_BASE/logout")
+hits_before=$(upstream_hits)
+status=$(protected_status "$PROXY_JAR" "$TMP_DIR/proxy-after-logout.txt")
+hits_after=$(upstream_hits)
+if [[ "$logout_status" != "302" || "$status" != "302" || "$hits_before" != "$hits_after" ]]; then
+  printf 'direct proxy-mode logout isolation failed\n' >&2
+  exit 1
+fi
+stop_gateway
+GATEWAY_UPSTREAM_URL=""
+PUBLIC_BASE="$ADAPTER_PUBLIC_BASE"
+start_gateway
 
 printf 'Checking a slow upstream cannot move absolute Cookie expiry...\n'
 SLOW_JAR="$TMP_DIR/slow-cookies.txt"

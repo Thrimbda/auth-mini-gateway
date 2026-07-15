@@ -1,6 +1,7 @@
 # auth-mini-gateway
 
-Rust/SQLite gateway that adapts auth-mini sessions to nginx `auth_request` front authentication.
+Rust/SQLite gateway that enforces auth-mini sessions either as an nginx
+`auth_request` adapter or as a fixed-upstream authenticated reverse proxy.
 
 ## What It Does
 
@@ -14,7 +15,9 @@ Rust/SQLite gateway that adapts auth-mini sessions to nginx `auth_request` front
 - Refreshes on protected requests and preserves the local session across temporary auth-mini failures.
 - Durably revokes only on local logout/expiry or an exact auth-mini refresh rejection.
 - Applies exact email/user-id allowlists independently of the IdP authentication method.
-- Lets nginx protect HTTP and WebSocket upstream traffic with `auth_request`.
+- Keeps the existing nginx `auth_request` adapter as the default mode.
+- Optionally streams authenticated HTTP, SSE, and WebSocket traffic to one
+  startup-configured upstream.
 
 ## Quick Start
 
@@ -30,12 +33,25 @@ cargo test
 cargo build
 ```
 
+Direct proxy and fail-closed mode-switch drills:
+
+```bash
+scripts/e2e-proxy-mode.sh
+scripts/e2e-mode-switch.sh
+```
+
+Both use ephemeral loopback fixtures and print no credentials. The real
+auth-mini drill additionally requires the pinned external auth-mini checkout.
+
 The gateway expects a real auth-mini server at `AUTH_MINI_ISSUER`. For local browser traffic, set `AUTH_MINI_PUBLIC_BASE_URL` to the auth-mini origin reachable from the browser.
 
 ## Configuration
 
 - `HOST`: bind host, default `127.0.0.1`.
 - `PORT`: bind port, default `3000`.
+- `UPSTREAM_URL`: optional absolute `http`/`https` URL. Empty or unset selects
+  adapter mode. A non-empty value selects proxy mode and may include a fixed
+  base path, but must not contain credentials, a query, or a fragment.
 - `GATEWAY_PUBLIC_BASE_URL`: public origin serving gateway routes through nginx.
 - `AUTH_MINI_ISSUER`: auth-mini issuer used for JWT `iss` validation and for `/jwks`, `/me`, refresh, and logout; it must be reachable by the gateway.
 - `AUTH_MINI_PUBLIC_BASE_URL`: browser-visible auth-mini origin; defaults to `AUTH_MINI_ISSUER`.
@@ -53,9 +69,55 @@ The gateway expects a real auth-mini server at `AUTH_MINI_ISSUER`. For local bro
 - `REFRESH_SKEW_SECONDS`: refresh access tokens this many seconds before expiry.
 - `LOGOUT_REDIRECT`: default post-logout relative redirect.
 
-## nginx
+## Operating modes
 
-`examples/nginx.conf` exposes public gateway routes and keeps `/auth/check` internal through `/_auth`. Protected upstream requests use nginx `auth_request`; denied requests do not reach upstream. WebSocket upgrade headers are forwarded only after auth succeeds.
+### Adapter mode (default)
+
+Leave `UPSTREAM_URL` empty. The gateway serves only `/healthz`, `/login`,
+`/auth/callback`, `/auth/callback/session`, `/auth/check`, and `/logout`.
+Every other method/path returns the compatibility `404`. nginx calls
+`/auth/check` and proxies the application only after a `204` response.
+
+### Fixed-upstream proxy mode
+
+Set one trusted startup value, for example:
+
+```env
+HOST=127.0.0.1
+PORT=7780
+UPSTREAM_URL=http://127.0.0.1:4096
+```
+
+The six gateway-owned paths still take precedence for every method. Other safe
+paths use the same session, refresh, identity, and allowlist decision as
+`/auth/check`: anonymous requests receive a login `302`, denied identities get
+`403`, authentication uncertainty gets `503`, and only allowed requests reach
+the fixed upstream. The request method, path/query, body, Host semantics,
+chunking, backpressure, SSE, and authenticated WebSocket upgrades are
+preserved without collecting proxy bodies.
+
+`UPSTREAM_URL` is not a routing template. Host, forwarding headers, query
+parameters, absolute-form authorities, cookies, and application redirects
+cannot select another destination. Browser cookies, Authorization,
+Proxy-Authorization, spoofed `X-Auth-Mini-*`, inbound forwarding fields, and
+hop-by-hop headers are removed. The gateway injects only verified user ID/email
+and forwarding metadata derived from the direct peer and configured public
+origin. The direct peer is not necessarily the browser IP when FRP/nginx sits
+in front.
+
+The protected application must bind only to loopback. Expose the gateway—not
+the application—through FRP. For OpenCode, map the gateway listener `7780`,
+which proxies to OpenCode `127.0.0.1:4096`; never expose `4096` or the adapter
+gateway port `3000`. Public TLS remains terminated by Acorn nginx.
+
+## nginx adapter configuration
+
+`examples/nginx.conf` is the adapter-mode example. It exposes public gateway
+routes and keeps `/auth/check` internal through `/_auth`. Protected upstream
+requests use nginx `auth_request`; denied requests do not reach upstream.
+WebSocket upgrade headers are forwarded only after auth succeeds. In proxy
+mode nginx/FRP sends application traffic to the gateway itself; the gateway
+replaces node-local nginx only for application proxying, not Acorn public TLS.
 
 ## Docs
 

@@ -1,6 +1,8 @@
 # auth-mini-gateway Docs
 
-auth-mini-gateway is a small Rust/SQLite front-auth adapter for putting nginx-protected apps behind auth-mini login.
+auth-mini-gateway is a small Rust/SQLite authentication gateway for putting
+apps behind auth-mini login. It can be an nginx `auth_request` adapter or a
+single fixed-upstream streaming proxy.
 
 It does not replace auth-mini. It lets nginx ask a first-party gateway whether a browser request should reach a protected upstream.
 
@@ -9,7 +11,8 @@ It does not replace auth-mini. It lets nginx ask a first-party gateway whether a
 Use this gateway when you want:
 
 - auth-mini login in front of an app that cannot verify auth-mini tokens itself.
-- nginx `auth_request` enforcement for HTTP and WebSocket traffic.
+- nginx `auth_request` enforcement, or direct authenticated HTTP/SSE/WebSocket
+  proxying to one configured upstream.
 - server-side storage of auth-mini access and refresh tokens.
 - browser sessions represented only by opaque, signed, HttpOnly cookies.
 - a single active gateway instance with durable SQLite WAL persistence.
@@ -22,7 +25,7 @@ This gateway intentionally does not provide:
 - auth-mini's authentication core, users, credentials, OTP, Passkey, or signing-key storage.
 - OIDC or OAuth provider behavior.
 - RBAC, organizations, tenants, admin UI, or audit products.
-- direct upstream proxying from the gateway; nginx remains the proxy.
+- multiple upstreams, host/path routing, or user-selected destinations.
 - multi-active gateway instances sharing one SQLite database.
 - cloud-provider-specific deployment manifests.
 
@@ -58,7 +61,8 @@ sequenceDiagram
 1. Deploy auth-mini first and configure its public issuer.
 2. Decide the protected public origin, for example `https://app.example.com`.
 3. Decide the auth-mini public origin, for example `https://auth.example.com`.
-4. Configure nginx as the only public entry to the protected upstream.
+4. Choose adapter mode (node-local nginx proxies the app) or fixed-upstream
+   proxy mode (FRP maps the gateway and the app remains loopback-only).
 5. Run one active gateway instance with a persistent SQLite volume.
 6. Set `COOKIE_SECURE=true` behind HTTPS and use a strong `GATEWAY_COOKIE_SECRET`.
 7. Verify login, refresh, logout, allowlist denial, and WebSocket behavior before rollout.
@@ -86,5 +90,7 @@ Silent SSO is currently **unsupported** by the pinned auth-mini capability evide
 - Example nginx config: `../examples/nginx.conf`
 - Example Docker Compose topology: `../examples/docker-compose.yml`
 - Real auth-mini E2E harness: `../scripts/e2e-real-auth-mini.sh`
+- Direct proxy-mode harness: `../scripts/e2e-proxy-mode.sh`
+- Adapter/proxy mode-switch drill: `../scripts/e2e-mode-switch.sh`
 - Actual pre-change binary compatibility harness: `../scripts/e2e-old-binary-compat.sh`
 - WAL-consistent backup/restore drill: `../scripts/e2e-wal-backup-restore.sh`

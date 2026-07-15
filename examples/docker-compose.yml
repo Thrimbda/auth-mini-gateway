@@ -5,6 +5,9 @@ services:
     environment:
       HOST: 0.0.0.0
       PORT: 3000
+      # Empty keeps this checked-in nginx auth_request topology. Set one fixed
+      # URL only when using the gateway itself as the application proxy.
+      UPSTREAM_URL: ${UPSTREAM_URL:-}
       GATEWAY_PUBLIC_BASE_URL: http://localhost:${NGINX_PORT:-8080}
       AUTH_MINI_ISSUER: ${AUTH_MINI_ISSUER:-http://auth-mini:7777}
       AUTH_MINI_PUBLIC_BASE_URL: ${AUTH_MINI_PUBLIC_BASE_URL:-http://localhost:7777}

@@ -2,7 +2,9 @@
 set -euo pipefail
 
 ROOT_DIR=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)
-BASE_REF=${OLD_GATEWAY_REF:-origin/master}
+# Pin the actual pre-lifecycle binary. Using a moving origin/master stops being
+# an old-binary test as soon as the lifecycle change is merged.
+BASE_REF=${OLD_GATEWAY_REF:-f0519d1}
 TMP_DIR=$(mktemp -d)
 CURRENT_PID=""
 OLD_PID=""
