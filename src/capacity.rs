@@ -26,13 +26,38 @@ impl DownstreamLease {
     }
 }
 
+/// One cloneable ownership token for an admitted downstream HTTP/2 stream.
+/// Separate request- and response-half clones keep the single permit until
+/// both halves (or a tunnel) have relinquished ownership.
+#[derive(Clone)]
+pub(crate) struct DownstreamStreamLease {
+    _inner: Arc<DownstreamStreamLeaseInner>,
+}
+
+struct DownstreamStreamLeaseInner {
+    _permit: OwnedSemaphorePermit,
+}
+
+impl DownstreamStreamLease {
+    pub(crate) fn new(permit: OwnedSemaphorePermit) -> Self {
+        Self {
+            _inner: Arc::new(DownstreamStreamLeaseInner { _permit: permit }),
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn strong_count(&self) -> usize {
+        Arc::strong_count(&self._inner)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use std::sync::Arc;
 
     use tokio::sync::Semaphore;
 
-    use super::DownstreamLease;
+    use super::{DownstreamLease, DownstreamStreamLease};
 
     fn assert_send_sync<T: Send + Sync>() {}
 
@@ -53,6 +78,25 @@ mod tests {
         drop(lease);
         assert_eq!(semaphore.available_permits(), 0);
         drop(clone);
+        assert_eq!(semaphore.available_permits(), 1);
+    }
+
+    #[tokio::test]
+    async fn stream_half_clones_share_exactly_one_owned_permit() {
+        assert_send_sync::<DownstreamStreamLease>();
+        let semaphore = Arc::new(Semaphore::new(1));
+        let lease = DownstreamStreamLease::new(
+            semaphore
+                .clone()
+                .acquire_owned()
+                .await
+                .expect("open semaphore"),
+        );
+        let request_half = lease.clone();
+        assert_eq!(lease.strong_count(), 2);
+        drop(lease);
+        assert_eq!(semaphore.available_permits(), 0);
+        drop(request_half);
         assert_eq!(semaphore.available_permits(), 1);
     }
 }

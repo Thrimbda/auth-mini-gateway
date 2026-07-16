@@ -39,3 +39,10 @@
 - Added current trust decisions for underscore-header rejection and explicit immediate-peer CIDR plus one-value XFF handling.
 - Added reusable lifetime-owned capacity and trusted-forwarding handoff patterns.
 - Replaced the abstract proxy rollout follow-up with exact Acorn `18081`, Axiom `7780`, OpenCode `4096`, systemd resource, trusted-peer, and rollback evidence gates.
+
+## 2026-07-17
+
+- Added the `enable-http2-proxy` task summary after RFC correction, implementation, full verification, security review, and reviewer walkthrough.
+- Added current decisions for ALPN-authoritative HTTPS selection, explicit cleartext protocol choice, configured-only H2 authority, and independent per-stream authentication and admission.
+- Expanded proxy and lifetime patterns with one-dispatch/no-downgrade behavior, per-exchange H2 capacity, same-connection SETTINGS proof, fixed-memory revocation monitoring, and physical-close ownership.
+- Recorded the pinned Hyper CONNECT behavior, generation-retirement and conservative-capability residuals, missing real-auth fixture, upgrade review gate, and separate production rollout requirement.

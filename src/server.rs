@@ -7,29 +7,32 @@ use std::pin::Pin;
 #[cfg(debug_assertions)]
 use std::sync::atomic::{AtomicBool, Ordering as AtomicOrdering};
 use std::sync::Arc;
+use std::task::{Context, Poll};
 use std::time::{Duration as StdDuration, Instant as StdInstant};
 
 use bytes::Bytes;
 use chrono::{DateTime, Duration, TimeZone, Utc};
 use http::header::{CONNECTION, CONTENT_LENGTH, CONTENT_TYPE, COOKIE, EXPECT, HOST, SET_COOKIE};
-use http::{HeaderValue, Method, StatusCode, Version};
+use http::{HeaderName, HeaderValue, Method, StatusCode, Version};
 use http_body_util::{BodyExt as _, Limited};
 use hyper::body::{Body as _, Incoming};
+#[cfg(test)]
 use hyper::server::conn::http1;
 use hyper::service::service_fn;
 use hyper::{Request as HyperRequest, Response as HyperResponse};
-use hyper_util::rt::{TokioIo, TokioTimer};
+use hyper_util::rt::{TokioExecutor, TokioIo, TokioTimer};
+use hyper_util::server::conn::auto;
 use serde::Deserialize;
 use serde_json::json;
 use tokio::net::TcpListener;
-use tokio::sync::Semaphore;
+use tokio::sync::{watch, Semaphore};
 use url::{form_urlencoded, Url};
 
 use crate::auth_mini::{
     AuthMini, AuthMiniClient, IdentityFetchOutcome, IdentityUnavailable, IndeterminateClass,
     RefreshError,
 };
-use crate::capacity::DownstreamLease;
+use crate::capacity::{DownstreamLease, DownstreamStreamLease};
 use crate::config::Config;
 use crate::cookies::{
     clear_cookie, read_signed_cookie, serialize_signed_cookie, LOGIN_STATE_COOKIE, SESSION_COOKIE,
@@ -44,12 +47,14 @@ use crate::http::{is_safe_header_value, Request, Response};
 use crate::policy::{evaluate, Identity, PolicyDecision};
 use crate::proxy::{
     derive_client_ip, empty_body, full_body, parse_websocket_request, CapacityClass, GatewayBody,
-    Proxy, ProxyError, ProxyIdentity,
+    Proxy, ProxyError, ProxyIdentity, WebSocketRequestError,
 };
 use crate::return_target::{normalize_return_target, ReturnTargetMode};
 use crate::runtime_plan::{AUTH_BLOCKING_ADMISSION, AUTH_BLOCKING_WORKERS};
 
 const MAX_LOCAL_BODY: usize = 64 * 1024;
+const DOWNSTREAM_INITIAL_HEAD_TIMEOUT: StdDuration = StdDuration::from_secs(10);
+const DOWNSTREAM_H2_MAX_HEADER_LIST_SIZE: u32 = 16_384;
 #[cfg(debug_assertions)]
 const PROCESS_TEST_TERMINAL_ENV: &str = "AMG_TEST_FATAL_ACCEPT_WITH_UNFINISHABLE_RESOLVER";
 #[cfg(debug_assertions)]
@@ -104,9 +109,124 @@ struct AppState {
     flights: Arc<FlightCoordinator>,
     executor: AuthExecutor,
     login_builder: Arc<dyn LoginStateBuilder>,
+    #[cfg(debug_assertions)]
+    before_service_call: Arc<dyn Fn() + Send + Sync>,
+    #[cfg(debug_assertions)]
     before_auth_decision: Arc<dyn Fn() + Send + Sync>,
+    #[cfg(debug_assertions)]
+    before_upstream_admission: Arc<dyn Fn() + Send + Sync>,
     proxy: Option<Proxy>,
     public_proto: String,
+    downstream_streams: DownstreamStreamAdmission,
+}
+
+#[cfg(not(debug_assertions))]
+const _: fn(&AppState) = |state| {
+    let AppState {
+        config: _,
+        store: _,
+        auth_mini: _,
+        flights: _,
+        executor: _,
+        login_builder: _,
+        proxy: _,
+        public_proto: _,
+        downstream_streams: _,
+    } = state;
+};
+
+#[cfg(debug_assertions)]
+struct ServeHooks {
+    before_service_call: Arc<dyn Fn() + Send + Sync>,
+    before_auth_decision: Arc<dyn Fn() + Send + Sync>,
+    before_upstream_admission: Arc<dyn Fn() + Send + Sync>,
+}
+
+#[cfg(debug_assertions)]
+impl ServeHooks {
+    fn no_op() -> Self {
+        Self {
+            before_service_call: Arc::new(|| {}),
+            before_auth_decision: Arc::new(|| {}),
+            before_upstream_admission: Arc::new(|| {}),
+        }
+    }
+}
+
+#[derive(Clone)]
+struct DownstreamStreamAdmission {
+    gateway_owned: Arc<Semaphore>,
+    proxy_fallback: Option<Arc<Semaphore>>,
+}
+
+impl DownstreamStreamAdmission {
+    fn from_config(config: &Config) -> Self {
+        if config.upstream.is_some() {
+            Self {
+                gateway_owned: Arc::new(Semaphore::new(
+                    config
+                        .max_downstream_connections
+                        .checked_sub(config.max_active_upstreams)
+                        .expect("validated proxy downstream headroom"),
+                )),
+                proxy_fallback: Some(Arc::new(Semaphore::new(config.max_active_upstreams))),
+            }
+        } else {
+            Self {
+                gateway_owned: Arc::new(Semaphore::new(config.max_downstream_connections)),
+                proxy_fallback: None,
+            }
+        }
+    }
+
+    fn try_acquire(
+        &self,
+        version: Version,
+        path: &str,
+    ) -> Result<Option<DownstreamStreamLease>, ()> {
+        if version != Version::HTTP_2 {
+            return Ok(None);
+        }
+        let semaphore = match &self.proxy_fallback {
+            Some(proxy_fallback) if !OWNED_PATHS.contains(&path) => proxy_fallback,
+            _ => &self.gateway_owned,
+        };
+        Arc::clone(semaphore)
+            .try_acquire_owned()
+            .map(DownstreamStreamLease::new)
+            .map(Some)
+            .map_err(|_| ())
+    }
+}
+
+struct DownstreamStreamBody {
+    inner: GatewayBody,
+    lease: Option<DownstreamStreamLease>,
+}
+
+impl hyper::body::Body for DownstreamStreamBody {
+    type Data = Bytes;
+    type Error = crate::proxy::BoxError;
+
+    fn poll_frame(
+        self: Pin<&mut Self>,
+        context: &mut Context<'_>,
+    ) -> Poll<Option<Result<hyper::body::Frame<Self::Data>, Self::Error>>> {
+        let this = self.get_mut();
+        let frame = Pin::new(&mut this.inner).poll_frame(context);
+        if matches!(&frame, Poll::Ready(None) | Poll::Ready(Some(Err(_)))) {
+            this.lease.take();
+        }
+        frame
+    }
+
+    fn is_end_stream(&self) -> bool {
+        self.inner.is_end_stream()
+    }
+
+    fn size_hint(&self) -> hyper::body::SizeHint {
+        self.inner.size_hint()
+    }
 }
 
 trait LoginStateBuilder: Send + Sync {
@@ -533,6 +653,49 @@ pub async fn run_server_with_listener_and_roots(
     listener: TcpListener,
     test_roots: Option<rustls::RootCertStore>,
 ) -> Result<(), SanitizedExit> {
+    run_server_with_listener_and_roots_impl(
+        config,
+        auth_mini,
+        listener,
+        test_roots,
+        #[cfg(debug_assertions)]
+        ServeHooks::no_op(),
+    )
+    .await
+}
+
+#[cfg(debug_assertions)]
+#[doc(hidden)]
+pub async fn run_server_with_listener_and_roots_and_hooks(
+    config: Config,
+    auth_mini: Arc<dyn AuthMini>,
+    listener: TcpListener,
+    test_roots: Option<rustls::RootCertStore>,
+    before_service_call: Arc<dyn Fn() + Send + Sync>,
+    before_auth_decision: Arc<dyn Fn() + Send + Sync>,
+    before_upstream_admission: Arc<dyn Fn() + Send + Sync>,
+) -> Result<(), SanitizedExit> {
+    run_server_with_listener_and_roots_impl(
+        config,
+        auth_mini,
+        listener,
+        test_roots,
+        ServeHooks {
+            before_service_call,
+            before_auth_decision,
+            before_upstream_admission,
+        },
+    )
+    .await
+}
+
+async fn run_server_with_listener_and_roots_impl(
+    config: Config,
+    auth_mini: Arc<dyn AuthMini>,
+    listener: TcpListener,
+    test_roots: Option<rustls::RootCertStore>,
+    #[cfg(debug_assertions)] hooks: ServeHooks,
+) -> Result<(), SanitizedExit> {
     config
         .validate()
         .map_err(|error| SanitizedExit::ConfigurationInvalid {
@@ -542,14 +705,16 @@ pub async fn run_server_with_listener_and_roots(
     let max_blocking_resolvers = config.max_blocking_resolvers;
     #[cfg(not(debug_assertions))]
     let proxy = match (config.upstream.clone(), test_roots) {
-        (Some(upstream), Some(roots)) => Some(Proxy::with_root_store(
+        (Some(upstream), Some(roots)) => Some(Proxy::with_root_store_and_protocol(
             upstream,
+            config.upstream_protocol,
             roots,
             max_active_upstreams,
             max_blocking_resolvers,
         )),
-        (Some(upstream), None) => Some(Proxy::new(
+        (Some(upstream), None) => Some(Proxy::new_with_protocol(
             upstream,
+            config.upstream_protocol,
             max_active_upstreams,
             max_blocking_resolvers,
         )),
@@ -566,8 +731,9 @@ pub async fn run_server_with_listener_and_roots(
             .ok_or(SanitizedExit::ProxyInitializeFailed)?;
         let roots = test_roots.unwrap_or_else(rustls::RootCertStore::empty);
         Some(
-            Proxy::with_root_store_and_resolver(
+            Proxy::with_root_store_and_resolver_protocol(
                 upstream,
+                config.upstream_protocol,
                 roots,
                 max_active_upstreams,
                 max_blocking_resolvers,
@@ -578,14 +744,16 @@ pub async fn run_server_with_listener_and_roots(
         )
     } else {
         match (config.upstream.clone(), test_roots) {
-            (Some(upstream), Some(roots)) => Some(Proxy::with_root_store(
+            (Some(upstream), Some(roots)) => Some(Proxy::with_root_store_and_protocol(
                 upstream,
+                config.upstream_protocol,
                 roots,
                 max_active_upstreams,
                 max_blocking_resolvers,
             )),
-            (Some(upstream), None) => Some(Proxy::new(
+            (Some(upstream), None) => Some(Proxy::new_with_protocol(
                 upstream,
+                config.upstream_protocol,
                 max_active_upstreams,
                 max_blocking_resolvers,
             )),
@@ -601,7 +769,8 @@ pub async fn run_server_with_listener_and_roots(
         proxy,
         AuthExecutor::new(),
         Arc::new(StoreLoginStateBuilder),
-        Arc::new(|| {}),
+        #[cfg(debug_assertions)]
+        hooks,
     )
     .await
 }
@@ -613,8 +782,14 @@ async fn serve_with_components(
     proxy: Option<Proxy>,
     executor: AuthExecutor,
     login_builder: Arc<dyn LoginStateBuilder>,
-    before_auth_decision: Arc<dyn Fn() + Send + Sync>,
+    #[cfg(debug_assertions)] hooks: ServeHooks,
 ) -> Result<(), SanitizedExit> {
+    #[cfg(debug_assertions)]
+    let ServeHooks {
+        before_service_call,
+        before_auth_decision,
+        before_upstream_admission,
+    } = hooks;
     let public_proto = Url::parse(&config.public_base_url)
         .map_err(|_| SanitizedExit::PublicBaseInvalid)?
         .scheme()
@@ -633,6 +808,7 @@ async fn serve_with_components(
             .min(config.max_blocking_resolvers)
     );
     let downstream = Arc::new(Semaphore::new(config.max_downstream_connections));
+    let downstream_streams = DownstreamStreamAdmission::from_config(&config);
     let config = Arc::new(config);
     let state = AppState {
         store: Arc::new(Store::new(config.database_path.clone())),
@@ -641,9 +817,15 @@ async fn serve_with_components(
         flights: Arc::new(FlightCoordinator::default()),
         executor,
         login_builder,
+        #[cfg(debug_assertions)]
+        before_service_call,
+        #[cfg(debug_assertions)]
         before_auth_decision,
+        #[cfg(debug_assertions)]
+        before_upstream_admission,
         proxy,
         public_proto,
+        downstream_streams,
     };
 
     let source = TcpAcceptSource {
@@ -672,28 +854,115 @@ fn spawn_downstream_connection(
     state: AppState,
     lease: DownstreamLease,
 ) {
+    tokio::spawn(serve_downstream_connection(
+        stream,
+        peer,
+        state,
+        lease,
+        DOWNSTREAM_INITIAL_HEAD_TIMEOUT,
+    ));
+}
+
+async fn serve_downstream_connection(
+    stream: tokio::net::TcpStream,
+    peer: SocketAddr,
+    state: AppState,
+    lease: DownstreamLease,
+    initial_head_timeout: StdDuration,
+) {
+    let max_concurrent_streams = state
+        .config
+        .max_downstream_connections
+        .min(u32::MAX as usize) as u32;
     let service_lease = lease.clone();
-    tokio::spawn(async move {
-        let service = service_fn(move |request| {
-            let state = state.clone();
-            let lease = service_lease.clone();
-            async move { Ok::<_, Infallible>(handle_hyper_request(request, peer, state, lease).await) }
-        });
-        let mut builder = http1::Builder::new();
-        builder
-            .keep_alive(true)
-            .max_headers(100)
-            .header_read_timeout(StdDuration::from_secs(10))
-            .timer(TokioTimer::new())
-            .ignore_invalid_headers(false);
-        let connection = builder
-            .serve_connection(TokioIo::new(stream), service)
-            .with_upgrades();
-        if connection.await.is_err() {
-            tracing::debug!(event = "downstream_connection", outcome = "closed");
+    let (first_head_sender, first_head_receiver) = watch::channel(false);
+    let service = service_fn(move |request| {
+        // `Service::call` is reached only after Hyper has parsed a complete
+        // request head. Latch this synchronously before creating the handler
+        // future so the initial connection deadline cannot leak into the
+        // request or response lifetime.
+        first_head_sender.send_replace(true);
+        #[cfg(debug_assertions)]
+        (state.before_service_call)();
+        let state = state.clone();
+        let lease = service_lease.clone();
+        let version = request.version();
+        let body_bearing = request_has_body(&request);
+        let stream_admission = state
+            .downstream_streams
+            .try_acquire(version, request.uri().path());
+        async move {
+            let (response, stream_lease) = match stream_admission {
+                Ok(stream_lease) => (
+                    handle_hyper_request(request, peer, state, lease, stream_lease.clone()).await,
+                    stream_lease,
+                ),
+                Err(()) => {
+                    tracing::info!(
+                        event = "downstream_stream_capacity",
+                        protocol = "http2",
+                        outcome = "saturated"
+                    );
+                    (service_capacity_hyper(body_bearing, None), None)
+                }
+            };
+            Ok::<_, Infallible>(finish_downstream_response(response, version, stream_lease))
         }
-        drop(lease);
     });
+
+    let mut builder = auto::Builder::new(TokioExecutor::new());
+    builder
+        .http1()
+        .keep_alive(true)
+        .max_headers(100)
+        .header_read_timeout(StdDuration::from_secs(10))
+        .timer(TokioTimer::new())
+        .ignore_invalid_headers(false);
+    builder
+        .http2()
+        .max_header_list_size(DOWNSTREAM_H2_MAX_HEADER_LIST_SIZE)
+        .max_concurrent_streams(max_concurrent_streams)
+        .enable_connect_protocol();
+
+    let connection = builder.serve_connection_with_upgrades(TokioIo::new(stream), service);
+    tokio::pin!(connection);
+    let initial_sleep = tokio::time::sleep(initial_head_timeout);
+    tokio::pin!(initial_sleep);
+    let mut wait_receiver = first_head_receiver.clone();
+    let first_head = async move {
+        if !*wait_receiver.borrow() {
+            let _ = wait_receiver.changed().await;
+        }
+    };
+    tokio::pin!(first_head);
+
+    let completed = tokio::select! {
+        result = &mut connection => Some(result),
+        () = &mut first_head => None,
+        () = &mut initial_sleep => {
+            // Resolve a simultaneous complete-head signal in favor of the
+            // request. Otherwise dropping the one pinned future closes the
+            // connection at the original absolute deadline.
+            if *first_head_receiver.borrow() {
+                None
+            } else {
+                tracing::debug!(
+                    event = "downstream_connection",
+                    outcome = "initial_head_timeout"
+                );
+                drop(lease);
+                return;
+            }
+        }
+    };
+    let result = match completed {
+        Some(result) => result,
+        None => connection.await,
+    };
+    if result.is_err() {
+        tracing::debug!(event = "downstream_connection", outcome = "closed");
+    }
+    drop(lease);
 }
 
 async fn handle_hyper_request(
@@ -701,15 +970,42 @@ async fn handle_hyper_request(
     peer: SocketAddr,
     state: AppState,
     downstream_lease: DownstreamLease,
+    downstream_stream_lease: Option<DownstreamStreamLease>,
 ) -> HyperResponse<GatewayBody> {
+    if request.version() == Version::HTTP_2
+        && request.method() != Method::CONNECT
+        && validate_ordinary_h2_request(&request).is_err()
+    {
+        return generated_response(400, "Bad request", true, None);
+    }
     let path = request.uri().path().to_string();
+    if OWNED_PATHS.contains(&path.as_str())
+        && request.method() == Method::CONNECT
+        && request.version() == Version::HTTP_2
+    {
+        return match parse_websocket_request(&request) {
+            Err(WebSocketRequestError::BadRequest) => {
+                generated_response(400, "Bad request", true, None)
+            }
+            Ok(_) | Err(WebSocketRequestError::MethodNotAllowed) => {
+                generated_response(405, "Method not allowed", true, None)
+            }
+        };
+    }
     if OWNED_PATHS.contains(&path.as_str()) {
         return handle_local_request(request, state, false).await;
     }
     if state.proxy.is_none() {
         return handle_local_request(request, state, true).await;
     }
-    handle_proxy_fallback(request, peer, state, downstream_lease).await
+    handle_proxy_fallback(
+        request,
+        peer,
+        state,
+        downstream_lease,
+        downstream_stream_lease,
+    )
+    .await
 }
 
 async fn handle_local_request(
@@ -718,6 +1014,14 @@ async fn handle_local_request(
     adapter_fallback: bool,
 ) -> HyperResponse<GatewayBody> {
     let body_bearing = request_has_body(&request);
+    let h2_cookie = if request.version() == Version::HTTP_2 {
+        match proxy_auth_cookie(&request) {
+            Ok(cookie) => cookie,
+            Err(()) => return generated_response(400, "Bad request", true, None),
+        }
+    } else {
+        None
+    };
     if validate_expect(&request, body_bearing).is_err() {
         return generated_response(417, "Expectation failed", true, None);
     }
@@ -742,9 +1046,10 @@ async fn handle_local_request(
             Err(_) => return generated_response(400, "Bad request", true, None),
         }
     };
-    let headers = parts
+    let mut headers: Vec<_> = parts
         .headers
         .iter()
+        .filter(|(name, _)| parts.version != Version::HTTP_2 || *name != COOKIE)
         .map(|(name, value)| {
             (
                 name.as_str().to_string(),
@@ -752,12 +1057,20 @@ async fn handle_local_request(
             )
         })
         .collect();
-    let local_request = Request::new(
-        parts.method.as_str().to_string(),
-        parts.uri.to_string(),
-        headers,
-        body,
-    );
+    if let Some(cookie) = h2_cookie {
+        headers.push(("Cookie".to_string(), cookie));
+    }
+    let target = if parts.version == Version::HTTP_2 {
+        parts
+            .uri
+            .path_and_query()
+            .map(|value| value.as_str())
+            .unwrap_or(parts.uri.path())
+            .to_string()
+    } else {
+        parts.uri.to_string()
+    };
+    let local_request = Request::new(parts.method.as_str().to_string(), target, headers, body);
     if adapter_fallback {
         return local_into_hyper(
             no_store(Response::text(404, "Not found")),
@@ -809,6 +1122,7 @@ async fn handle_proxy_fallback(
     peer: SocketAddr,
     state: AppState,
     downstream_lease: DownstreamLease,
+    downstream_stream_lease: Option<DownstreamStreamLease>,
 ) -> HyperResponse<GatewayBody> {
     let body_bearing = request_has_body(&request);
     if request
@@ -818,9 +1132,22 @@ async fn handle_proxy_fallback(
     {
         return generated_response(400, "Bad request", true, None);
     }
-    let path_and_query = match classify_fallback_target(&request) {
+    let websocket = match parse_websocket_request(&request) {
+        Ok(websocket) => websocket,
+        Err(WebSocketRequestError::BadRequest) => {
+            return generated_response(400, "Bad request", true, None);
+        }
+        Err(WebSocketRequestError::MethodNotAllowed) => {
+            return generated_response(405, "Method not allowed", true, None);
+        }
+    };
+    let path_and_query = match classify_fallback_target(&request, websocket.is_some()) {
         Ok(value) => value,
         Err((status, body)) => return generated_response(status, body, true, None),
+    };
+    let public_authority = match public_authority(&request) {
+        Ok(authority) => authority,
+        Err(()) => return generated_response(400, "Bad request", true, None),
     };
     let Some(path_and_query) = normalize_return_target(
         Some(&path_and_query),
@@ -832,9 +1159,6 @@ async fn handle_proxy_fallback(
     if validate_expect(&request, body_bearing).is_err() {
         return generated_response(417, "Expectation failed", true, None);
     }
-    if request.headers().get_all(HOST).iter().count() != 1 {
-        return generated_response(400, "Bad request", true, None);
-    }
     let client_ip = match derive_client_ip(
         peer.ip(),
         request.headers(),
@@ -843,15 +1167,10 @@ async fn handle_proxy_fallback(
         Ok(client_ip) => client_ip,
         Err(_) => return generated_response(400, "Bad request", true, None),
     };
-    let websocket = match parse_websocket_request(&request) {
-        Ok(websocket) => websocket,
-        Err(_) => return generated_response(400, "Bad request", true, None),
+    let cookie = match proxy_auth_cookie(&request) {
+        Ok(cookie) => cookie,
+        Err(()) => return generated_response(400, "Bad request", true, None),
     };
-    let cookie = request
-        .headers()
-        .get(COOKIE)
-        .and_then(|value| value.to_str().ok())
-        .map(ToOwned::to_owned);
     let auth_result = match run_proxy_auth_operation(&state, cookie, path_and_query.clone()).await {
         Ok(result) => result,
         Err(error) => return proxy_auth_execution_error_response(error, body_bearing),
@@ -863,10 +1182,13 @@ async fn handle_proxy_fallback(
     };
 
     let proxy = state.proxy.as_ref().expect("proxy mode");
+    #[cfg(debug_assertions)]
+    (state.before_upstream_admission)();
     let result = proxy
         .forward(
             request,
             &path_and_query,
+            public_authority,
             client_ip,
             &state.public_proto,
             ProxyIdentity {
@@ -877,6 +1199,7 @@ async fn handle_proxy_fallback(
             body_bearing,
             websocket,
             downstream_lease,
+            downstream_stream_lease,
         )
         .await;
     match result {
@@ -967,12 +1290,14 @@ async fn run_proxy_auth_operation(
     let auth_mini = Arc::clone(&state.auth_mini);
     let flights = Arc::clone(&state.flights);
     let login_builder = Arc::clone(&state.login_builder);
+    #[cfg(debug_assertions)]
     let before_auth_decision = Arc::clone(&state.before_auth_decision);
     state
         .executor
         .run(move || {
             execute_proxy_auth(
                 || {
+                    #[cfg(debug_assertions)]
                     before_auth_decision();
                     auth_decision(
                         cookie.as_deref(),
@@ -990,12 +1315,26 @@ async fn run_proxy_auth_operation(
 
 fn classify_fallback_target(
     request: &HyperRequest<Incoming>,
+    websocket: bool,
 ) -> Result<String, (u16, &'static str)> {
-    if request.method() == Method::CONNECT {
+    if request.method() == Method::CONNECT && !websocket {
         return Err((405, "Method not allowed"));
     }
     if request.uri().path() == "*" {
         return Err((400, "Bad request"));
+    }
+    if request.version() == Version::HTTP_2 {
+        if !matches!(request.uri().scheme_str(), Some("http" | "https"))
+            || request.uri().authority().is_none()
+        {
+            return Err((400, "Bad request"));
+        }
+        return request
+            .uri()
+            .path_and_query()
+            .map(|value| value.as_str().to_string())
+            .filter(|value| value.starts_with('/'))
+            .ok_or((400, "Bad request"));
     }
     if request.uri().scheme().is_some() {
         if !matches!(request.uri().scheme_str(), Some("http" | "https")) {
@@ -1017,6 +1356,63 @@ fn classify_fallback_target(
         .map(|value| value.as_str().to_string())
         .filter(|value| value.starts_with('/'))
         .ok_or((400, "Bad request"))
+}
+
+fn public_authority(request: &HyperRequest<Incoming>) -> Result<HeaderValue, ()> {
+    if request.version() != Version::HTTP_2 {
+        let values: Vec<_> = request.headers().get_all(HOST).iter().collect();
+        return match values.as_slice() {
+            [value] => Ok((*value).clone()),
+            _ => Err(()),
+        };
+    }
+
+    let authority = request.uri().authority().ok_or(())?.as_str();
+    let hosts: Vec<_> = request.headers().get_all(HOST).iter().collect();
+    if hosts.len() > 1
+        || hosts
+            .first()
+            .is_some_and(|host| host.as_bytes() != authority.as_bytes())
+    {
+        return Err(());
+    }
+    HeaderValue::from_str(authority).map_err(|_| ())
+}
+
+fn validate_ordinary_h2_request(request: &HyperRequest<Incoming>) -> Result<(), ()> {
+    if !matches!(request.uri().scheme_str(), Some("http" | "https"))
+        || request.uri().authority().is_none()
+        || !request
+            .uri()
+            .path_and_query()
+            .is_some_and(|value| value.as_str().starts_with('/'))
+    {
+        return Err(());
+    }
+    public_authority(request).map(|_| ())
+}
+
+fn proxy_auth_cookie(request: &HyperRequest<Incoming>) -> Result<Option<String>, ()> {
+    if request.version() != Version::HTTP_2 {
+        return Ok(request
+            .headers()
+            .get(COOKIE)
+            .and_then(|value| value.to_str().ok())
+            .map(ToOwned::to_owned));
+    }
+
+    let mut combined = None::<String>;
+    for value in request.headers().get_all(COOKIE) {
+        let value = value.to_str().map_err(|_| ())?;
+        match &mut combined {
+            Some(combined) => {
+                combined.push_str("; ");
+                combined.push_str(value);
+            }
+            None => combined = Some(value.to_string()),
+        }
+    }
+    Ok(combined)
 }
 
 fn validate_expect(request: &HyperRequest<Incoming>, body_bearing: bool) -> Result<(), ()> {
@@ -1047,6 +1443,40 @@ fn request_has_body(request: &HyperRequest<Incoming>) -> bool {
         || request
             .headers()
             .contains_key(http::header::TRANSFER_ENCODING)
+}
+
+fn finish_downstream_response(
+    mut response: HyperResponse<GatewayBody>,
+    request_version: Version,
+    stream_lease: Option<DownstreamStreamLease>,
+) -> HyperResponse<GatewayBody> {
+    if request_version == Version::HTTP_2 {
+        *response.version_mut() = Version::HTTP_2;
+        for name in [
+            CONNECTION,
+            HeaderName::from_static("keep-alive"),
+            HeaderName::from_static("proxy-connection"),
+            http::header::PROXY_AUTHENTICATE,
+            http::header::PROXY_AUTHORIZATION,
+            http::header::TE,
+            http::header::TRAILER,
+            http::header::TRANSFER_ENCODING,
+            http::header::UPGRADE,
+        ] {
+            response.headers_mut().remove(name);
+        }
+    }
+
+    let Some(stream_lease) = stream_lease else {
+        return response;
+    };
+    let (parts, body) = response.into_parts();
+    let body = DownstreamStreamBody {
+        inner: body,
+        lease: Some(stream_lease),
+    }
+    .boxed_unsync();
+    HyperResponse::from_parts(parts, body)
 }
 
 fn generated_response(
@@ -1875,6 +2305,8 @@ mod tests {
     use std::thread;
 
     use chrono::TimeZone;
+    use http_body_util::{BodyExt as _, Full};
+    use hyper::client::conn::http2;
     use tempfile::tempdir;
     use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
 
@@ -2336,6 +2768,151 @@ mod tests {
         assert!(!renewed.headers().contains_key(CONNECTION));
     }
 
+    #[test]
+    fn downstream_h2_stream_admission_uses_exact_mode_partitions() {
+        let mut proxy_config = test_config();
+        proxy_config.upstream = crate::config::parse_upstream_url(Some("http://127.0.0.1:4096"))
+            .expect("valid upstream");
+        proxy_config.upstream_protocol = crate::config::UpstreamProtocol::Http1;
+        proxy_config.max_downstream_connections = 18;
+        proxy_config.max_active_upstreams = 2;
+        proxy_config.validate().expect("valid proxy capacity");
+        let proxy = DownstreamStreamAdmission::from_config(&proxy_config);
+
+        let proxy_leases: Vec<_> = (0..2)
+            .map(|_| {
+                proxy
+                    .try_acquire(Version::HTTP_2, "/application")
+                    .expect("proxy stream admitted")
+                    .expect("H2 stream lease")
+            })
+            .collect();
+        assert!(proxy.try_acquire(Version::HTTP_2, "/application").is_err());
+
+        let owned_leases: Vec<_> = (0..16)
+            .map(|_| {
+                proxy
+                    .try_acquire(Version::HTTP_2, "/healthz")
+                    .expect("gateway stream admitted")
+                    .expect("H2 stream lease")
+            })
+            .collect();
+        assert!(proxy.try_acquire(Version::HTTP_2, "/healthz").is_err());
+        assert!(proxy
+            .try_acquire(Version::HTTP_11, "/application")
+            .expect("H1 has connection admission")
+            .is_none());
+
+        drop(proxy_leases);
+        drop(owned_leases);
+
+        let adapter = DownstreamStreamAdmission::from_config(&test_config());
+        let adapter_leases: Vec<_> = (0..256)
+            .map(|_| {
+                adapter
+                    .try_acquire(Version::HTTP_2, "/anything")
+                    .expect("adapter stream admitted")
+                    .expect("H2 stream lease")
+            })
+            .collect();
+        assert!(adapter.try_acquire(Version::HTTP_2, "/anything").is_err());
+        drop(adapter_leases);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn first_complete_head_disarms_only_the_initial_deadline_for_h1_and_h2() {
+        let initial_deadline = StdDuration::from_millis(250);
+
+        let (mut h1, h1_server) = short_deadline_downstream(initial_deadline).await;
+        h1.write_all(b"GET /healthz HTTP/1.1\r\nHost: public.example\r\n\r\n")
+            .await
+            .expect("first H1 request");
+        assert!(read_test_h1_head(&mut h1).await.starts_with("HTTP/1.1 204"));
+        tokio::time::sleep(initial_deadline * 3).await;
+        h1.write_all(b"GET /healthz HTTP/1.1\r\nHost: public.example\r\nConnection: close\r\n\r\n")
+            .await
+            .expect("post-deadline H1 request");
+        let mut second_h1 = Vec::new();
+        h1.read_to_end(&mut second_h1)
+            .await
+            .expect("second H1 response");
+        assert!(second_h1.starts_with(b"HTTP/1.1 204"));
+        tokio::time::timeout(StdDuration::from_secs(2), h1_server)
+            .await
+            .expect("H1 server task completed")
+            .expect("H1 server task joined");
+
+        let (h2_stream, h2_server) = short_deadline_downstream(initial_deadline).await;
+        let (mut sender, connection) = http2::Builder::new(TokioExecutor::new())
+            .handshake::<_, Full<Bytes>>(TokioIo::new(h2_stream))
+            .await
+            .expect("H2 prior-knowledge handshake");
+        let h2_client = tokio::spawn(async move {
+            let _ = connection.await;
+        });
+        let first = HyperRequest::builder()
+            .version(Version::HTTP_2)
+            .uri("http://public.example/healthz")
+            .body(Full::new(Bytes::new()))
+            .expect("first H2 request");
+        sender.ready().await.expect("first H2 ready");
+        let first = sender.send_request(first).await.expect("first H2 response");
+        assert_eq!(first.status(), StatusCode::NO_CONTENT);
+        first
+            .into_body()
+            .collect()
+            .await
+            .expect("first H2 response body");
+
+        tokio::time::sleep(initial_deadline * 3).await;
+        let second = HyperRequest::builder()
+            .version(Version::HTTP_2)
+            .uri("http://public.example/healthz")
+            .body(Full::new(Bytes::new()))
+            .expect("second H2 request");
+        sender.ready().await.expect("post-deadline H2 ready");
+        let second = sender
+            .send_request(second)
+            .await
+            .expect("post-deadline H2 response");
+        assert_eq!(second.status(), StatusCode::NO_CONTENT);
+        second
+            .into_body()
+            .collect()
+            .await
+            .expect("second H2 response body");
+
+        drop(sender);
+        h2_client.abort();
+        h2_server.abort();
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn initial_downstream_timeout_covers_idle_and_23_byte_near_h2_preface() {
+        let initial_deadline = StdDuration::from_millis(75);
+
+        let (mut idle, idle_server) = short_deadline_downstream(initial_deadline).await;
+        tokio::time::timeout(initial_deadline * 4, idle_server)
+            .await
+            .expect("idle initial deadline")
+            .expect("idle downstream task");
+        let mut byte = [0_u8; 1];
+        assert_eq!(idle.read(&mut byte).await.expect("idle EOF"), 0);
+
+        let (mut near_h2, near_h2_server) = short_deadline_downstream(initial_deadline).await;
+        const H2_PREFACE: &[u8] = b"PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n";
+        assert_eq!(H2_PREFACE.len(), 24);
+        near_h2
+            .write_all(&H2_PREFACE[..23])
+            .await
+            .expect("23-byte near-H2 preface");
+        tokio::time::timeout(initial_deadline * 4, near_h2_server)
+            .await
+            .expect("near-H2 initial deadline")
+            .expect("near-H2 downstream task");
+        assert_eq!(near_h2.read(&mut byte).await.expect("near-H2 EOF"), 0);
+    }
+
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn raw_resolver_saturation_is_immediate_no_wait_and_control_plane_safe() {
         let upstream_listener = tokio::net::TcpListener::bind("127.0.0.1:0")
@@ -2375,6 +2952,7 @@ mod tests {
             upstream_address.port()
         )))
         .expect("domain upstream URL");
+        config.upstream_protocol = crate::config::UpstreamProtocol::Http1;
         config.max_downstream_connections = 18;
         config.max_active_upstreams = 2;
         config.max_blocking_resolvers = 1;
@@ -2431,7 +3009,11 @@ mod tests {
             Some(proxy),
             AuthExecutor::new(),
             Arc::new(StoreLoginStateBuilder),
-            Arc::new(|| {}),
+            ServeHooks {
+                before_service_call: Arc::new(|| {}),
+                before_auth_decision: Arc::new(|| {}),
+                before_upstream_admission: Arc::new(|| {}),
+            },
         ));
 
         let mut first = tokio::net::TcpStream::connect(gateway_address)
@@ -2625,6 +3207,7 @@ mod tests {
             upstream_address.port()
         )))
         .expect("pooled domain URL");
+        config.upstream_protocol = crate::config::UpstreamProtocol::Http1;
         config.max_downstream_connections = 18;
         config.max_active_upstreams = 2;
         config.max_blocking_resolvers = 1;
@@ -2677,7 +3260,11 @@ mod tests {
             Some(proxy),
             AuthExecutor::new(),
             Arc::new(StoreLoginStateBuilder),
-            Arc::new(|| {}),
+            ServeHooks {
+                before_service_call: Arc::new(|| {}),
+                before_auth_decision: Arc::new(|| {}),
+                before_upstream_admission: Arc::new(|| {}),
+            },
         ));
 
         let mut first = tokio::net::TcpStream::connect(gateway_address)
@@ -2823,9 +3410,12 @@ mod tests {
                 flights: Arc::new(FlightCoordinator::default()),
                 executor,
                 login_builder: builder,
+                before_service_call: Arc::new(|| {}),
                 before_auth_decision,
+                before_upstream_admission: Arc::new(|| {}),
                 proxy: None,
                 public_proto: "http".to_string(),
+                downstream_streams: DownstreamStreamAdmission::from_config(&config),
             }
         };
 
@@ -3123,6 +3713,26 @@ mod tests {
     }
 
     #[test]
+    fn release_cfg_excludes_dynamic_integration_hooks_from_app_state_and_public_api() {
+        let source = include_str!("server.rs")
+            .split("#[cfg(test)]\nmod tests")
+            .next()
+            .expect("server release source");
+        assert!(source.contains("#[cfg(not(debug_assertions))]\nconst _: fn(&AppState)"));
+        assert!(source.contains(
+            "#[cfg(debug_assertions)]\n#[doc(hidden)]\npub async fn run_server_with_listener_and_roots_and_hooks"
+        ));
+        for field in [
+            "before_service_call: Arc<dyn Fn() + Send + Sync>",
+            "before_auth_decision: Arc<dyn Fn() + Send + Sync>",
+            "before_upstream_admission: Arc<dyn Fn() + Send + Sync>",
+        ] {
+            let position = source.find(field).expect("debug hook field");
+            assert!(source[..position].ends_with("#[cfg(debug_assertions)]\n    "));
+        }
+    }
+
+    #[test]
     fn production_blocking_and_dial_sites_are_source_budgeted() {
         let server = include_str!("server.rs")
             .split("#[cfg(test)]\nmod tests")
@@ -3240,6 +3850,7 @@ mod tests {
         let mut config = test_config();
         config.upstream = crate::config::parse_upstream_url(Some("http://127.0.0.1:4096"))
             .expect("valid upstream");
+        config.upstream_protocol = crate::config::UpstreamProtocol::Http1;
         config.max_active_upstreams = 128;
         config.max_downstream_connections = 143;
         assert_eq!(
@@ -4467,6 +5078,69 @@ mod tests {
         (format!("http://{address}"), server)
     }
 
+    async fn short_deadline_downstream(
+        initial_deadline: StdDuration,
+    ) -> (tokio::net::TcpStream, tokio::task::JoinHandle<()>) {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("short-deadline listener");
+        let address = listener.local_addr().expect("short-deadline address");
+        let client = tokio::net::TcpStream::connect(address)
+            .await
+            .expect("short-deadline client");
+        let (server, peer) = listener.accept().await.expect("short-deadline accept");
+
+        let config = test_config();
+        let downstream_streams = DownstreamStreamAdmission::from_config(&config);
+        let config = Arc::new(config);
+        let state = AppState {
+            store: Arc::new(Store::new(config.database_path.clone())),
+            config: Arc::clone(&config),
+            auth_mini: Arc::new(MockAuthMini::new(
+                Vec::new(),
+                Vec::new(),
+                "unused-user".to_string(),
+                "unused-session".to_string(),
+            )),
+            flights: Arc::new(FlightCoordinator::default()),
+            executor: AuthExecutor::new(),
+            login_builder: Arc::new(StoreLoginStateBuilder),
+            before_service_call: Arc::new(|| {}),
+            before_auth_decision: Arc::new(|| {}),
+            before_upstream_admission: Arc::new(|| {}),
+            proxy: None,
+            public_proto: "http".to_string(),
+            downstream_streams,
+        };
+        let downstream = Arc::new(Semaphore::new(1));
+        let lease = DownstreamLease::new(
+            downstream
+                .try_acquire_owned()
+                .expect("short-deadline downstream lease"),
+        );
+        let task = tokio::spawn(serve_downstream_connection(
+            server,
+            peer,
+            state,
+            lease,
+            initial_deadline,
+        ));
+        (client, task)
+    }
+
+    async fn read_test_h1_head(stream: &mut tokio::net::TcpStream) -> String {
+        let mut head = Vec::new();
+        let mut byte = [0u8; 1];
+        while !head.ends_with(b"\r\n\r\n") {
+            stream
+                .read_exact(&mut byte)
+                .await
+                .expect("read H1 response head");
+            head.push(byte[0]);
+        }
+        String::from_utf8(head).expect("UTF-8 H1 response head")
+    }
+
     fn test_config() -> Config {
         Config {
             host: "127.0.0.1".to_string(),
@@ -4488,6 +5162,7 @@ mod tests {
             allow_user_ids: HashSet::new(),
             logout_redirect: "/".to_string(),
             upstream: None,
+            upstream_protocol: crate::config::UpstreamProtocol::Auto,
             max_downstream_connections: 256,
             max_active_upstreams: 128,
             max_blocking_resolvers: 8,
