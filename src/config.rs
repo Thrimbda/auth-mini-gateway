@@ -35,10 +35,29 @@ pub struct Config {
     pub allow_user_ids: HashSet<String>,
     pub logout_redirect: String,
     pub upstream: Option<UpstreamBase>,
+    pub upstream_protocol: UpstreamProtocol,
     pub max_downstream_connections: usize,
     pub max_active_upstreams: usize,
     pub max_blocking_resolvers: usize,
     pub trusted_proxy_cidrs: TrustedProxySet,
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum UpstreamProtocol {
+    #[default]
+    Auto,
+    Http1,
+    Http2,
+}
+
+impl UpstreamProtocol {
+    pub(crate) const fn as_str(self) -> &'static str {
+        match self {
+            Self::Auto => "auto",
+            Self::Http1 => "http1",
+            Self::Http2 => "http2",
+        }
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -187,6 +206,11 @@ impl Config {
         )?;
         let trusted_proxy_cidrs =
             parse_trusted_proxy_cidrs(env::var("TRUSTED_PROXY_CIDRS").ok().as_deref())?;
+        // Parse the URL first so an invalid origin remains the authoritative
+        // startup failure when both settings are malformed.
+        let upstream = parse_upstream_url(env::var("UPSTREAM_URL").ok().as_deref())?;
+        let upstream_protocol =
+            parse_upstream_protocol(env::var("UPSTREAM_PROTOCOL").ok().as_deref())?;
 
         let config = Self {
             host: env::var("HOST").unwrap_or_else(|_| "127.0.0.1".to_string()),
@@ -216,7 +240,8 @@ impl Config {
             allow_emails: parse_csv_lower("ALLOW_EMAILS"),
             allow_user_ids: parse_csv("ALLOW_USER_IDS"),
             logout_redirect: env::var("LOGOUT_REDIRECT").unwrap_or_else(|_| "/".to_string()),
-            upstream: parse_upstream_url(env::var("UPSTREAM_URL").ok().as_deref())?,
+            upstream,
+            upstream_protocol,
             max_downstream_connections,
             max_active_upstreams,
             max_blocking_resolvers,
@@ -243,6 +268,7 @@ impl Config {
                 "GATEWAY_MAX_BLOCKING_RESOLVERS must be an integer from 1 through 32",
             ));
         }
+        validate_upstream_protocol(self.upstream.as_ref(), self.upstream_protocol)?;
         if self.upstream.is_some() {
             let minimum = self
                 .max_active_upstreams
@@ -262,6 +288,34 @@ impl Config {
         }
         Ok(())
     }
+}
+
+pub fn parse_upstream_protocol(value: Option<&str>) -> Result<UpstreamProtocol, ConfigError> {
+    match value {
+        None | Some("") => Ok(UpstreamProtocol::Auto),
+        Some("auto") => Ok(UpstreamProtocol::Auto),
+        Some("http1") => Ok(UpstreamProtocol::Http1),
+        Some("http2") => Ok(UpstreamProtocol::Http2),
+        Some(_) => Err(ConfigError::new(
+            "upstream_protocol_invalid",
+            "UPSTREAM_PROTOCOL must be exactly auto, http1, or http2",
+        )),
+    }
+}
+
+fn validate_upstream_protocol(
+    upstream: Option<&UpstreamBase>,
+    protocol: UpstreamProtocol,
+) -> Result<(), ConfigError> {
+    if upstream.is_some_and(|upstream| upstream.scheme() == "http")
+        && protocol == UpstreamProtocol::Auto
+    {
+        return Err(ConfigError::new(
+            "upstream_protocol_cleartext_auto",
+            "cleartext proxy mode requires UPSTREAM_PROTOCOL=http1 or http2",
+        ));
+    }
+    Ok(())
 }
 
 pub fn parse_upstream_url(value: Option<&str>) -> Result<Option<UpstreamBase>, ConfigError> {
@@ -588,6 +642,61 @@ mod tests {
             assert!(error.to_string().contains("UPSTREAM_URL"));
             assert!(!error.to_string().contains(value));
         }
+    }
+
+    #[test]
+    fn upstream_protocol_has_exact_value_neutral_enum_semantics() {
+        assert_eq!(parse_upstream_protocol(None), Ok(UpstreamProtocol::Auto));
+        assert_eq!(
+            parse_upstream_protocol(Some("")),
+            Ok(UpstreamProtocol::Auto)
+        );
+        assert_eq!(
+            parse_upstream_protocol(Some("auto")),
+            Ok(UpstreamProtocol::Auto)
+        );
+        assert_eq!(
+            parse_upstream_protocol(Some("http1")),
+            Ok(UpstreamProtocol::Http1)
+        );
+        assert_eq!(
+            parse_upstream_protocol(Some("http2")),
+            Ok(UpstreamProtocol::Http2)
+        );
+
+        for invalid in ["AUTO", "h2", "http/1.1", " http1", "http2 ", "https"] {
+            let error = parse_upstream_protocol(Some(invalid)).expect_err("invalid protocol");
+            assert_eq!(error.class(), "upstream_protocol_invalid");
+        }
+        let raw = "raw-protocol-value-marker";
+        let error = parse_upstream_protocol(Some(raw)).expect_err("invalid raw protocol");
+        assert!(!error.to_string().contains(raw));
+    }
+
+    #[test]
+    fn upstream_protocol_validation_is_origin_aware_and_adapter_safe() {
+        let cleartext = parse_upstream_url(Some("http://127.0.0.1:4096"))
+            .expect("valid cleartext URL")
+            .expect("cleartext upstream");
+        let https = parse_upstream_url(Some("https://upstream.example"))
+            .expect("valid HTTPS URL")
+            .expect("HTTPS upstream");
+
+        for protocol in [
+            UpstreamProtocol::Auto,
+            UpstreamProtocol::Http1,
+            UpstreamProtocol::Http2,
+        ] {
+            assert!(validate_upstream_protocol(None, protocol).is_ok());
+            assert!(validate_upstream_protocol(Some(&https), protocol).is_ok());
+        }
+        for protocol in [UpstreamProtocol::Http1, UpstreamProtocol::Http2] {
+            assert!(validate_upstream_protocol(Some(&cleartext), protocol).is_ok());
+        }
+        let error = validate_upstream_protocol(Some(&cleartext), UpstreamProtocol::Auto)
+            .expect_err("cleartext auto must fail");
+        assert_eq!(error.class(), "upstream_protocol_cleartext_auto");
+        assert!(!error.to_string().contains(cleartext.authority()));
     }
 
     #[test]

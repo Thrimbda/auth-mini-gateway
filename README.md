@@ -52,6 +52,9 @@ The gateway expects a real auth-mini server at `AUTH_MINI_ISSUER`. For local bro
 - `UPSTREAM_URL`: optional absolute `http`/`https` URL. Empty or unset selects
   adapter mode. A non-empty value selects proxy mode and may include a fixed
   base path, but must not contain credentials, a query, or a fragment.
+- `UPSTREAM_PROTOCOL`: exact `auto`, `http1`, or `http2`; missing/empty defaults
+  to `auto`. HTTPS and adapter mode accept `auto`. A cleartext `UPSTREAM_URL`
+  requires explicit `http1` or `http2` at startup.
 - `GATEWAY_MAX_DOWNSTREAM_CONNECTIONS`: accepted downstream connection limit,
   default `256`.
 - `GATEWAY_MAX_ACTIVE_UPSTREAMS`: active proxy exchange/connection limit,
@@ -94,6 +97,7 @@ Set one trusted startup value, for example:
 HOST=127.0.0.1
 PORT=7780
 UPSTREAM_URL=http://127.0.0.1:4096
+UPSTREAM_PROTOCOL=http1
 ```
 
 The six gateway-owned paths still take precedence for every method. Other safe
@@ -103,6 +107,24 @@ paths use the same session, refresh, identity, and allowlist decision as
 the fixed upstream. The request method, path/query, body, Host semantics,
 chunking, backpressure, SSE, and authenticated WebSocket upgrades are
 preserved without collecting proxy bodies.
+
+#### Upstream HTTP protocol and WebSocket capability
+
+For HTTPS upstreams, `UPSTREAM_PROTOCOL=auto` offers HTTP/2 and HTTP/1.1 by
+ALPN and treats the negotiated protocol as final. `http2` requires negotiated
+HTTP/2; cleartext `http2` is explicit h2c prior knowledge. Neither mode probes,
+falls back, or replays a request after a protocol or stream failure. Cleartext
+deployments must select `http1` or `http2` explicitly.
+
+RFC 8441 WebSockets are used only when the exact selected HTTP/2 connection
+advertised `SETTINGS_ENABLE_CONNECT_PROTOCOL=1`; otherwise that tunnel returns
+`502` without downgrading to an idle HTTP/1 connection. HTTP/1 Upgrade remains
+supported, including protocol translation when downstream and upstream differ.
+This repository change does not enable HTTP/2 in production infrastructure.
+To roll back upstream traffic, set `UPSTREAM_PROTOCOL=http1` and restart; this
+clears in-memory HTTP/2 generations while downstream HTTP/2 serving remains
+enabled. A downstream-protocol rollback requires the previous HTTP/1-only
+binary and the existing maintenance/old-binary procedure.
 
 `UPSTREAM_URL` is not a routing template. Host, forwarding headers, query
 parameters, absolute-form authorities, cookies, and application redirects

@@ -78,10 +78,20 @@ For a gateway that optionally becomes the protected application proxy:
 - remove browser cookies, authorization, caller identity, inbound forwarding, fixed hop-by-hop fields, and all `Connection`-nominated fields before injecting verified identity
 - preserve the external Host for application semantics without using it for routing or authentication
 - stream request/response frames under HTTP backpressure; never collect application bodies or place them in an unbounded channel
-- use one upstream send attempt and return a sanitized `502` rather than replaying non-idempotent bodies after a stale connection failure
+- close candidate selection before dispatch, call `send_request` once, and never replay, retry, or downgrade selected H2 to H1 after readiness, SETTINGS, capability, GOAWAY, REFUSED_STREAM, reset, stale-generation, or send failure
 - validate both sides of a WebSocket handshake before committing downstream `101`; reject nomination of required handshake fields
 - cancel incomplete uploads and disable connection reuse when an upstream returns a final response before request EOS
 - verify denial paths with an upstream hit counter, and verify SSE/large-body/WebSocket behavior with timing and raw-wire assertions
+
+## HTTP/2 capability proof and retirement pattern
+
+For RFC 8441 on a multiplexed upstream connection:
+
+- before sender publication or application dispatch, observe the initial server SETTINGS and the client's SETTINGS ACK on the same plaintext I/O that Hyper uses; handshake completion or sender readiness alone is not proof
+- keep the same byte-transparent scanner attached for the connection lifetime, retaining only fixed frame-header/setting-pair scratch and scalar counters rather than peer-sized payloads
+- seed eligibility from the initial effective `SETTINGS_ENABLE_CONNECT_PROTOCOL`; initial false remains WebSocket-disabled even if a later SETTINGS says true
+- linearize every H2 enqueue against the shared generation state; a later effective `1` to `0` makes the exact generation nonselectable and retires its driver without H1 downgrade, migration, or replay
+- keep monotonic generation IDs and the retiring owner slot through physical transport close so stale signals cannot evict a replacement generation
 
 ## Lifetime-owned capacity pattern
 
@@ -89,8 +99,10 @@ For an async proxy that must bound tasks and file descriptors:
 
 - acquire downstream capacity before `accept()` so saturation creates no accepted FD or rejection task
 - model one accepted socket as one cloneable private lease that survives Hyper upgrade into the WebSocket bridge
-- separate active-upstream capacity from the bounded idle pool; idle capacity is not an active-work bound
-- own the complete HTTP client connection as sender plus driver handle, and observe driver termination before returning active capacity on non-idle paths
+- count active-upstream capacity per application exchange/stream, not per multiplexed H2 connection; bound physical H1 owners and live/retiring H2 generations through the combined owner slots plus active private connections
+- reserve an H2 creator's sender clone and stream permit before pool publication so another exchange cannot steal the creator's capacity
+- retain exchange and stream permits until both upload disposal and response EOS/error/drop are witnessed; SSE, rejected upgrades, and tunnels retain them through their real terminal cleanup
+- own the complete HTTP client connection as sender, driver, and transport-drop witness; pooled/retiring slots and private/exclusive capacity remain held through physical transport close
 - make DNS resolution explicit and bounded; retain resolver handle plus capacity through timeout/cancellation cleanup instead of using hidden hostname resolution
 - reserve blocking execution for authentication independently from resolver capacity
 - return immediate no-body-poll `503` when upstream/resolver capacity is full; never queue request bodies behind long-lived SSE/WebSocket work

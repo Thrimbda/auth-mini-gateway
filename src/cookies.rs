@@ -214,6 +214,7 @@ mod tests {
             allow_user_ids: HashSet::new(),
             logout_redirect: "/".to_string(),
             upstream: None,
+            upstream_protocol: crate::config::UpstreamProtocol::Auto,
             max_downstream_connections: 256,
             max_active_upstreams: 128,
             max_blocking_resolvers: 8,

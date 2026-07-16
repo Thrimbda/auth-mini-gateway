@@ -4,12 +4,14 @@
 
 - Keep auth-mini external and unmodified; gateway adapts auth-mini login/token/session behavior into either nginx front-auth decisions or one fixed authenticated upstream proxy.
 - `UPSTREAM_URL` is optional. Unset/empty keeps the nginx `auth_request` adapter and unmatched-route `404`; a valid fixed HTTP(S) URL enables authenticated HTTP/SSE/WebSocket proxy fallback.
-- One gateway instance serves one public origin and at most one startup-configured upstream. Request Host, headers, cookies, path, or query cannot select another destination.
+- `UPSTREAM_PROTOCOL` missing/empty means `auto`. HTTPS `auto` is ALPN-authoritative: selected `h2` is final, while `http/1.1` or no ALPN selects H1. Cleartext proxy mode requires explicit `http1` or `http2` because no safe in-band protocol discovery exists.
+- One gateway instance serves one public origin and at most one startup-configured upstream. Configured `UpstreamBase` alone controls upstream scheme, authority, dial target, TLS identity, and pool membership; request Host, H2 authority, headers, cookies, path, or query cannot select another destination.
 - Gateway-owned login, callback, auth-check, logout, and health routes always remain local before proxy fallback.
 - `/auth/check` and proxy mode share one session/refresh/policy/touch decision; only their HTTP response mapping differs.
-- Before proxying, remove browser cookies/authorization, caller identity, inbound forwarding, and hop-by-hop fields; preserve external Host only as app metadata and inject only verified user ID/email.
-- Bound proxy resources with independent startup budgets: downstream connections D=256, active upstreams U=128, and blocking resolvers R=8 by default. Proxy mode requires at least 16 downstream slots beyond U.
-- Hold D through the accepted HTTP/SSE/WebSocket lifetime. Hold U through explicit DNS, TCP/TLS/HTTP, complete sender+driver cleanup, response/SSE body, or tunnel completion. Hold R and U until a resolver handle is observed complete.
+- Every HTTP/2 stream delivered to gateway service independently runs route validation, authentication, allowlist authorization, header sanitation, and capacity admission; no connection-level identity or authorization result is reused.
+- Before proxying over H1 or H2, remove browser cookies/authorization, caller identity, inbound forwarding, and hop-by-hop fields; preserve validated public authority only as application metadata and inject only verified user ID/email.
+- Bound proxy resources with independent startup budgets: downstream connections D=256, active upstream application exchanges/streams U=128, and blocking resolvers R=8 by default. Proxy mode requires at least 16 downstream slots beyond U.
+- Hold D through the accepted HTTP/SSE/WebSocket lifetime. Hold U and stream permits through upload disposal plus response/SSE/tunnel completion; retain pooled/private physical-owner accounting through driver and transport close. Hold R and U until a resolver handle is observed complete.
 - Configure Tokio blocking capacity as 64 auth workers plus R resolver workers plus 16 runtime margin; resolver saturation must not queue hidden blocking work or starve authentication.
 - Validate the effective soft `RLIMIT_NOFILE` against exact adapter/proxy budgets at startup and refuse impossible configurations rather than silently shrinking limits.
 - Recoverable listener errors retry with bounded backoff and globally suppressed logs. Fatal listener errors use non-waiting runtime shutdown, one sanitized event, and nonzero exit so unabortable resolver work cannot block systemd restart.
