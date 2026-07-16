@@ -46,3 +46,4 @@
 - Added current decisions for ALPN-authoritative HTTPS selection, explicit cleartext protocol choice, configured-only H2 authority, and independent per-stream authentication and admission.
 - Expanded proxy and lifetime patterns with one-dispatch/no-downgrade behavior, per-exchange H2 capacity, same-connection SETTINGS proof, fixed-memory revocation monitoring, and physical-close ownership.
 - Recorded the pinned Hyper CONNECT behavior, generation-retirement and conservative-capability residuals, missing real-auth fixture, upgrade review gate, and separate production rollout requirement.
+- Recorded PR #11 squash merge `5638fb0` and the completed task lifecycle.

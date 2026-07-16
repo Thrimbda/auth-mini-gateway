@@ -64,3 +64,12 @@
 - Repeated `review-change` with the security lens records PASS and no blocking finding.
 - Accepted residuals are the pinned Hyper nonzero CONNECT EOF exception, generation-wide failure on illegal revocation, conservative later capability enablement, missing real-auth fixture, and no production rollout in this task.
 - Next: reviewer walkthrough, PR body, wiki writeback, then commit/rebase/push/PR lifecycle.
+
+## 2026-07-17 - Delivery completed
+
+- Reviewer walkthrough, PR body, and Legion wiki writeback were included with the implementation.
+- Feature commit `edda267` was pushed from `legion/enable-http2-proxy-implementation`.
+- PR #11, `https://github.com/Thrimbda/auth-mini-gateway/pull/11`, was mergeable/CLEAN with no repository checks configured and was squash-merged as `5638fb05ee6577818c3bd32541b41ae01d2570f7`.
+- The remote and local feature branches were deleted and the feature worktree was removed.
+- The primary worktree was refreshed in detached-baseline mode to `origin/master` at `5638fb0` before this docs-only terminal-state closeout.
+- No deployment, Nix, production infrastructure, or external-system change was performed.

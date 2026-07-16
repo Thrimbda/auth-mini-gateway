@@ -2,9 +2,9 @@
 
 ## Quick Resume
 
-**Current phase**: Review and delivery
-**Current item**: Produce walkthrough, wiki writeback, and PR delivery
-**Progress**: 7/8 tasks complete
+**Current phase**: Completed
+**Current item**: None - delivery reached terminal state
+**Progress**: 8/8 tasks complete
 ---
 
 ## Phase 1: Contract and design
@@ -28,7 +28,7 @@
 
 ## Phase 4: Review and delivery
 
-- [ ] Complete readiness review, walkthrough, wiki writeback, PR lifecycle, cleanup, and main refresh. | Acceptance: review PASS; delivery evidence exists; PR reaches terminal state; workspace is cleaned and refreshed.
+- [x] Complete readiness review, walkthrough, wiki writeback, PR lifecycle, cleanup, and main refresh. | Acceptance: review PASS; delivery evidence exists; PR reaches terminal state; workspace is cleaned and refreshed.
 ---
 
 ## Discovered Tasks
