@@ -10,6 +10,8 @@
 - `supersedes`: HTTP/1.1-only downstream and upstream proxy transport
 - `superseded-by`: `(none)`
 - `production-rollout`: `separate-not-performed`
+- `delivery-pr`: `https://github.com/Thrimbda/auth-mini-gateway/pull/11`
+- `merge-commit`: `5638fb05ee6577818c3bd32541b41ae01d2570f7`
 
 ## Outcome Summary
 
