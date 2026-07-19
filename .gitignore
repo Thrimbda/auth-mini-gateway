@@ -8,3 +8,4 @@ coverage/
 *.sqlite
 *.sqlite-shm
 *.sqlite-wal
+/.perf/prove-http2-performance-regression/
