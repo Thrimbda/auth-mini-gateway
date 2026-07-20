@@ -11,12 +11,12 @@ pub const SCOUT_TARGETS: [u64; 7] = [5_000, 10_000, 20_000, 40_000, 80_000, 160_
 pub const COUNT_WINDOW_MAX_NS: u64 = 15_000_000_000;
 pub const COUNT_QUALITY_MIN_NS: u64 = 2_000_000_000;
 pub const COUNT_QUALITY_MIN_TICKS: u64 = 100;
-pub const FIXED_Q_OBS_SECONDS: u64 = 10;
-pub const Q_EXTRA_CAP_SECONDS: u64 = 7_200;
-pub const ANALYSIS_CAP_SECONDS: u64 = 1_800;
-pub const PROJECTION_CAP_SECONDS: u64 = 151_200;
-pub const ACTUAL_CAP_SECONDS: u64 = 172_800;
-pub const PRE_FREEZE_FLOOR_SECONDS: u64 = 17_217;
+pub const FIXED_Q_OBS_NS: u64 = 10_000_000_000;
+pub const Q_EXTRA_CAP_NS: u64 = 7_200_000_000_000;
+pub const ANALYSIS_CAP_NS: u64 = 1_800_000_000_000;
+pub const PROJECTION_CAP_NS: u64 = 151_200_000_000_000;
+pub const ACTUAL_CAP_NS: u64 = 172_800_000_000_000;
+pub const PRE_FREEZE_FLOOR_NS: u64 = 17_217_000_000_000;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ScoutTransition {
@@ -368,19 +368,19 @@ pub fn phase_counts(
 #[serde(deny_unknown_fields)]
 pub struct RuntimeProjection {
     pub n: u32,
-    pub e_pre_seconds: u64,
-    pub q_extra_pre_seconds: u64,
-    pub future_arm_seconds: u64,
-    pub remaining_q_extra_seconds: u64,
-    pub analysis_reserve_seconds: u64,
-    pub projected_total_seconds: u64,
+    pub e_pre_ns: u64,
+    pub q_extra_pre_ns: u64,
+    pub future_arm_ns: u64,
+    pub remaining_q_extra_ns: u64,
+    pub analysis_reserve_ns: u64,
+    pub projected_total_ns: u64,
     pub admissible: bool,
 }
 
 pub fn project_runtime(
     n: u32,
-    e_pre_seconds: u64,
-    q_extra_pre_seconds: u64,
+    e_pre_ns: u64,
+    q_extra_pre_ns: u64,
     durations: &[CellDurations],
 ) -> Result<RuntimeProjection> {
     if !matches!(n, 30 | 50) {
@@ -388,7 +388,7 @@ pub fn project_runtime(
             "only runtime-admissible N=30/50 can reach exact admission",
         ));
     }
-    if q_extra_pre_seconds > Q_EXTRA_CAP_SECONDS {
+    if q_extra_pre_ns > Q_EXTRA_CAP_NS {
         return Err(Error::new("completed Q_extra already exceeds Q_cap"));
     }
     if durations.len() != 15 {
@@ -411,15 +411,15 @@ pub fn project_runtime(
         .checked_mul(u64::from(n))
         .and_then(|value| value.checked_add(2 * u64::from(n / 10)))
         .ok_or_else(|| Error::new("future per-cell arm count overflow"))?;
-    let mut future_arm_seconds = 0_u64;
+    let mut future_arm_ns = 0_u64;
     for cell in all_cells() {
-        let cell_duration = arm_cap_seconds(
+        let cell_duration = arm_cap_ns(
             cell,
             *duration_map
                 .get(&cell)
                 .ok_or_else(|| Error::new("missing cell duration"))?,
         )?;
-        future_arm_seconds = future_arm_seconds
+        future_arm_ns = future_arm_ns
             .checked_add(
                 future_per_cell
                     .checked_mul(cell_duration)
@@ -427,37 +427,42 @@ pub fn project_runtime(
             )
             .ok_or_else(|| Error::new("future arm total overflow"))?;
     }
-    let remaining_q_extra_seconds = Q_EXTRA_CAP_SECONDS - q_extra_pre_seconds;
-    let projected_total_seconds = e_pre_seconds
-        .checked_add(future_arm_seconds)
-        .and_then(|value| value.checked_add(remaining_q_extra_seconds))
-        .and_then(|value| value.checked_add(ANALYSIS_CAP_SECONDS))
+    let remaining_q_extra_ns = Q_EXTRA_CAP_NS - q_extra_pre_ns;
+    let projected_total_ns = e_pre_ns
+        .checked_add(future_arm_ns)
+        .and_then(|value| value.checked_add(remaining_q_extra_ns))
+        .and_then(|value| value.checked_add(ANALYSIS_CAP_NS))
         .ok_or_else(|| Error::new("runtime projection overflow"))?;
     Ok(RuntimeProjection {
         n,
-        e_pre_seconds,
-        q_extra_pre_seconds,
-        future_arm_seconds,
-        remaining_q_extra_seconds,
-        analysis_reserve_seconds: ANALYSIS_CAP_SECONDS,
-        projected_total_seconds,
-        admissible: projected_total_seconds <= PROJECTION_CAP_SECONDS,
+        e_pre_ns,
+        q_extra_pre_ns,
+        future_arm_ns,
+        remaining_q_extra_ns,
+        analysis_reserve_ns: ANALYSIS_CAP_NS,
+        projected_total_ns,
+        admissible: projected_total_ns <= PROJECTION_CAP_NS,
     })
 }
 
-pub fn arm_cap_seconds(cell: Cell, durations: FrozenDurations) -> Result<u64> {
+pub fn arm_cap_ns(cell: Cell, durations: FrozenDurations) -> Result<u64> {
     cell.validate()?;
     durations.validate()?;
-    let ordinary = 20_u64
+    let ordinary_seconds = 20_u64
         .checked_add(durations.warmup_seconds)
         .and_then(|value| value.checked_add(durations.measure_seconds))
         .ok_or_else(|| Error::new("arm cap overflow"))?;
-    Ok(ordinary + u64::from(cell.workload == crate::schema::Workload::WebSocket) * 15)
+    let total_seconds = ordinary_seconds
+        .checked_add(u64::from(cell.workload == crate::schema::Workload::WebSocket) * 15)
+        .ok_or_else(|| Error::new("WebSocket arm cap overflow"))?;
+    total_seconds
+        .checked_mul(1_000_000_000)
+        .ok_or_else(|| Error::new("arm cap nanosecond conversion overflow"))
 }
 
 #[must_use]
-pub const fn actual_runtime_allowed(elapsed_seconds: u64) -> bool {
-    elapsed_seconds <= ACTUAL_CAP_SECONDS
+pub const fn actual_runtime_allowed(elapsed_ns: u64) -> bool {
+    elapsed_ns <= ACTUAL_CAP_NS
 }
 
 #[cfg(test)]
@@ -651,11 +656,11 @@ mod tests {
             workload: Workload::WebSocket,
             concurrency: 1,
         };
-        assert_eq!(arm_cap_seconds(ordinary, minimum).expect("cap"), 28);
-        assert_eq!(arm_cap_seconds(ordinary, maximum).expect("cap"), 60);
-        assert_eq!(arm_cap_seconds(websocket, minimum).expect("cap"), 43);
-        assert_eq!(arm_cap_seconds(websocket, maximum).expect("cap"), 75);
-        assert_eq!(PRE_FREEZE_FLOOR_SECONDS, 17_217);
+        assert_eq!(arm_cap_ns(ordinary, minimum).expect("cap"), 28_000_000_000);
+        assert_eq!(arm_cap_ns(ordinary, maximum).expect("cap"), 60_000_000_000);
+        assert_eq!(arm_cap_ns(websocket, minimum).expect("cap"), 43_000_000_000);
+        assert_eq!(arm_cap_ns(websocket, maximum).expect("cap"), 75_000_000_000);
+        assert_eq!(PRE_FREEZE_FLOOR_NS, 17_217_000_000_000);
     }
 
     #[test]
@@ -670,18 +675,16 @@ mod tests {
                 },
             })
             .collect::<Vec<_>>();
-        let n30 =
-            project_runtime(30, PRE_FREEZE_FLOOR_SECONDS, 0, &durations).expect("N=30 projection");
-        assert_eq!(n30.future_arm_seconds, 72_540);
-        assert_eq!(n30.projected_total_seconds, 98_757);
+        let n30 = project_runtime(30, PRE_FREEZE_FLOOR_NS, 0, &durations).expect("N=30 projection");
+        assert_eq!(n30.future_arm_ns, 72_540_000_000_000);
+        assert_eq!(n30.projected_total_ns, 98_757_000_000_000);
         assert!(n30.admissible);
-        let n50 =
-            project_runtime(50, PRE_FREEZE_FLOOR_SECONDS, 0, &durations).expect("N=50 projection");
-        assert_eq!(n50.future_arm_seconds, 120_900);
-        assert_eq!(n50.projected_total_seconds, 147_117);
+        let n50 = project_runtime(50, PRE_FREEZE_FLOOR_NS, 0, &durations).expect("N=50 projection");
+        assert_eq!(n50.future_arm_ns, 120_900_000_000_000);
+        assert_eq!(n50.projected_total_ns, 147_117_000_000_000);
         assert!(n50.admissible);
-        assert!(project_runtime(70, PRE_FREEZE_FLOOR_SECONDS, 0, &durations).is_err());
-        assert!(actual_runtime_allowed(ACTUAL_CAP_SECONDS));
-        assert!(!actual_runtime_allowed(ACTUAL_CAP_SECONDS + 1));
+        assert!(project_runtime(70, PRE_FREEZE_FLOOR_NS, 0, &durations).is_err());
+        assert!(actual_runtime_allowed(ACTUAL_CAP_NS));
+        assert!(!actual_runtime_allowed(ACTUAL_CAP_NS + 1));
     }
 }

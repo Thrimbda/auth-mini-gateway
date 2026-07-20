@@ -13,12 +13,19 @@ pub const DESIGN_LOCK_SCHEMA: &str = "amg-http2-perf/design-lock/v1";
 pub const CALIBRATION_MANIFEST_SCHEMA: &str = "amg-http2-perf/calibration-manifest/v1";
 pub const ZSTD_PROGRAM_SCHEMA: &str = "amg-http2-perf/zstd-program/v1";
 pub const RAW_LIMIT_SCHEMA: &str = "amg-http2-perf/raw-limits/v1";
+pub const MACHINE_SCHEMA: &str = "amg-http2-perf/machine/v1";
+pub const EXECUTION_STATE_SCHEMA: &str = "amg-http2-perf/execution-state/v1";
 
 pub const BASELINE_COMMIT: &str = "28a4a273ea9b2725191dce35233f55972beaac6f";
 pub const INITIAL_CANDIDATE_COMMIT: &str = "1f9821ab36f546ca0ffd9f6b83cb9a1f0af512ad";
 pub const CHUNK_BYTES: u64 = 50_331_648;
 pub const JSON_MAX_BYTES: u64 = 1_048_576;
 pub const TASK_CAP_BYTES: u64 = 536_870_912;
+pub const MAX_ARCHIVE_MEMBERS: u64 = TASK_CAP_BYTES / 512;
+pub const ZSTD_SAFE_CHECKSUM: &str =
+    "8f49c4d5f0abb602a93fb8736af2a4f4dd9512e36f7f570d66e65ff867ed3b9d";
+pub const ZSTD_SYS_CHECKSUM: &str =
+    "91e19ebc2adc8f83e43039e79776e3fda8ca919132d68a1fed6a5faca2683748";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "kebab-case")]
@@ -165,11 +172,19 @@ impl EvidenceClass {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "kebab-case")]
 pub enum EvidenceKind {
     Calibration,
     Campaign,
+    Diagnostic,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum RawProtocol {
+    H1,
+    H2,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -329,7 +344,12 @@ pub struct CodecIdentity {
     pub native_version: String,
     pub native_version_number: u32,
     pub native_source_package: String,
+    pub binding_package_checksum_sha256: String,
+    pub native_package_checksum_sha256: String,
     pub nested_lock_sha256: String,
+    pub codec_module_sha256: String,
+    pub resolver_sha256: String,
+    pub target_identity: String,
     pub parameter_program: String,
 }
 
@@ -338,12 +358,32 @@ impl CodecIdentity {
         if self.binding_name != "zstd-safe"
             || self.binding_version != "7.2.4"
             || self.native_name != "libzstd"
+            || self.native_version != "1.5.7"
+            || self.native_version_number != 10_507
             || self.native_source_package != "zstd-sys-2.0.16+zstd.1.5.7"
+            || self.binding_package_checksum_sha256 != ZSTD_SAFE_CHECKSUM
+            || self.native_package_checksum_sha256 != ZSTD_SYS_CHECKSUM
             || self.parameter_program != ZSTD_PROGRAM_SCHEMA
+            || self.target_identity != crate::statistics::math_target_identity()
         {
             return Err(Error::new("unsupported Zstandard encoder identity"));
         }
-        validate_sha256("nested_lock_sha256", &self.nested_lock_sha256)
+        for (name, value) in [
+            (
+                "binding_package_checksum_sha256",
+                &self.binding_package_checksum_sha256,
+            ),
+            (
+                "native_package_checksum_sha256",
+                &self.native_package_checksum_sha256,
+            ),
+            ("nested_lock_sha256", &self.nested_lock_sha256),
+            ("codec_module_sha256", &self.codec_module_sha256),
+            ("resolver_sha256", &self.resolver_sha256),
+        ] {
+            validate_non_placeholder_sha256(name, value)?;
+        }
+        Ok(())
     }
 }
 
@@ -359,6 +399,9 @@ pub struct ZstdParameterProgram {
     pub dict_id_flag: bool,
     pub long_distance_matching: bool,
     pub dictionary: Option<String>,
+    pub resolver: String,
+    pub explicit_parameter_ids: Vec<String>,
+    pub feature_unavailable_parameter_ids: Vec<String>,
 }
 
 impl ZstdParameterProgram {
@@ -374,6 +417,37 @@ impl ZstdParameterProgram {
             dict_id_flag: false,
             long_distance_matching: false,
             dictionary: None,
+            resolver: "amg-http2-perf/zstd-level9-resolver/v1".to_owned(),
+            explicit_parameter_ids: [
+                "compressionLevel",
+                "windowLog",
+                "hashLog",
+                "chainLog",
+                "searchLog",
+                "minMatch",
+                "targetLength",
+                "strategy",
+                "nbWorkers",
+                "checksumFlag",
+                "contentSizeFlag",
+                "dictIDFlag",
+                "enableLongDistanceMatching",
+                "ldmHashLog",
+                "ldmMinMatch",
+                "ldmBucketSizeLog",
+                "ldmHashRateLog",
+                "jobSize",
+                "overlapSizeLog",
+                "targetCBlockSize",
+                "pledgedSrcSize",
+            ]
+            .into_iter()
+            .map(str::to_owned)
+            .collect(),
+            feature_unavailable_parameter_ids: ["forceMaxWindow", "format", "srcSizeHint"]
+                .into_iter()
+                .map(str::to_owned)
+                .collect(),
         }
     }
 
@@ -392,11 +466,39 @@ impl ZstdParameterProgram {
 pub struct ResolvedZstdParameters {
     pub program: ZstdParameterProgram,
     pub pledged_source_size: u64,
+    pub window_log: u32,
+    pub hash_log: u32,
+    pub chain_log: u32,
+    pub search_log: u32,
+    pub min_match: u32,
+    pub target_length: u32,
+    pub strategy: i32,
+    pub ldm_hash_log: u32,
+    pub ldm_min_match: u32,
+    pub ldm_bucket_size_log: u32,
+    pub ldm_hash_rate_log: u32,
+    pub job_size: u32,
+    pub overlap_size_log: u32,
+    pub target_cblock_size: u32,
+    pub parameter_map_sha256: String,
 }
 
 impl ResolvedZstdParameters {
     pub fn validate(&self) -> Result<()> {
-        self.program.validate()
+        self.program.validate()?;
+        if self.pledged_source_size > TASK_CAP_BYTES
+            || self.window_log == 0
+            || self.hash_log == 0
+            || self.chain_log == 0
+            || self.search_log == 0
+            || self.min_match == 0
+            || self.strategy != 6
+        {
+            return Err(Error::new(
+                "resolved Zstandard parameter map is out of bounds",
+            ));
+        }
+        validate_non_placeholder_sha256("parameter_map_sha256", &self.parameter_map_sha256)
     }
 }
 
@@ -440,6 +542,7 @@ pub struct Intent {
     pub candidate_commit: String,
     pub campaign_seed: u64,
     pub encoder: CodecIdentity,
+    pub producer_executable_sha256: String,
     pub zstd: ZstdParameterProgram,
     pub raw_limits: RawLimits,
 }
@@ -458,6 +561,10 @@ impl Intent {
             ));
         }
         self.encoder.validate()?;
+        validate_non_placeholder_sha256(
+            "producer_executable_sha256",
+            &self.producer_executable_sha256,
+        )?;
         self.zstd.validate()?;
         self.raw_limits.validate()
     }
@@ -468,6 +575,7 @@ impl Intent {
 pub struct RoundPlan {
     pub round: u32,
     pub row: u8,
+    pub arm_order: Vec<Arm>,
     pub cells: Vec<Cell>,
 }
 
@@ -475,6 +583,18 @@ impl RoundPlan {
     pub fn validate(&self) -> Result<()> {
         if self.row >= 10 {
             return Err(Error::new(format!("invalid Williams row {}", self.row)));
+        }
+        let canonical = crate::schedule::williams_rows()[usize::from(self.row)].to_vec();
+        if self.arm_order != canonical {
+            return Err(Error::new(
+                "round arm positions do not match the named Williams row",
+            ));
+        }
+        let unique_arms: BTreeSet<_> = self.arm_order.iter().copied().collect();
+        if self.arm_order.len() != 5 || unique_arms.len() != 5 {
+            return Err(Error::new(
+                "round does not contain five unique arm positions",
+            ));
         }
         if self.cells.len() != 15 {
             return Err(Error::new("round does not contain all 15 cells"));
@@ -505,8 +625,8 @@ impl DesignLock {
         if self.schema != DESIGN_LOCK_SCHEMA {
             return Err(Error::new("unsupported design-lock schema"));
         }
-        validate_sha256("intent_sha256", &self.intent_sha256)?;
-        validate_sha256("calibration_plan_sha256", &self.calibration_plan_sha256)?;
+        validate_non_placeholder_sha256("intent_sha256", &self.intent_sha256)?;
+        validate_non_placeholder_sha256("calibration_plan_sha256", &self.calibration_plan_sha256)?;
         if !matches!(self.selected_n, 30 | 50) {
             return Err(Error::new(
                 "design-lock N must be runtime-admissible 30 or 50; N=70/100 stop before a design lock",
@@ -522,6 +642,12 @@ impl DesignLock {
                 return Err(Error::new("design-lock rounds are not contiguous"));
             }
             round.validate()?;
+        }
+        let regenerated = crate::schedule::generate_rounds(self.schedule_seed, self.selected_n)?;
+        if self.rounds != regenerated {
+            return Err(Error::new(
+                "design-lock schedule does not regenerate from its seed and N",
+            ));
         }
         let expected = hard_comparisons();
         if self.comparisons != expected {
@@ -624,7 +750,16 @@ impl CalibrationRecord {
                     return Err(Error::new("scout record has invalid class/arm/target"));
                 }
                 let target = self.target.unwrap_or_default();
-                if self.lane_quotas.iter().sum::<u64>() != target
+                let quota_total = self
+                    .lane_quotas
+                    .iter()
+                    .try_fold(0_u64, |total, value| total.checked_add(*value));
+                let completion_total = self
+                    .lane_completions
+                    .iter()
+                    .try_fold(0_u64, |total, value| total.checked_add(*value));
+                if quota_total != Some(target)
+                    || completion_total != Some(target)
                     || self.lane_completions != self.lane_quotas
                     || self.started_operations != target
                     || self.deadline_completions != target
@@ -683,6 +818,7 @@ pub struct AuthoritativeRecord {
     pub arm: Arm,
     pub position: u8,
     pub observation_id: String,
+    pub raw_sha256: String,
     pub metrics: ArmMetrics,
 }
 
@@ -695,6 +831,7 @@ impl AuthoritativeRecord {
         }
         validate_identifier("run_id", &self.run_id)?;
         validate_identifier("observation_id", &self.observation_id)?;
+        validate_non_placeholder_sha256("raw_sha256", &self.raw_sha256)?;
         self.cell.validate()?;
         self.metrics.validate()
     }
@@ -781,6 +918,7 @@ pub struct AuthoritativeManifest {
     pub run_id: String,
     pub design_lock_sha256: String,
     pub analysis_config_sha256: String,
+    pub math_target_sha256: String,
     pub n: u32,
     pub observations: Vec<AuthoritativeRecord>,
     pub quality: QualityEvidence,
@@ -792,10 +930,19 @@ impl AuthoritativeManifest {
             return Err(Error::new("authoritative manifest schema/N is invalid"));
         }
         validate_identifier("run_id", &self.run_id)?;
-        validate_sha256("design_lock_sha256", &self.design_lock_sha256)?;
-        validate_sha256("analysis_config_sha256", &self.analysis_config_sha256)?;
+        validate_non_placeholder_sha256("design_lock_sha256", &self.design_lock_sha256)?;
+        validate_non_placeholder_sha256("analysis_config_sha256", &self.analysis_config_sha256)?;
+        validate_non_placeholder_sha256("math_target_sha256", &self.math_target_sha256)?;
+        if self.math_target_sha256 != crate::statistics::math_target_sha256() {
+            return Err(Error::new(
+                "authoritative manifest math target differs from this verifier",
+            ));
+        }
         self.quality.validate()?;
-        let expected_count = usize::try_from(75_u32.saturating_mul(self.n)).unwrap_or(usize::MAX);
+        let expected_count = 75_u32
+            .checked_mul(self.n)
+            .and_then(|value| usize::try_from(value).ok())
+            .ok_or_else(|| Error::new("authoritative matrix count overflow"))?;
         if self.observations.len() != expected_count {
             return Err(Error::new(format!(
                 "authoritative matrix has {} records, expected {expected_count}",
@@ -840,13 +987,25 @@ impl AuthoritativeManifest {
 #[serde(deny_unknown_fields)]
 pub struct RawArmMetadata {
     pub schema: String,
+    pub evidence_id: String,
+    pub run_id: String,
     pub class: EvidenceClass,
     pub cell: Cell,
     pub arm: Option<Arm>,
+    pub direct_protocol: Option<RawProtocol>,
+    pub ordinal: u64,
+    pub round: Option<u32>,
+    pub row: Option<u8>,
+    pub position: Option<u8>,
+    pub epoch: Option<u32>,
+    pub scout_target: Option<u64>,
+    pub observation_id: String,
     pub started_operations: u64,
     pub deadline_completions: u64,
     pub drained_operations: u64,
     pub latency_record_ceiling: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub materialization_sha256: Option<String>,
 }
 
 impl RawArmMetadata {
@@ -855,32 +1014,98 @@ impl RawArmMetadata {
             return Err(Error::new("unsupported raw arm metadata schema"));
         }
         self.cell.validate()?;
-        if self.class == EvidenceClass::D && self.arm.is_some() {
-            return Err(Error::new("direct evidence cannot name a gateway arm"));
-        }
-        if self.class != EvidenceClass::D && self.arm.is_none() {
-            return Err(Error::new("gateway evidence must name its arm"));
+        validate_identifier("evidence_id", &self.evidence_id)?;
+        validate_identifier("run_id", &self.run_id)?;
+        validate_identifier("observation_id", &self.observation_id)?;
+        match self.class {
+            EvidenceClass::S => {
+                if self.arm.is_none()
+                    || self.direct_protocol.is_some()
+                    || self.scout_target.is_none()
+                    || self.round.is_some()
+                    || self.row.is_some()
+                    || self.position.is_some()
+                    || self.epoch.is_some()
+                {
+                    return Err(Error::new("invalid scout metadata domain"));
+                }
+            }
+            EvidenceClass::C => {
+                if self.arm.is_none()
+                    || self.direct_protocol.is_some()
+                    || self.row.is_none_or(|row| row >= 10)
+                    || self.position.is_none_or(|position| position >= 5)
+                    || self.round.is_some()
+                    || self.epoch.is_some()
+                    || self.scout_target.is_some()
+                {
+                    return Err(Error::new("invalid Williams metadata domain"));
+                }
+            }
+            EvidenceClass::D => {
+                if self.arm.is_some()
+                    || self.direct_protocol.is_none()
+                    || self.epoch.is_none()
+                    || self.round.is_some()
+                    || self.row.is_some()
+                    || self.position.is_some()
+                    || self.scout_target.is_some()
+                {
+                    return Err(Error::new("invalid direct metadata domain"));
+                }
+            }
+            EvidenceClass::A => {
+                if self.arm.is_none()
+                    || self.direct_protocol.is_some()
+                    || self.round.is_none()
+                    || self.row.is_none_or(|row| row >= 10)
+                    || self.position.is_none_or(|position| position >= 5)
+                    || self.epoch.is_some()
+                    || self.scout_target.is_some()
+                {
+                    return Err(Error::new("invalid authoritative metadata domain"));
+                }
+            }
         }
         if self.deadline_completions > self.started_operations
             || self.started_operations > self.drained_operations
         {
             return Err(Error::new("raw operation counts are not ordered"));
         }
+        if self.drained_operations != self.started_operations {
+            return Err(Error::new(
+                "raw drained operations must equal started operations",
+            ));
+        }
+        if self.started_operations > u64::MAX / 1_048_576 {
+            return Err(Error::new(
+                "raw operation count exceeds checked workload-byte arithmetic",
+            ));
+        }
         if self.class.has_latencies() {
-            if self.drained_operations == 0 || self.drained_operations > self.latency_record_ceiling
+            if self.drained_operations > self.latency_record_ceiling
+                || self.latency_record_ceiling > (TASK_CAP_BYTES - 32) / 8
             {
                 return Err(Error::new(
-                    "latency count is zero or exceeds its sealed ceiling",
+                    "latency count or sealed ceiling exceeds its bound",
                 ));
             }
         } else if self.latency_record_ceiling != 0 {
             return Err(Error::new("S/D evidence must have a zero latency ceiling"));
         }
+        if let Some(hash) = &self.materialization_sha256 {
+            validate_non_placeholder_sha256("materialization evidence", hash)?;
+            if self.class == EvidenceClass::D || self.cell.workload == Workload::WebSocket {
+                return Err(Error::new(
+                    "direct/WebSocket raw evidence cannot bind ordinary authenticated materialization",
+                ));
+            }
+        }
         Ok(())
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "SCREAMING_SNAKE_CASE")]
 pub enum Verdict {
     Pass,
@@ -896,6 +1121,16 @@ pub fn validate_sha256(name: &str, value: &str) -> Result<()> {
     {
         return Err(Error::new(format!(
             "{name} is not a lowercase SHA-256 hex digest"
+        )));
+    }
+    Ok(())
+}
+
+pub fn validate_non_placeholder_sha256(name: &str, value: &str) -> Result<()> {
+    validate_sha256(name, value)?;
+    if value.bytes().all(|byte| byte == b'0') || value.bytes().all(|byte| byte == b'f') {
+        return Err(Error::new(format!(
+            "{name} is a placeholder SHA-256 digest"
         )));
     }
     Ok(())
@@ -959,34 +1194,68 @@ mod tests {
 
     #[test]
     fn intent_strictly_rejects_unknown_fields_and_bad_versions() {
-        let bytes = br#"{"baseline_commit":"28a4a273ea9b2725191dce35233f55972beaac6f","campaign_seed":1,"candidate_commit":"1f9821ab36f546ca0ffd9f6b83cb9a1f0af512ad","encoder":{"binding_name":"zstd-safe","binding_version":"7.2.4","native_name":"libzstd","native_source_package":"zstd-sys-2.0.16+zstd.1.5.7","native_version":"1.5.7","native_version_number":10507,"nested_lock_sha256":"0000000000000000000000000000000000000000000000000000000000000000","parameter_program":"amg-http2-perf/zstd-program/v1"},"evidence_id":"x","evidence_kind":"calibration","raw_limits":{"canonical_buffer_bytes":1048576,"chunk_bytes":50331648,"json_max_bytes":1048576,"schema":"amg-http2-perf/raw-limits/v1","task_cap_bytes":536870912},"schema":"wrong","zstd":{"checksum_flag":true,"compression_level":9,"content_size_flag":true,"dict_id_flag":false,"dictionary":null,"format":"zstd1","long_distance_matching":false,"nb_workers":0,"schema":"amg-http2-perf/zstd-program/v1"}}"#;
-        let intent: Intent = json::from_slice_strict(bytes).expect("strict shape");
+        let fixture = Intent {
+            schema: "wrong".to_owned(),
+            evidence_id: "x".to_owned(),
+            evidence_kind: EvidenceKind::Calibration,
+            baseline_commit: BASELINE_COMMIT.to_owned(),
+            candidate_commit: INITIAL_CANDIDATE_COMMIT.to_owned(),
+            campaign_seed: 1,
+            encoder: crate::codec::current_identity(),
+            producer_executable_sha256: crate::codec::current_executable_sha256()
+                .expect("test executable hash"),
+            zstd: ZstdParameterProgram::fixed(),
+            raw_limits: RawLimits::fixed(),
+        };
+        let bytes = json::canonical_bytes(&fixture).expect("canonical fixture");
+        let intent: Intent = json::from_slice_strict(&bytes).expect("strict shape");
         assert!(intent.validate().is_err());
 
-        let mut with_unknown = bytes[..bytes.len() - 1].to_vec();
-        with_unknown.extend_from_slice(b",\"unknown\":1}");
-        assert!(json::from_slice_strict::<Intent>(&with_unknown).is_err());
+        let mut value = serde_json::to_value(fixture).expect("intent value");
+        value
+            .as_object_mut()
+            .expect("intent object")
+            .insert("unknown".to_owned(), serde_json::Value::from(1));
+        assert!(json::from_slice_strict::<Intent>(
+            &serde_json::to_vec(&value).expect("unknown fixture")
+        )
+        .is_err());
     }
 
     #[test]
     fn raw_class_latency_contract_is_strict() {
         let mut metadata = RawArmMetadata {
             schema: ARM_SCHEMA.to_owned(),
+            evidence_id: "fixture-evidence".to_owned(),
+            run_id: "fixture-evidence".to_owned(),
             class: EvidenceClass::S,
             cell: Cell {
                 workload: Workload::Get,
                 concurrency: 1,
             },
             arm: Some(Arm::B11),
+            direct_protocol: None,
+            ordinal: 0,
+            round: None,
+            row: None,
+            position: None,
+            epoch: None,
+            scout_target: Some(10),
+            observation_id: "fixture-observation".to_owned(),
             started_operations: 10,
             deadline_completions: 10,
             drained_operations: 10,
             latency_record_ceiling: 0,
+            materialization_sha256: None,
         };
         assert!(metadata.validate().is_ok());
         metadata.latency_record_ceiling = 10;
         assert!(metadata.validate().is_err());
         metadata.class = EvidenceClass::A;
+        metadata.scout_target = None;
+        metadata.round = Some(0);
+        metadata.row = Some(0);
+        metadata.position = Some(0);
         assert!(metadata.validate().is_ok());
         metadata.drained_operations = 11;
         assert!(metadata.validate().is_err());
@@ -996,7 +1265,7 @@ mod tests {
     fn design_lock_and_authoritative_records_reject_drifted_domain_data() {
         let mut design = DesignLock {
             schema: DESIGN_LOCK_SCHEMA.to_owned(),
-            intent_sha256: "00".repeat(32),
+            intent_sha256: "01".repeat(32),
             calibration_plan_sha256: "11".repeat(32),
             selected_n: 30,
             schedule_seed: 9,
@@ -1015,6 +1284,7 @@ mod tests {
             arm: Arm::B11,
             position: 0,
             observation_id: "obs-fixture".to_owned(),
+            raw_sha256: "01".repeat(32),
             metrics: ArmMetrics {
                 throughput_ops_per_second: 1.0,
                 p99_latency_ns: 1,
@@ -1026,5 +1296,72 @@ mod tests {
         let mut wrong_round = record;
         wrong_round.round = 30;
         assert!(wrong_round.validate(30).is_err());
+    }
+
+    #[test]
+    fn scout_count_overflow_and_raw_workload_count_overflow_fail_closed() {
+        let record = CalibrationRecord {
+            schema: EXECUTION_SCHEMA.to_owned(),
+            calibration_id: "calibration-fixture".to_owned(),
+            phase: CalibrationPhase::Scout,
+            class: EvidenceClass::S,
+            cell: Cell {
+                workload: Workload::Get,
+                concurrency: 16,
+            },
+            arm: Some(Arm::B11),
+            target: Some(u64::MAX),
+            elapsed_ns: 1,
+            gateway_ticks: 100,
+            started_operations: u64::MAX,
+            deadline_completions: u64::MAX,
+            drained_operations: u64::MAX,
+            lane_quotas: {
+                let mut values = vec![0; 16];
+                values[0] = u64::MAX;
+                values[1] = 1;
+                values
+            },
+            lane_completions: {
+                let mut values = vec![0; 16];
+                values[0] = u64::MAX;
+                values[1] = 1;
+                values
+            },
+            endpoint_hashes_match: true,
+            process_identity: "process".to_owned(),
+        };
+        assert!(record.validate().is_err());
+
+        let mut metadata = RawArmMetadata {
+            schema: ARM_SCHEMA.to_owned(),
+            evidence_id: "fixture".to_owned(),
+            run_id: "fixture".to_owned(),
+            class: EvidenceClass::S,
+            cell: Cell {
+                workload: Workload::Upload1Mib,
+                concurrency: 1,
+            },
+            arm: Some(Arm::B11),
+            direct_protocol: None,
+            ordinal: 0,
+            round: None,
+            row: None,
+            position: None,
+            epoch: None,
+            scout_target: Some(u64::MAX),
+            observation_id: "observation".to_owned(),
+            started_operations: u64::MAX,
+            deadline_completions: u64::MAX,
+            drained_operations: u64::MAX,
+            latency_record_ceiling: 0,
+            materialization_sha256: None,
+        };
+        assert!(metadata.validate().is_err());
+        metadata.started_operations = 1;
+        metadata.deadline_completions = 1;
+        metadata.drained_operations = 1;
+        metadata.scout_target = Some(1);
+        assert!(metadata.validate().is_ok());
     }
 }

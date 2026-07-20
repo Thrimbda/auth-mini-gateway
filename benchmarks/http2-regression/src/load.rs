@@ -1,8 +1,9 @@
 //! Persistent H1/H2 load role with exact closed-loop workload validation.
 
 use crate::control::{
-    connect_loopback, ConnectionLedger, ConnectionPolicy, ControlBody, ControlContext, LoadProof,
-    LoadResult, LoadTarget, Role,
+    AttemptEvidence, ConnectionLedger, ConnectionPolicy, ControlBody, ControlContext,
+    FramedControl, LoadProof, LoadResult, LoadTarget, Role, RoleErrorClass, RoleErrorCode,
+    RoleErrorStage,
 };
 use crate::fixture::BenchBody;
 use crate::linux::{clock_ns, process_identity, ClockKind};
@@ -12,11 +13,13 @@ use crate::topology::{
     masked_ping, operation_id, operation_id_text, parse_unmasked_pong, planned_connection_id,
     websocket_accept, Corpus, Protocol, CORPUS_BYTES, SSE_EVENTS,
 };
+use crate::wire::{H2FrameObserver, H2WireEvidence, ObservedH2Io};
 use crate::{Error, Result, ResultContext};
 use bytes::Bytes;
 use http::header::{
     AUTHORIZATION, CONNECTION, CONTENT_LENGTH, COOKIE, HOST, ORIGIN, PROXY_AUTHORIZATION,
-    SEC_WEBSOCKET_ACCEPT, SEC_WEBSOCKET_KEY, SEC_WEBSOCKET_VERSION, SET_COOKIE, UPGRADE,
+    SEC_WEBSOCKET_ACCEPT, SEC_WEBSOCKET_KEY, SEC_WEBSOCKET_VERSION, SET_COOKIE, TRANSFER_ENCODING,
+    UPGRADE,
 };
 use http::{HeaderValue, Method, Request, Response, StatusCode, Version};
 use http_body_util::BodyExt as _;
@@ -24,11 +27,12 @@ use hyper::body::Incoming;
 use hyper::client::conn::{http1, http2};
 use hyper_util::rt::{TokioExecutor, TokioIo};
 use sha2::{Digest, Sha256};
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, VecDeque};
 use std::net::SocketAddr;
 use std::pin::Pin;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
+use std::time::Duration;
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tokio::net::{TcpSocket, TcpStream};
 use tokio::task::JoinHandle;
@@ -37,26 +41,50 @@ trait TunnelIo: AsyncRead + AsyncWrite + Unpin + Send {}
 impl<T> TunnelIo for T where T: AsyncRead + AsyncWrite + Unpin + Send {}
 
 enum HttpSender {
-    H1(http1::SendRequest<BenchBody>),
-    H2(http2::SendRequest<BenchBody>),
+    H1 {
+        sender: http1::SendRequest<BenchBody>,
+        connection_id: u64,
+    },
+    H2 {
+        sender: http2::SendRequest<BenchBody>,
+        observer: H2FrameObserver,
+    },
 }
 
 impl HttpSender {
-    async fn send(&mut self, request: Request<BenchBody>) -> Result<Response<Incoming>> {
+    async fn send(
+        &mut self,
+        request: Request<BenchBody>,
+        extended_connect: bool,
+    ) -> Result<(Response<Incoming>, u64, Option<u32>)> {
         match self {
-            Self::H1(sender) => {
+            Self::H1 {
+                sender,
+                connection_id,
+            } => {
                 sender.ready().await.context("H1 sender ready")?;
-                sender
+                let response = sender
                     .send_request(request)
                     .await
-                    .context("send H1 request")
+                    .context("send H1 request")?;
+                Ok((response, *connection_id, None))
             }
-            Self::H2(sender) => {
+            Self::H2 { sender, observer } => {
+                let request_lock = observer.request_lock();
+                let _guard = request_lock.lock().await;
                 sender.ready().await.context("H2 sender ready")?;
-                sender
-                    .send_request(request)
-                    .await
-                    .context("send H2 request")
+                if extended_connect {
+                    observer.mark_next_headers_as_extended_connect()?;
+                }
+                let response = sender.send_request(request);
+                let stream_id = observer.claim_stream(Duration::from_secs(2)).await?;
+                let connection_id = observer.snapshot()?.connection_id;
+                drop(_guard);
+                Ok((
+                    response.await.context("send H2 request")?,
+                    connection_id,
+                    Some(stream_id),
+                ))
             }
         }
     }
@@ -125,7 +153,20 @@ struct Lane {
     authority: String,
     corpus: Arc<Corpus>,
     transport: LaneTransport,
+    physical_connection_id: Option<u64>,
+    tunnel_stream_id: Option<u32>,
+    websocket_masks: VecDeque<PreparedWebSocketFrame>,
+    attempts: Arc<OperationAttemptTracker>,
+    h2_stream_tracker: Option<Arc<ActiveStreamTracker>>,
     phase_sequences: BTreeMap<u16, u64>,
+}
+
+#[derive(Clone, Copy)]
+struct PreparedWebSocketFrame {
+    phase: u16,
+    sequence: u64,
+    frame: [u8; 14],
+    expected_payload: [u8; 8],
 }
 
 struct LoadSession {
@@ -134,6 +175,11 @@ struct LoadSession {
     workload: Workload,
     physical_connections: u64,
     fresh_tracker: Option<Arc<FreshConnectionTracker>>,
+    base_connection_ledger: ConnectionLedger,
+    h2_observers: Vec<H2FrameObserver>,
+    websocket_open_ledger: Option<ConnectionLedger>,
+    attempts: Arc<OperationAttemptTracker>,
+    h2_stream_tracker: Option<Arc<ActiveStreamTracker>>,
     drivers: Vec<JoinHandle<()>>,
 }
 
@@ -148,12 +194,28 @@ struct OperationOutcome {
     status_ok: bool,
     eos_ok: bool,
     payload_ok: bool,
+    sse_content_type_ok: bool,
     response_headers_sanitized: bool,
     connection: OperationConnection,
 }
 
+struct ResultWindow {
+    start_ns: u64,
+    deadline_ns: Option<u64>,
+    end_ns: u64,
+    retain_latencies: bool,
+}
+
+struct LaneResultSummary {
+    count: u64,
+    quotas: Vec<u64>,
+    completions: Vec<u64>,
+}
+
 #[derive(Debug, Default)]
 struct OperationConnection {
+    connection_id: Option<u64>,
+    stream_id: Option<u32>,
     planned_id: Option<String>,
     socket_creations: u64,
     connect_attempts: u64,
@@ -168,14 +230,103 @@ struct OperationConnection {
     h2_streams: u64,
 }
 
-pub async fn run_load_role(context: ControlContext, control_address: SocketAddr) -> Result<()> {
-    let mut control = connect_loopback(control_address, context.clone()).await?;
+#[derive(Debug, Default)]
+struct OperationAttemptTracker {
+    starts: AtomicU64,
+    successes: AtomicU64,
+    failures: AtomicU64,
+    reconnects: AtomicU64,
+    retries: AtomicU64,
+}
+
+#[derive(Debug, Default)]
+struct ActiveStreamTracker {
+    active: AtomicU64,
+    maximum: AtomicU64,
+}
+
+impl ActiveStreamTracker {
+    fn reset_phase(&self) -> Result<()> {
+        if self.active.load(Ordering::SeqCst) != 0 {
+            return Err(Error::new("H2 phase began with active request streams"));
+        }
+        self.maximum.store(0, Ordering::SeqCst);
+        Ok(())
+    }
+
+    fn acquire(self: &Arc<Self>) -> ActiveStreamGuard {
+        let active = self.active.fetch_add(1, Ordering::SeqCst) + 1;
+        let mut maximum = self.maximum.load(Ordering::SeqCst);
+        while active > maximum {
+            match self
+                .maximum
+                .compare_exchange(maximum, active, Ordering::SeqCst, Ordering::SeqCst)
+            {
+                Ok(_) => break,
+                Err(actual) => maximum = actual,
+            }
+        }
+        ActiveStreamGuard {
+            tracker: Arc::clone(self),
+        }
+    }
+}
+
+struct ActiveStreamGuard {
+    tracker: Arc<ActiveStreamTracker>,
+}
+
+impl Drop for ActiveStreamGuard {
+    fn drop(&mut self) {
+        self.tracker.active.fetch_sub(1, Ordering::SeqCst);
+    }
+}
+
+impl OperationAttemptTracker {
+    fn begin(self: &Arc<Self>) -> OperationAttemptGuard {
+        self.starts.fetch_add(1, Ordering::SeqCst);
+        OperationAttemptGuard {
+            tracker: Arc::clone(self),
+            completed: false,
+        }
+    }
+
+    fn snapshot(&self) -> AttemptEvidence {
+        AttemptEvidence {
+            starts: self.starts.load(Ordering::SeqCst),
+            successes: self.successes.load(Ordering::SeqCst),
+            failures: self.failures.load(Ordering::SeqCst),
+            reconnects: self.reconnects.load(Ordering::SeqCst),
+            retries: self.retries.load(Ordering::SeqCst),
+        }
+    }
+}
+
+struct OperationAttemptGuard {
+    tracker: Arc<OperationAttemptTracker>,
+    completed: bool,
+}
+
+impl OperationAttemptGuard {
+    fn success(mut self) {
+        self.tracker.successes.fetch_add(1, Ordering::SeqCst);
+        self.completed = true;
+    }
+}
+
+impl Drop for OperationAttemptGuard {
+    fn drop(&mut self) {
+        if !self.completed {
+            self.tracker.failures.fetch_add(1, Ordering::SeqCst);
+        }
+    }
+}
+
+pub async fn run_load_role(context: ControlContext, control: &mut FramedControl) -> Result<()> {
     control
-        .send(ControlBody::Hello {
-            role: Role::Load,
-            identity: process_identity(std::process::id())?,
-        })
+        .authenticate_inherited_role(Role::Load, process_identity(std::process::id())?)
         .await?;
+    control.mark_failure_stage(RoleErrorStage::Startup);
     control
         .send(ControlBody::Ready {
             role: Role::Load,
@@ -196,68 +347,125 @@ pub async fn run_load_role(context: ControlContext, control_address: SocketAddr)
                 warmup_operations,
                 websocket_settle: _,
             } => {
+                control.mark_failure_stage(RoleErrorStage::Prepare);
                 if session.is_some() || workload != context.cell.workload {
                     return Err(Error::new("load session duplicate or cell mismatch"));
                 }
-                let preparation = async {
-                    let endpoint = match target {
-                        LoadTarget::Gateway => gateway_address.as_deref().ok_or_else(|| {
-                            Error::new("gateway load target has no gateway address")
-                        })?,
-                        LoadTarget::Direct => &fixture_address,
-                    };
-                    let endpoint = crate::control::parse_loopback_address(endpoint)?;
-                    let mut prepared = LoadSession::connect(
-                        target,
-                        protocol,
-                        workload,
-                        endpoint,
-                        cookie_header,
-                        context.cell.concurrency,
-                    )
-                    .await?;
-                    let proof = prepared.prepare(warmup_operations).await?;
-                    Ok::<_, Error>((prepared, proof))
+                let endpoint = match target {
+                    LoadTarget::Gateway => gateway_address
+                        .as_deref()
+                        .ok_or_else(|| Error::new("gateway load target has no gateway address")),
+                    LoadTarget::Direct => Ok(fixture_address.as_str()),
                 }
+                .and_then(crate::control::parse_loopback_address);
+                let endpoint = match endpoint {
+                    Ok(value) => value,
+                    Err(error) => {
+                        send_load_terminal(
+                            control,
+                            RoleErrorStage::Prepare,
+                            RoleErrorCode::InvalidConfiguration,
+                            &error,
+                            None,
+                        )
+                        .await?;
+                        return Err(error);
+                    }
+                };
+                let prepared = LoadSession::connect(
+                    target,
+                    protocol,
+                    workload,
+                    endpoint,
+                    cookie_header,
+                    context.cell.concurrency,
+                )
                 .await;
-                match preparation {
-                    Ok((prepared, proof)) => {
+                let mut prepared = match prepared {
+                    Ok(value) => value,
+                    Err(error) => {
+                        send_load_terminal(
+                            control,
+                            RoleErrorStage::Prepare,
+                            RoleErrorCode::PrepareFailed,
+                            &error,
+                            None,
+                        )
+                        .await?;
+                        return Err(error);
+                    }
+                };
+                control.mark_failure_stage(RoleErrorStage::Proof);
+                match prepared.prepare(warmup_operations).await {
+                    Ok(proof) => {
                         session = Some(prepared);
                         control.send(ControlBody::Prepared { proof }).await?;
                     }
                     Err(error) => {
-                        control
-                            .send(ControlBody::RoleError {
-                                class: "load-preparation-blocked".to_owned(),
-                                message: error.to_string(),
-                            })
-                            .await?;
+                        send_load_terminal(
+                            control,
+                            RoleErrorStage::Proof,
+                            RoleErrorCode::PrepareFailed,
+                            &error,
+                            Some(prepared.attempts.snapshot()),
+                        )
+                        .await?;
                         return Err(error);
                     }
                 }
             }
             ControlBody::Measure { phase, operations } => {
+                control.mark_failure_stage(RoleErrorStage::Measure);
                 let prepared = session
                     .as_mut()
                     .ok_or_else(|| Error::new("load Measure before Prepare"))?;
                 match prepared.run_batch(phase, operations).await {
                     Ok(result) => control.send(ControlBody::Measured { result }).await?,
                     Err(error) => {
-                        control
-                            .send(ControlBody::RoleError {
-                                class: "load-measurement-blocked".to_owned(),
-                                message: error.to_string(),
-                            })
-                            .await?;
+                        send_load_terminal(
+                            control,
+                            RoleErrorStage::Measure,
+                            RoleErrorCode::MeasureFailed,
+                            &error,
+                            Some(prepared.attempts.snapshot()),
+                        )
+                        .await?;
                         return Err(error);
                     }
                 }
+            }
+            ControlBody::PrepareOperationCorpus {
+                phase,
+                operation_ceiling,
+            } => {
+                control.mark_failure_stage(RoleErrorStage::Prepare);
+                let prepared = session
+                    .as_mut()
+                    .ok_or_else(|| Error::new("load corpus preparation before Prepare"))?;
+                if let Err(error) = prepared.prepare_operation_corpus(phase, operation_ceiling) {
+                    send_load_terminal(
+                        control,
+                        RoleErrorStage::Prepare,
+                        RoleErrorCode::PrepareFailed,
+                        &error,
+                        Some(prepared.attempts.snapshot()),
+                    )
+                    .await?;
+                    return Err(error);
+                }
+                control
+                    .send(ControlBody::OperationCorpusPrepared {
+                        phase,
+                        operation_ceiling,
+                    })
+                    .await?;
             }
             ControlBody::MeasureCount {
                 phase,
                 operations,
                 retain_latencies,
             } => {
+                control.mark_failure_stage(RoleErrorStage::Measure);
                 let prepared = session
                     .as_mut()
                     .ok_or_else(|| Error::new("load MeasureCount before Prepare"))?;
@@ -267,12 +475,14 @@ pub async fn run_load_role(context: ControlContext, control_address: SocketAddr)
                 {
                     Ok(result) => control.send(ControlBody::Measured { result }).await?,
                     Err(error) => {
-                        control
-                            .send(ControlBody::RoleError {
-                                class: "load-count-window-blocked".to_owned(),
-                                message: error.to_string(),
-                            })
-                            .await?;
+                        send_load_terminal(
+                            control,
+                            RoleErrorStage::Measure,
+                            RoleErrorCode::MeasureFailed,
+                            &error,
+                            Some(prepared.attempts.snapshot()),
+                        )
+                        .await?;
                         return Err(error);
                     }
                 }
@@ -282,6 +492,7 @@ pub async fn run_load_role(context: ControlContext, control_address: SocketAddr)
                 duration_ns,
                 retain_latencies,
             } => {
+                control.mark_failure_stage(RoleErrorStage::Measure);
                 let prepared = session
                     .as_mut()
                     .ok_or_else(|| Error::new("load MeasureDuration before Prepare"))?;
@@ -291,17 +502,69 @@ pub async fn run_load_role(context: ControlContext, control_address: SocketAddr)
                 {
                     Ok(result) => control.send(ControlBody::Measured { result }).await?,
                     Err(error) => {
-                        control
-                            .send(ControlBody::RoleError {
-                                class: "load-fixed-window-blocked".to_owned(),
-                                message: error.to_string(),
-                            })
-                            .await?;
+                        send_load_terminal(
+                            control,
+                            RoleErrorStage::Measure,
+                            RoleErrorCode::MeasureFailed,
+                            &error,
+                            Some(prepared.attempts.snapshot()),
+                        )
+                        .await?;
+                        return Err(error);
+                    }
+                }
+            }
+            ControlBody::MaterializeDuration { phase, duration_ns } => {
+                control.mark_failure_stage(RoleErrorStage::Materialize);
+                let prepared = session
+                    .as_mut()
+                    .ok_or_else(|| Error::new("load MaterializeDuration before Prepare"))?;
+                match prepared
+                    .run_duration_with_bounds(
+                        phase,
+                        duration_ns,
+                        false,
+                        3_000_000_000,
+                        10_000_000_000,
+                    )
+                    .await
+                {
+                    Ok(result) => control.send(ControlBody::Measured { result }).await?,
+                    Err(error) => {
+                        send_load_terminal(
+                            control,
+                            RoleErrorStage::Materialize,
+                            RoleErrorCode::MaterializeFailed,
+                            &error,
+                            Some(prepared.attempts.snapshot()),
+                        )
+                        .await?;
+                        return Err(error);
+                    }
+                }
+            }
+            ControlBody::MaterializeWave { phase, operations } => {
+                control.mark_failure_stage(RoleErrorStage::Materialize);
+                let prepared = session
+                    .as_mut()
+                    .ok_or_else(|| Error::new("load MaterializeWave before Prepare"))?;
+                match prepared.run_materialization_wave(phase, operations).await {
+                    Ok(result) => control.send(ControlBody::Measured { result }).await?,
+                    Err(error) => {
+                        send_load_terminal(
+                            control,
+                            RoleErrorStage::Materialize,
+                            RoleErrorCode::MaterializeFailed,
+                            &error,
+                            Some(prepared.attempts.snapshot()),
+                        )
+                        .await?;
                         return Err(error);
                     }
                 }
             }
             ControlBody::Stop => {
+                control.mark_failure_stage(RoleErrorStage::Exit);
                 drop(session.take());
                 control
                     .send(ControlBody::Stopped { role: Role::Load })
@@ -311,13 +574,50 @@ pub async fn run_load_role(context: ControlContext, control_address: SocketAddr)
             other => {
                 return Err(Error::new(format!(
                     "load received unexpected control message: {other:?}"
-                )))
+                ))
+                .with_role_diagnostic(control.failure_stage(), RoleErrorCode::ControlProtocol))
             }
         }
     }
 }
 
+async fn send_load_terminal(
+    control: &mut FramedControl,
+    stage: RoleErrorStage,
+    fallback_code: RoleErrorCode,
+    error: &Error,
+    attempt: Option<AttemptEvidence>,
+) -> Result<()> {
+    let diagnostic = error.role_diagnostic();
+    control
+        .send_terminal_error(
+            RoleErrorClass::Command,
+            diagnostic.map_or(stage, |value| value.stage),
+            diagnostic.map_or_else(
+                || error.role_code().unwrap_or(fallback_code),
+                |value| value.code,
+            ),
+            &error.to_string(),
+            attempt,
+        )
+        .await
+}
+
 impl LoadSession {
+    fn prepare_operation_corpus(&mut self, phase: u16, operations: u64) -> Result<()> {
+        if operations == 0 {
+            return Err(Error::new("operation corpus ceiling must be nonzero"));
+        }
+        let lane_count =
+            u64::try_from(self.lanes.len()).map_err(|_| Error::new("lane count overflow"))?;
+        for lane in &mut self.lanes {
+            let lane_index = u64::from(lane.id);
+            let quota = operations / lane_count + u64::from(lane_index < operations % lane_count);
+            lane.precompute_websocket_masks(phase, quota)?;
+        }
+        Ok(())
+    }
+
     async fn connect(
         target: LoadTarget,
         protocol: Protocol,
@@ -331,6 +631,11 @@ impl LoadSession {
         }
         let mut lanes = Vec::with_capacity(usize::from(concurrency));
         let mut drivers = Vec::new();
+        let mut base_connection_ledger = empty_connection_ledger(protocol, workload);
+        let mut h2_observers = Vec::new();
+        let attempts = Arc::new(OperationAttemptTracker::default());
+        let h2_stream_tracker = (protocol == Protocol::H2 && workload != Workload::WebSocket)
+            .then(|| Arc::new(ActiveStreamTracker::default()));
         let fresh_tracker = (protocol == Protocol::H1 && workload == Workload::Upload1Mib)
             .then(|| Arc::new(FreshConnectionTracker::default()));
         let authority = "public.example".to_owned();
@@ -346,9 +651,12 @@ impl LoadSession {
                             tracker: Arc::clone(tracker),
                         }
                     } else {
-                        let (sender, driver) = open_h1(endpoint).await?;
+                        let connection_id = u64::from(lane) + 1;
+                        record_connection_start(&mut base_connection_ledger, connection_id)?;
+                        let (sender, driver) = open_h1(endpoint, connection_id).await?;
                         drivers.push(driver);
-                        LaneTransport::Http(HttpSender::H1(sender))
+                        record_connection_success(&mut base_connection_ledger, connection_id)?;
+                        LaneTransport::Http(sender)
                     };
                     lanes.push(Lane {
                         id: lane,
@@ -359,13 +667,23 @@ impl LoadSession {
                         authority: authority.clone(),
                         corpus: Arc::clone(&corpus),
                         transport,
+                        physical_connection_id: (fresh_tracker.is_none())
+                            .then_some(u64::from(lane) + 1),
+                        tunnel_stream_id: None,
+                        websocket_masks: VecDeque::new(),
+                        attempts: Arc::clone(&attempts),
+                        h2_stream_tracker: h2_stream_tracker.clone(),
                         phase_sequences: BTreeMap::new(),
                     });
                 }
             }
             Protocol::H2 => {
-                let (sender, driver) = open_h2(endpoint).await?;
+                record_connection_start(&mut base_connection_ledger, 1)?;
+                let (sender, driver, observer) =
+                    open_h2(endpoint, 1, workload == Workload::WebSocket).await?;
                 drivers.push(driver);
+                record_connection_success(&mut base_connection_ledger, 1)?;
+                h2_observers.push(observer.clone());
                 for lane in 0..concurrency {
                     lanes.push(Lane {
                         id: lane,
@@ -375,7 +693,15 @@ impl LoadSession {
                         cookie_header: cookie_header.clone(),
                         authority: authority.clone(),
                         corpus: Arc::clone(&corpus),
-                        transport: LaneTransport::Http(HttpSender::H2(sender.clone())),
+                        transport: LaneTransport::Http(HttpSender::H2 {
+                            sender: sender.clone(),
+                            observer: observer.clone(),
+                        }),
+                        physical_connection_id: Some(1),
+                        tunnel_stream_id: None,
+                        websocket_masks: VecDeque::new(),
+                        attempts: Arc::clone(&attempts),
+                        h2_stream_tracker: h2_stream_tracker.clone(),
                         phase_sequences: BTreeMap::new(),
                     });
                 }
@@ -395,31 +721,56 @@ impl LoadSession {
                 1
             },
             fresh_tracker,
+            base_connection_ledger,
+            h2_observers,
+            websocket_open_ledger: None,
+            attempts,
+            h2_stream_tracker,
             drivers,
         })
     }
 
     async fn prepare(&mut self, warmup_operations: u64) -> Result<LoadProof> {
         if self.workload == Workload::WebSocket {
-            self.open_all_websockets().await?;
+            let (
+                open_ledger,
+                first_operation_id,
+                last_operation_id,
+                operation_hash_sha256,
+                attempts,
+            ) = self.open_all_websockets().await?;
+            self.websocket_open_ledger = Some(open_ledger.clone());
+            let h2_wire = self.h2_wire_evidence()?;
             return Ok(LoadProof {
                 downstream_protocol: self.protocol,
                 physical_connections: self.physical_connections,
-                h2_settings_proved: self.protocol == Protocol::H2,
-                extended_connect_proved: self.protocol == Protocol::H2,
+                h2_settings_proved: self.protocol == Protocol::H1
+                    || h2_wire.iter().all(initial_h2_exchange_proved),
+                extended_connect_proved: self.protocol == Protocol::H1
+                    || h2_wire.iter().all(|wire| {
+                        wire.enable_connect_protocol_seen
+                            && wire.extended_connect_headers > 0
+                            && wire.early_extended_connect_headers == 0
+                    }),
                 warmup_operations: 0,
+                warmup_end_ns: clock_ns(ClockKind::Monotonic)?,
                 tunnels: self.lanes.len() as u64,
-                last_operation_id: operation_id_text(operation_id(0, 0, 0)),
+                first_operation_id,
+                last_operation_id,
+                operation_hash_sha256,
                 request_bytes: 0,
                 response_bytes: 0,
-                connection_ledger: websocket_connection_ledger(
-                    self.protocol,
-                    self.physical_connections,
-                    self.lanes.len() as u64,
-                ),
+                connection_ledger: open_ledger,
+                h2_wire,
+                attempts,
+                lane_quotas: vec![1; self.lanes.len()],
+                lane_completions: vec![1; self.lanes.len()],
             });
         }
-        let count = warmup_operations.max(u64::try_from(self.lanes.len()).unwrap_or(u64::MAX));
+        if warmup_operations == 0 {
+            return Err(Error::new("protocol proof requires at least one operation"));
+        }
+        let count = warmup_operations;
         let result = self.run_batch(1, count).await?;
         Ok(LoadProof {
             downstream_protocol: self.protocol,
@@ -428,34 +779,145 @@ impl LoadSession {
             } else {
                 self.physical_connections
             },
-            h2_settings_proved: self.protocol == Protocol::H2,
+            h2_settings_proved: self.protocol == Protocol::H1
+                || self
+                    .h2_wire_evidence()?
+                    .iter()
+                    .all(initial_h2_exchange_proved),
             extended_connect_proved: false,
             warmup_operations: result.operations_completed,
+            warmup_end_ns: result.window_end_ns,
             tunnels: 0,
+            first_operation_id: result.first_operation_id,
             last_operation_id: result.last_operation_id,
+            operation_hash_sha256: result.operation_hash_sha256,
             request_bytes: result.request_bytes,
             response_bytes: result.response_bytes,
             connection_ledger: result.connection_ledger,
+            h2_wire: result.h2_wire,
+            attempts: result.attempts,
+            lane_quotas: result.lane_quotas,
+            lane_completions: result.lane_completions,
         })
     }
 
-    async fn open_all_websockets(&mut self) -> Result<()> {
+    async fn open_all_websockets(
+        &mut self,
+    ) -> Result<(ConnectionLedger, String, String, String, AttemptEvidence)> {
+        let attempts_before = self.attempts.snapshot();
         let lanes = std::mem::take(&mut self.lanes);
+        let mut lanes = lanes.into_iter();
+        let first_lane = lanes
+            .next()
+            .ok_or_else(|| Error::new("WebSocket tunnel lane inventory is empty"))?;
+        let (first_lane, first_outcome) = open_websocket(first_lane).await?;
         let mut tasks = Vec::with_capacity(lanes.len());
         for lane in lanes {
             tasks.push(tokio::spawn(async move { open_websocket(lane).await }));
         }
-        let mut restored = Vec::with_capacity(tasks.len());
+        let mut restored = Vec::with_capacity(tasks.len() + 1);
+        let mut outcomes = Vec::with_capacity(tasks.len() + 1);
+        restored.push(first_lane);
+        outcomes.push(first_outcome);
         for task in tasks {
-            restored.push(task.await.context("join WebSocket handshake lane")??);
+            let (lane, outcome) = task.await.context("join WebSocket handshake lane")??;
+            restored.push(lane);
+            outcomes.push(outcome);
         }
+        let attempts = reconcile_attempt_delta(
+            attempts_before,
+            self.attempts.snapshot(),
+            u64::try_from(outcomes.len()).map_err(|_| Error::new("tunnel count overflow"))?,
+        )?;
         restored.sort_by_key(|lane| lane.id);
+        outcomes.sort_by(|left, right| {
+            left.operation_id
+                .as_bytes()
+                .cmp(right.operation_id.as_bytes())
+        });
         self.lanes = restored;
-        Ok(())
+        let mut ledger = self.base_connection_ledger.clone();
+        let mut hasher = Sha256::new();
+        let mut per_connection = BTreeMap::<u64, u64>::new();
+        for outcome in &outcomes {
+            let connection_id = outcome
+                .connection
+                .connection_id
+                .ok_or_else(|| Error::new("tunnel handshake lacks physical connection ID"))?;
+            let count = per_connection.entry(connection_id).or_insert(0);
+            *count = count
+                .checked_add(outcome.connection.requests)
+                .ok_or_else(|| Error::new("tunnel requests-per-connection overflow"))?;
+            add_connection_outcome(&mut ledger, &mut hasher, outcome)?;
+        }
+        if self.protocol == Protocol::H2 {
+            set_h2_stream_identity(&mut ledger, &outcomes)?;
+        }
+        ledger.max_requests_per_connection = per_connection.values().copied().max().unwrap_or(0);
+        ledger.operation_connection_hash_sha256 = format!("{:x}", hasher.finalize());
+        if self.protocol == Protocol::H2 {
+            ledger.active_h2_streams = u64::try_from(outcomes.len())
+                .map_err(|_| Error::new("tunnel stream count overflow"))?;
+            ledger.max_active_h2_streams = ledger.active_h2_streams;
+        }
+        validate_connection_ledger(
+            &ledger,
+            u64::try_from(outcomes.len()).map_err(|_| Error::new("tunnel count overflow"))?,
+            u64::try_from(self.lanes.len()).map_err(|_| Error::new("lane count overflow"))?,
+        )?;
+        let first = outcomes
+            .first()
+            .ok_or_else(|| Error::new("WebSocket tunnel outcome inventory is empty"))?
+            .operation_id
+            .clone();
+        let last = outcomes
+            .last()
+            .ok_or_else(|| Error::new("WebSocket tunnel outcome inventory is empty"))?
+            .operation_id
+            .clone();
+        let mut operation_hasher = Sha256::new();
+        for outcome in &outcomes {
+            operation_hasher.update(outcome.operation_id.as_bytes());
+            operation_hasher.update(outcome.request_bytes.to_be_bytes());
+            operation_hasher.update(outcome.response_bytes.to_be_bytes());
+        }
+        Ok((
+            ledger,
+            first,
+            last,
+            format!("{:x}", operation_hasher.finalize()),
+            attempts,
+        ))
+    }
+
+    fn h2_wire_evidence(&self) -> Result<Vec<H2WireEvidence>> {
+        let mut evidence = self
+            .h2_observers
+            .iter()
+            .map(H2FrameObserver::snapshot)
+            .collect::<Result<Vec<_>>>()?;
+        evidence.sort_by_key(|wire| wire.connection_id);
+        Ok(evidence)
     }
 
     async fn run_batch(&mut self, phase: u16, operations: u64) -> Result<LoadResult> {
         self.run_batch_with_latencies(phase, operations, true).await
+    }
+
+    async fn run_materialization_wave(
+        &mut self,
+        phase: u16,
+        operations: u64,
+    ) -> Result<LoadResult> {
+        let lanes =
+            u64::try_from(self.lanes.len()).map_err(|_| Error::new("lane count overflow"))?;
+        if operations != lanes {
+            return Err(Error::new(
+                "materialization wave must issue exactly one operation per lane",
+            ));
+        }
+        self.run_batch_with_latencies(phase, operations, false)
+            .await
     }
 
     async fn run_batch_with_latencies(
@@ -472,7 +934,19 @@ impl LoadSession {
         if let Some(tracker) = &self.fresh_tracker {
             tracker.reset_phase()?;
         }
+        if let Some(tracker) = &self.h2_stream_tracker {
+            tracker.reset_phase()?;
+        }
+        let attempts_before = self.attempts.snapshot();
         let lanes = std::mem::take(&mut self.lanes);
+        let lane_quotas = lanes
+            .iter()
+            .map(|lane| {
+                let lane_index = u64::from(lane.id);
+                operations / lane_count + u64::from(lane_index < operations % lane_count)
+            })
+            .collect::<Vec<_>>();
+        validate_precomputed_websocket_masks(&lanes, phase, &lane_quotas)?;
         let mut tasks = Vec::with_capacity(lanes.len());
         let barrier = Arc::new(tokio::sync::Barrier::new(lanes.len() + 1));
         for lane in lanes {
@@ -493,8 +967,12 @@ impl LoadSession {
         barrier.wait().await;
         let mut restored = Vec::with_capacity(tasks.len());
         let mut outcomes = Vec::new();
+        let mut lane_completions = vec![0_u64; usize::try_from(lane_count).unwrap_or(0)];
         for task in tasks {
             let (lane, mut lane_outcomes) = task.await.context("join load lane")??;
+            let lane_index = usize::from(lane.id);
+            lane_completions[lane_index] = u64::try_from(lane_outcomes.len())
+                .map_err(|_| Error::new("lane completion count overflow"))?;
             restored.push(lane);
             outcomes.append(&mut lane_outcomes);
         }
@@ -504,13 +982,22 @@ impl LoadSession {
         if outcomes.len() as u64 != operations {
             return Err(Error::new("load batch quota/completion mismatch"));
         }
+        let attempts =
+            reconcile_attempt_delta(attempts_before, self.attempts.snapshot(), operations)?;
         self.finish_result(
             outcomes,
-            lane_count,
-            window_start_ns,
-            None,
-            window_end_ns,
-            retain_latencies,
+            ResultWindow {
+                start_ns: window_start_ns,
+                deadline_ns: None,
+                end_ns: window_end_ns,
+                retain_latencies,
+            },
+            attempts,
+            LaneResultSummary {
+                count: lane_count,
+                quotas: lane_quotas,
+                completions: lane_completions,
+            },
         )
     }
 
@@ -520,9 +1007,27 @@ impl LoadSession {
         duration_ns: u64,
         retain_latencies: bool,
     ) -> Result<LoadResult> {
-        if !(5_000_000_000..=30_000_000_000).contains(&duration_ns) {
+        self.run_duration_with_bounds(
+            phase,
+            duration_ns,
+            retain_latencies,
+            5_000_000_000,
+            30_000_000_000,
+        )
+        .await
+    }
+
+    async fn run_duration_with_bounds(
+        &mut self,
+        phase: u16,
+        duration_ns: u64,
+        retain_latencies: bool,
+        minimum_ns: u64,
+        maximum_ns: u64,
+    ) -> Result<LoadResult> {
+        if !(minimum_ns..=maximum_ns).contains(&duration_ns) {
             return Err(Error::new(
-                "fixed measurement duration must be within 5..=30 seconds",
+                "fixed operation duration is outside its sealed bounds",
             ));
         }
         let lane_count =
@@ -530,7 +1035,25 @@ impl LoadSession {
         if let Some(tracker) = &self.fresh_tracker {
             tracker.reset_phase()?;
         }
+        if let Some(tracker) = &self.h2_stream_tracker {
+            tracker.reset_phase()?;
+        }
+        let attempts_before = self.attempts.snapshot();
         let lanes = std::mem::take(&mut self.lanes);
+        // This is a writer/precomputation ceiling, never an operation quota.
+        // Reaching it before the frozen deadline is a terminal BLOCKED error;
+        // the load path never drops a started operation or computes a mask in
+        // the timed region.
+        const MAX_DURATION_OPERATIONS: u64 = 2_000_000;
+        let mask_quotas = lanes
+            .iter()
+            .map(|lane| {
+                let lane_index = u64::from(lane.id);
+                MAX_DURATION_OPERATIONS / lane_count
+                    + u64::from(lane_index < MAX_DURATION_OPERATIONS % lane_count)
+            })
+            .collect::<Vec<_>>();
+        validate_precomputed_websocket_masks(&lanes, phase, &mask_quotas)?;
         let barrier = Arc::new(tokio::sync::Barrier::new(lanes.len() + 1));
         let shared_deadline = Arc::new(AtomicU64::new(0));
         let mut tasks = Vec::with_capacity(lanes.len());
@@ -547,6 +1070,7 @@ impl LoadSession {
                 {
                     outcomes.push(outcome);
                 }
+                lane.discard_websocket_masks(phase)?;
                 Ok::<_, Error>((lane, outcomes))
             }));
         }
@@ -558,8 +1082,12 @@ impl LoadSession {
         barrier.wait().await;
         let mut restored = Vec::with_capacity(tasks.len());
         let mut outcomes = Vec::new();
+        let mut lane_completions = vec![0_u64; usize::try_from(lane_count).unwrap_or(0)];
         for task in tasks {
             let (lane, mut lane_outcomes) = task.await.context("join fixed-window load lane")??;
+            let lane_index = usize::from(lane.id);
+            lane_completions[lane_index] = u64::try_from(lane_outcomes.len())
+                .map_err(|_| Error::new("lane completion count overflow"))?;
             restored.push(lane);
             outcomes.append(&mut lane_outcomes);
         }
@@ -569,25 +1097,47 @@ impl LoadSession {
         if outcomes.is_empty() {
             return Err(Error::new("fixed measurement completed zero operations"));
         }
+        let attempts = reconcile_attempt_delta(
+            attempts_before,
+            self.attempts.snapshot(),
+            outcomes.len() as u64,
+        )?;
+        let lane_quotas = lane_completions.clone();
         self.finish_result(
             outcomes,
-            lane_count,
-            window_start_ns,
-            Some(window_deadline_ns),
-            window_end_ns,
-            retain_latencies,
+            ResultWindow {
+                start_ns: window_start_ns,
+                deadline_ns: Some(window_deadline_ns),
+                end_ns: window_end_ns,
+                retain_latencies,
+            },
+            attempts,
+            LaneResultSummary {
+                count: lane_count,
+                quotas: lane_quotas,
+                completions: lane_completions,
+            },
         )
     }
 
     fn finish_result(
         &self,
         mut outcomes: Vec<OperationOutcome>,
-        lane_count: u64,
-        window_start_ns: u64,
-        window_deadline_ns: Option<u64>,
-        window_end_ns: u64,
-        retain_latencies: bool,
+        window: ResultWindow,
+        attempts: AttemptEvidence,
+        lanes: LaneResultSummary,
     ) -> Result<LoadResult> {
+        let ResultWindow {
+            start_ns: window_start_ns,
+            deadline_ns: window_deadline_ns,
+            end_ns: window_end_ns,
+            retain_latencies,
+        } = window;
+        let LaneResultSummary {
+            count: lane_count,
+            quotas: lane_quotas,
+            completions: lane_completions,
+        } = lanes;
         outcomes.sort_by(|left, right| {
             left.operation_id
                 .as_bytes()
@@ -599,7 +1149,22 @@ impl LoadSession {
         let mut response_bytes = 0_u64;
         let mut latencies = Vec::with_capacity(outcomes.len());
         let mut connection_hasher = Sha256::new();
-        let mut ledger = empty_connection_ledger(self.protocol, self.workload);
+        let mut requests_per_connection = BTreeMap::<String, u64>::new();
+        let mut ledger = if self.fresh_tracker.is_some() {
+            empty_connection_ledger(self.protocol, self.workload)
+        } else if self.workload == Workload::WebSocket {
+            let mut base = self
+                .websocket_open_ledger
+                .clone()
+                .ok_or_else(|| Error::new("WebSocket phase has no observed tunnel ledger"))?;
+            base.requests = 0;
+            base.responses = 0;
+            base.response_eos = 0;
+            base.operation_connection_hash_sha256.clear();
+            base
+        } else {
+            self.base_connection_ledger.clone()
+        };
         for outcome in &outcomes {
             hasher.update(outcome.operation_id.as_bytes());
             hasher.update(outcome.request_bytes.to_be_bytes());
@@ -613,8 +1178,34 @@ impl LoadSession {
             if retain_latencies {
                 latencies.push(outcome.latency_ns);
             }
+            let connection_key = outcome
+                .connection
+                .planned_id
+                .clone()
+                .or_else(|| {
+                    outcome
+                        .connection
+                        .connection_id
+                        .map(|value| format!("physical-{value}"))
+                })
+                .ok_or_else(|| Error::new("operation has no actual/planned connection identity"))?;
+            let requests = requests_per_connection.entry(connection_key).or_insert(0);
+            *requests = requests
+                .checked_add(outcome.connection.requests)
+                .ok_or_else(|| Error::new("requests-per-connection overflow"))?;
             add_connection_outcome(&mut ledger, &mut connection_hasher, outcome)?;
         }
+        if self.protocol == Protocol::H2 && self.workload != Workload::WebSocket {
+            set_h2_stream_identity(&mut ledger, &outcomes)?;
+            let tracker = self
+                .h2_stream_tracker
+                .as_ref()
+                .ok_or_else(|| Error::new("persistent H2 arm lacks active-stream tracker"))?;
+            ledger.active_h2_streams = tracker.active.load(Ordering::SeqCst);
+            ledger.max_active_h2_streams = tracker.maximum.load(Ordering::SeqCst);
+        }
+        ledger.max_requests_per_connection =
+            requests_per_connection.values().copied().max().unwrap_or(0);
         if let Some(tracker) = &self.fresh_tracker {
             ledger.active_connections = tracker.active.load(Ordering::SeqCst);
             ledger.max_active_connections = tracker.maximum.load(Ordering::SeqCst);
@@ -625,7 +1216,8 @@ impl LoadSession {
             }
         }
         ledger.operation_connection_hash_sha256 = format!("{:x}", connection_hasher.finalize());
-        validate_connection_ledger(&mut ledger, operations, lane_count)?;
+        validate_connection_ledger(&ledger, operations, lane_count)?;
+        let observed_retries = ledger.retry_attempts;
         let operations_completed_by_deadline = window_deadline_ns.map_or(operations, |deadline| {
             outcomes
                 .iter()
@@ -654,12 +1246,17 @@ impl LoadSession {
             status_ok: outcomes.iter().all(|outcome| outcome.status_ok),
             eos_ok: outcomes.iter().all(|outcome| outcome.eos_ok),
             payload_ok: outcomes.iter().all(|outcome| outcome.payload_ok),
+            sse_content_type_ok: outcomes.iter().all(|outcome| outcome.sse_content_type_ok),
             response_headers_sanitized: outcomes
                 .iter()
                 .all(|outcome| outcome.response_headers_sanitized),
-            retries: 0,
+            retries: observed_retries,
             latencies_ns: latencies,
             connection_ledger: ledger,
+            h2_wire: self.h2_wire_evidence()?,
+            attempts,
+            lane_quotas,
+            lane_completions,
         })
     }
 }
@@ -681,6 +1278,7 @@ fn empty_connection_ledger(protocol: Protocol, workload: Workload) -> Connection
         socket_creations: 0,
         connect_attempts: 0,
         connect_successes: 0,
+        failed_connect_attempts: 0,
         cumulative_connections: 0,
         requests: 0,
         responses: 0,
@@ -692,6 +1290,12 @@ fn empty_connection_ledger(protocol: Protocol, workload: Workload) -> Connection
         max_active_connections: 0,
         max_requests_per_connection: 0,
         h2_streams: 0,
+        active_h2_streams: 0,
+        max_active_h2_streams: 0,
+        first_h2_stream_id: None,
+        last_h2_stream_id: None,
+        h2_stream_sequence_sha256: crate::wire::request_stream_sequence_sha256(0)
+            .expect("empty H2 stream sequence is infallible"),
         reuse_attempts: 0,
         reconnect_attempts: 0,
         retry_attempts: 0,
@@ -699,29 +1303,107 @@ fn empty_connection_ledger(protocol: Protocol, workload: Workload) -> Connection
     }
 }
 
-fn websocket_connection_ledger(
-    protocol: Protocol,
-    physical_connections: u64,
-    tunnels: u64,
-) -> ConnectionLedger {
-    let mut ledger = empty_connection_ledger(protocol, Workload::WebSocket);
-    ledger.planned_connections = physical_connections;
-    ledger.socket_creations = physical_connections;
-    ledger.connect_attempts = physical_connections;
-    ledger.connect_successes = physical_connections;
-    ledger.cumulative_connections = physical_connections;
-    ledger.requests = tunnels;
-    ledger.responses = tunnels;
-    ledger.active_connections = physical_connections;
-    ledger.max_active_connections = physical_connections;
-    ledger.max_requests_per_connection = if protocol == Protocol::H1 { 1 } else { tunnels };
-    ledger.h2_streams = if protocol == Protocol::H2 { tunnels } else { 0 };
+fn record_connection_start(ledger: &mut ConnectionLedger, connection_id: u64) -> Result<()> {
+    if connection_id == 0 {
+        return Err(Error::new("physical connection ID must be nonzero"));
+    }
+    for field in [
+        &mut ledger.planned_connections,
+        &mut ledger.socket_creations,
+        &mut ledger.connect_attempts,
+        &mut ledger.active_connections,
+    ] {
+        *field = field
+            .checked_add(1)
+            .ok_or_else(|| Error::new("physical connection ledger overflow"))?;
+    }
+    ledger.max_active_connections = ledger.max_active_connections.max(ledger.active_connections);
+    Ok(())
+}
+
+fn record_connection_success(ledger: &mut ConnectionLedger, connection_id: u64) -> Result<()> {
+    if connection_id == 0 || ledger.connect_successes >= ledger.connect_attempts {
+        return Err(Error::new(
+            "physical connection success has no prior attempt",
+        ));
+    }
+    ledger.connect_successes = ledger
+        .connect_successes
+        .checked_add(1)
+        .ok_or_else(|| Error::new("connect-success ledger overflow"))?;
+    ledger.cumulative_connections = ledger
+        .cumulative_connections
+        .checked_add(1)
+        .ok_or_else(|| Error::new("cumulative-connection ledger overflow"))?;
+    Ok(())
+}
+
+fn initial_h2_exchange_proved(wire: &H2WireEvidence) -> bool {
+    wire.validate(false).is_ok()
+}
+
+fn reconcile_attempt_delta(
+    before: AttemptEvidence,
+    after: AttemptEvidence,
+    expected: u64,
+) -> Result<AttemptEvidence> {
+    let delta = |end: u64, start: u64, name: &str| {
+        end.checked_sub(start)
+            .ok_or_else(|| Error::new(format!("operation {name} counter decreased")))
+    };
+    let evidence = AttemptEvidence {
+        starts: delta(after.starts, before.starts, "start")?,
+        successes: delta(after.successes, before.successes, "success")?,
+        failures: delta(after.failures, before.failures, "failure")?,
+        reconnects: delta(after.reconnects, before.reconnects, "reconnect")?,
+        retries: delta(after.retries, before.retries, "retry")?,
+    };
+    if evidence.starts != expected
+        || evidence.successes != expected
+        || evidence.failures != 0
+        || evidence.reconnects != 0
+        || evidence.retries != 0
+    {
+        return Err(Error::new(
+            "operation start/success/failure/reconnect/retry ledger is not an exact complete set",
+        ));
+    }
+    Ok(evidence)
+}
+
+fn set_h2_stream_identity(
+    ledger: &mut ConnectionLedger,
+    outcomes: &[OperationOutcome],
+) -> Result<()> {
+    let mut stream_ids = outcomes
+        .iter()
+        .map(|outcome| {
+            outcome
+                .connection
+                .stream_id
+                .ok_or_else(|| Error::new("H2 operation lacks an observed stream ID"))
+        })
+        .collect::<Result<Vec<_>>>()?;
+    stream_ids.sort_unstable();
+    if stream_ids.windows(2).any(|pair| pair[0] >= pair[1]) {
+        return Err(Error::new(
+            "H2 operation stream IDs are duplicate or unordered",
+        ));
+    }
+    ledger.first_h2_stream_id = stream_ids.first().copied();
+    ledger.last_h2_stream_id = stream_ids.last().copied();
     let mut hasher = Sha256::new();
-    hasher.update(protocol.label().as_bytes());
-    hasher.update(physical_connections.to_be_bytes());
-    hasher.update(tunnels.to_be_bytes());
-    ledger.operation_connection_hash_sha256 = format!("{:x}", hasher.finalize());
-    ledger
+    hasher.update(b"amg-http2-perf/h2-phase-streams/v1\0");
+    for stream_id in &stream_ids {
+        hasher.update(stream_id.to_be_bytes());
+    }
+    ledger.h2_stream_sequence_sha256 = format!("{:x}", hasher.finalize());
+    if stream_ids.len() as u64 != ledger.h2_streams {
+        return Err(Error::new(
+            "H2 operation and connection stream ledgers differ",
+        ));
+    }
+    Ok(())
 }
 
 fn add_connection_outcome(
@@ -750,6 +1432,14 @@ fn add_connection_outcome(
     } else {
         hasher.update(outcome.operation_id.as_bytes());
         hasher.update(ledger.policy_label().as_bytes());
+    }
+    match connection.connection_id {
+        Some(connection_id) => hasher.update(connection_id.to_be_bytes()),
+        None => hasher.update(0_u64.to_be_bytes()),
+    }
+    match connection.stream_id {
+        Some(stream_id) => hasher.update(stream_id.to_be_bytes()),
+        None => hasher.update(0_u32.to_be_bytes()),
     }
     checked_add!(socket_creations);
     checked_add!(connect_attempts);
@@ -782,10 +1472,22 @@ impl ConnectionPolicyLabel for ConnectionLedger {
 }
 
 fn validate_connection_ledger(
-    ledger: &mut ConnectionLedger,
+    ledger: &ConnectionLedger,
     operations: u64,
     concurrency: u64,
 ) -> Result<()> {
+    crate::schema::validate_sha256(
+        "connection H2 stream sequence",
+        &ledger.h2_stream_sequence_sha256,
+    )?;
+    if ledger.failed_connect_attempts != 0
+        || ledger
+            .connect_successes
+            .checked_add(ledger.failed_connect_attempts)
+            != Some(ledger.connect_attempts)
+    {
+        return Err(Error::new("connection attempt ledger is incomplete"));
+    }
     match ledger.policy {
         ConnectionPolicy::FreshH1PerOperation => {
             let exact = [
@@ -800,70 +1502,124 @@ fn validate_connection_ledger(
                 ledger.response_eos,
                 ledger.transport_eof,
             ];
-            ledger.max_requests_per_connection = 1;
             if exact.iter().any(|count| *count != operations)
                 || ledger.keep_alive_tokens != 0
                 || ledger.active_connections != 0
                 || ledger.max_active_connections == 0
                 || ledger.max_active_connections > concurrency
+                || ledger.max_requests_per_connection != 1
                 || ledger.reuse_attempts != 0
                 || ledger.reconnect_attempts != 0
                 || ledger.retry_attempts != 0
+                || ledger.h2_streams != 0
+                || ledger.active_h2_streams != 0
+                || ledger.max_active_h2_streams != 0
+                || ledger.first_h2_stream_id.is_some()
+                || ledger.last_h2_stream_id.is_some()
             {
                 return Err(Error::new(
                     "fresh-H1 connection ledger failed exact cumulative reconciliation",
                 ));
             }
         }
-        ConnectionPolicy::PersistentH1 | ConnectionPolicy::H1UpgradeTunnels => {
-            ledger.planned_connections = concurrency;
-            ledger.socket_creations = concurrency;
-            ledger.connect_attempts = concurrency;
-            ledger.connect_successes = concurrency;
-            ledger.cumulative_connections = concurrency;
-            ledger.active_connections = concurrency;
-            ledger.max_active_connections = concurrency;
-            ledger.max_requests_per_connection = operations.div_ceil(concurrency);
-            if ledger.requests != operations
+        ConnectionPolicy::PersistentH1 => {
+            if [
+                ledger.planned_connections,
+                ledger.socket_creations,
+                ledger.connect_attempts,
+                ledger.connect_successes,
+                ledger.cumulative_connections,
+                ledger.active_connections,
+                ledger.max_active_connections,
+            ]
+            .iter()
+            .any(|count| *count != concurrency)
+                || ledger.max_requests_per_connection != operations.div_ceil(concurrency)
+                || ledger.requests != operations
                 || ledger.responses != operations
                 || ledger.close_tokens != 0
                 || ledger.keep_alive_tokens != 0
                 || ledger.response_eos != operations
                 || ledger.transport_eof != 0
+                || ledger.h2_streams != 0
+                || ledger.active_h2_streams != 0
+                || ledger.max_active_h2_streams != 0
             {
                 return Err(Error::new("persistent-H1 operation ledger mismatch"));
             }
         }
+        ConnectionPolicy::H1UpgradeTunnels => {
+            if [
+                ledger.planned_connections,
+                ledger.socket_creations,
+                ledger.connect_attempts,
+                ledger.connect_successes,
+                ledger.cumulative_connections,
+                ledger.active_connections,
+                ledger.max_active_connections,
+            ]
+            .iter()
+            .any(|count| *count != concurrency)
+                || ledger.requests != operations
+                || ledger.responses != operations
+                || ledger.close_tokens != 0
+                || ledger.keep_alive_tokens != 0
+                || ledger.transport_eof != 0
+                || ledger.h2_streams != 0
+                || ledger.active_h2_streams != 0
+                || ledger.max_active_h2_streams != 0
+            {
+                return Err(Error::new("H1 Upgrade tunnel ledger mismatch"));
+            }
+        }
         ConnectionPolicy::PersistentH2 => {
-            ledger.planned_connections = 1;
-            ledger.socket_creations = 1;
-            ledger.connect_attempts = 1;
-            ledger.connect_successes = 1;
-            ledger.cumulative_connections = 1;
-            ledger.active_connections = 1;
-            ledger.max_active_connections = 1;
-            ledger.max_requests_per_connection = operations;
-            if ledger.requests != operations
+            if [
+                ledger.planned_connections,
+                ledger.socket_creations,
+                ledger.connect_attempts,
+                ledger.connect_successes,
+                ledger.cumulative_connections,
+                ledger.active_connections,
+                ledger.max_active_connections,
+            ]
+            .iter()
+            .any(|count| *count != 1)
+                || ledger.max_requests_per_connection != operations
+                || ledger.requests != operations
                 || ledger.responses != operations
                 || ledger.response_eos != operations
                 || ledger.h2_streams != operations
                 || ledger.close_tokens != 0
                 || ledger.transport_eof != 0
+                || ledger.active_h2_streams != 0
+                || ledger.max_active_h2_streams == 0
+                || ledger.max_active_h2_streams > concurrency
+                || ledger.first_h2_stream_id.is_none()
+                || ledger.last_h2_stream_id.is_none()
             {
                 return Err(Error::new("persistent-H2 operation ledger mismatch"));
             }
         }
         ConnectionPolicy::H2ExtendedConnectStreams => {
-            ledger.planned_connections = 1;
-            ledger.socket_creations = 1;
-            ledger.connect_attempts = 1;
-            ledger.connect_successes = 1;
-            ledger.cumulative_connections = 1;
-            ledger.active_connections = 1;
-            ledger.max_active_connections = 1;
-            ledger.max_requests_per_connection = operations;
-            ledger.h2_streams = concurrency;
-            if ledger.requests != operations || ledger.responses != operations {
+            if [
+                ledger.planned_connections,
+                ledger.socket_creations,
+                ledger.connect_attempts,
+                ledger.connect_successes,
+                ledger.cumulative_connections,
+                ledger.active_connections,
+                ledger.max_active_connections,
+            ]
+            .iter()
+            .any(|count| *count != 1)
+                || ledger.h2_streams != concurrency
+                || ledger.requests != operations
+                || ledger.responses != operations
+                || ledger.active_h2_streams != concurrency
+                || ledger.max_active_h2_streams != concurrency
+                || ledger.first_h2_stream_id.is_none()
+                || ledger.last_h2_stream_id.is_none()
+            {
                 return Err(Error::new("RFC8441 Ping/Pong operation ledger mismatch"));
             }
         }
@@ -879,13 +1635,96 @@ impl Drop for LoadSession {
     }
 }
 
+fn validate_precomputed_websocket_masks(
+    lanes: &[Lane],
+    phase: u16,
+    expected_per_lane: &[u64],
+) -> Result<()> {
+    if lanes.len() != expected_per_lane.len() {
+        return Err(Error::new(
+            "WebSocket precomputed-mask lane inventory differs from execution",
+        ));
+    }
+    for (lane, expected) in lanes.iter().zip(expected_per_lane) {
+        if lane.workload == Workload::WebSocket {
+            if lane.websocket_masks.len() as u64 != *expected
+                || lane
+                    .websocket_masks
+                    .iter()
+                    .any(|prepared| prepared.phase != phase)
+            {
+                return Err(Error::new(
+                    "WebSocket phase lacks its complete precomputed mask table",
+                ));
+            }
+        } else if !lane.websocket_masks.is_empty() {
+            return Err(Error::new(
+                "non-WebSocket lane unexpectedly carries a mask table",
+            ));
+        }
+    }
+    Ok(())
+}
+
 impl Lane {
-    fn next_operation(&mut self, phase: u16) -> (u64, String) {
+    fn precompute_websocket_masks(&mut self, phase: u16, count: u64) -> Result<()> {
+        if self.workload != Workload::WebSocket {
+            return Ok(());
+        }
+        if !self.websocket_masks.is_empty() {
+            return Err(Error::new(
+                "WebSocket mask table from a previous phase was not retired",
+            ));
+        }
+        let first = self.phase_sequences.get(&phase).copied().unwrap_or(0);
+        let count = usize::try_from(count)
+            .map_err(|_| Error::new("WebSocket mask table count exceeds usize"))?;
+        self.websocket_masks.reserve(count);
+        for offset in 0..count {
+            let sequence = first
+                .checked_add(offset as u64)
+                .ok_or_else(|| Error::new("WebSocket mask sequence overflow"))?;
+            if sequence > u64::from(u32::MAX) {
+                return Err(Error::new(
+                    "WebSocket mask sequence exceeds the sealed payload width",
+                ));
+            }
+            let packed = (u64::from(phase) << 32) | (sequence & 0xffff_ffff);
+            let id = operation_id(phase, self.id, sequence);
+            let frame: [u8; 14] = masked_ping(&self.corpus, id, self.id, packed)
+                .try_into()
+                .map_err(|_| Error::new("precomputed WebSocket frame width changed"))?;
+            let expected_payload = crate::topology::parse_masked_ping(&frame)?;
+            self.websocket_masks.push_back(PreparedWebSocketFrame {
+                phase,
+                sequence,
+                frame,
+                expected_payload,
+            });
+        }
+        Ok(())
+    }
+
+    fn discard_websocket_masks(&mut self, phase: u16) -> Result<()> {
+        if self
+            .websocket_masks
+            .iter()
+            .any(|prepared| prepared.phase != phase)
+        {
+            return Err(Error::new("WebSocket mask table contains another phase"));
+        }
+        self.websocket_masks.clear();
+        Ok(())
+    }
+
+    fn next_operation(&mut self, phase: u16) -> Result<(u64, String)> {
         let sequence = self.phase_sequences.entry(phase).or_insert(0);
         let current = *sequence;
-        *sequence = sequence.saturating_add(1);
+        *sequence = sequence
+            .checked_add(1)
+            .ok_or_else(|| Error::new("lane operation sequence overflow"))?;
         let id = operation_id(phase, self.id, current);
-        (current, operation_id_text(id))
+        Ok((current, operation_id_text(id)))
     }
 
     async fn run_operation(&mut self, phase: u16) -> Result<OperationOutcome> {
@@ -915,9 +1754,27 @@ impl Lane {
         } else {
             Some(self.build_http_request(&operation_text)?)
         };
+        let websocket_frame = if self.workload == Workload::WebSocket {
+            let prepared = self
+                .websocket_masks
+                .front()
+                .copied()
+                .ok_or_else(|| Error::new("WebSocket operation lacks a precomputed mask"))?;
+            if prepared.phase != phase || prepared.sequence != sequence {
+                return Err(Error::new(
+                    "precomputed WebSocket mask identity differs from operation",
+                ));
+            }
+            Some(prepared)
+        } else {
+            None
+        };
         let start = clock_ns(ClockKind::Monotonic)?;
         if deadline_ns.is_some_and(|deadline| start >= deadline) {
             return Ok(None);
+        }
+        if websocket_frame.is_some() {
+            self.websocket_masks.pop_front();
         }
         let stored = self.phase_sequences.entry(phase).or_insert(0);
         if *stored != sequence {
@@ -926,8 +1783,11 @@ impl Lane {
         *stored = stored
             .checked_add(1)
             .ok_or_else(|| Error::new("lane operation sequence overflow"))?;
+        let attempt = self.attempts.begin();
         let mut outcome = if self.workload == Workload::WebSocket {
-            self.run_websocket_operation(phase, sequence, operation_text)
+            let prepared =
+                websocket_frame.ok_or_else(|| Error::new("precomputed WebSocket frame missing"))?;
+            self.run_websocket_operation(operation_text, prepared.frame, prepared.expected_payload)
                 .await?
         } else {
             self.run_http_operation(
@@ -943,6 +1803,7 @@ impl Lane {
             .ok_or_else(|| Error::new("MONOTONIC operation clock moved backwards"))?;
         outcome.start_ns = start;
         outcome.completed_ns = end;
+        attempt.success();
         Ok(Some(outcome))
     }
 
@@ -996,9 +1857,13 @@ impl Lane {
         request: Request<BenchBody>,
     ) -> Result<OperationOutcome> {
         let corpus = Arc::clone(&self.corpus);
+        let _active_h2_stream = self
+            .h2_stream_tracker
+            .as_ref()
+            .map(ActiveStreamTracker::acquire);
         let mut outcome = match &mut self.transport {
             LaneTransport::Http(sender) => {
-                let response = sender.send(request).await?;
+                let (response, connection_id, stream_id) = sender.send(request, false).await?;
                 let mut outcome = validate_response(
                     self.workload,
                     self.protocol,
@@ -1011,6 +1876,8 @@ impl Lane {
                 outcome.connection.requests = 1;
                 outcome.connection.responses = 1;
                 outcome.connection.response_eos = 1;
+                outcome.connection.connection_id = Some(connection_id);
+                outcome.connection.stream_id = stream_id;
                 if self.protocol == Protocol::H2 {
                     outcome.connection.h2_streams = 1;
                 }
@@ -1040,13 +1907,10 @@ impl Lane {
 
     async fn run_websocket_operation(
         &mut self,
-        phase: u16,
-        sequence: u64,
         operation_text: String,
+        frame: [u8; 14],
+        expected_payload: [u8; 8],
     ) -> Result<OperationOutcome> {
-        let packed = (u64::from(phase) << 32) | (sequence & 0xffff_ffff);
-        let id = operation_id(phase, self.id, sequence);
-        let frame = masked_ping(&self.corpus, id, self.id, packed);
         let io = match &mut self.transport {
             LaneTransport::WebSocket(io) => io,
             LaneTransport::Http(_) | LaneTransport::FreshH1 { .. } => {
@@ -1058,7 +1922,6 @@ impl Lane {
         let mut pong = [0_u8; 10];
         io.read_exact(&mut pong).await?;
         let payload = parse_unmasked_pong(&pong)?;
-        let expected_payload = crate::topology::parse_masked_ping(&frame)?;
         Ok(OperationOutcome {
             operation_id: operation_text,
             request_bytes: 8,
@@ -1069,8 +1932,11 @@ impl Lane {
             status_ok: true,
             eos_ok: true,
             payload_ok: payload == expected_payload,
+            sse_content_type_ok: true,
             response_headers_sanitized: true,
             connection: OperationConnection {
+                connection_id: self.physical_connection_id,
+                stream_id: self.tunnel_stream_id,
                 requests: 1,
                 responses: 1,
                 response_eos: 1,
@@ -1080,8 +1946,8 @@ impl Lane {
     }
 }
 
-async fn open_websocket(mut lane: Lane) -> Result<Lane> {
-    let (_, operation_text) = lane.next_operation(0);
+async fn open_websocket(mut lane: Lane) -> Result<(Lane, OperationOutcome)> {
+    let (_, operation_text) = lane.next_operation(0)?;
     // Canonical 16-byte RFC 6455 nonce (the RFC example value).
     let key = "dGhlIHNhbXBsZSBub25jZQ==";
     let uri = if lane.protocol == Protocol::H1 {
@@ -1101,7 +1967,7 @@ async fn open_websocket(mut lane: Lane) -> Result<Lane> {
             Version::HTTP_2
         })
         .uri(uri)
-        .header("x-amg-bench-op", operation_text)
+        .header("x-amg-bench-op", &operation_text)
         .header(SEC_WEBSOCKET_VERSION, "13")
         .header(ORIGIN, "http://public.example")
         .header(AUTHORIZATION, "Bearer browser-secret-must-strip")
@@ -1124,6 +1990,7 @@ async fn open_websocket(mut lane: Lane) -> Result<Lane> {
             .insert(hyper::ext::Protocol::from_static("websocket"));
     }
     apply_target_headers(&mut request, lane.target, lane.cookie_header.as_deref())?;
+    let attempt = lane.attempts.begin();
     let sender = match &mut lane.transport {
         LaneTransport::Http(sender) => sender,
         LaneTransport::FreshH1 { .. } => {
@@ -1131,7 +1998,8 @@ async fn open_websocket(mut lane: Lane) -> Result<Lane> {
         }
         LaneTransport::WebSocket(_) => return Err(Error::new("duplicate WebSocket open")),
     };
-    let mut response = sender.send(request).await?;
+    let (mut response, connection_id, stream_id) =
+        sender.send(request, lane.protocol == Protocol::H2).await?;
     match lane.protocol {
         Protocol::H1 => {
             if response.status() != StatusCode::SWITCHING_PROTOCOLS
@@ -1171,7 +2039,31 @@ async fn open_websocket(mut lane: Lane) -> Result<Lane> {
         .await
         .context("obtain WebSocket upgraded tunnel")?;
     lane.transport = LaneTransport::WebSocket(Box::pin(TokioIo::new(upgraded)));
-    Ok(lane)
+    lane.physical_connection_id = Some(connection_id);
+    lane.tunnel_stream_id = stream_id;
+    let outcome = OperationOutcome {
+        operation_id: operation_text,
+        request_bytes: 0,
+        response_bytes: 0,
+        latency_ns: 0,
+        start_ns: 0,
+        completed_ns: 0,
+        status_ok: true,
+        eos_ok: true,
+        payload_ok: true,
+        sse_content_type_ok: true,
+        response_headers_sanitized: true,
+        connection: OperationConnection {
+            connection_id: Some(connection_id),
+            stream_id,
+            requests: 1,
+            responses: 1,
+            h2_streams: u64::from(stream_id.is_some()),
+            ..OperationConnection::default()
+        },
+    };
+    attempt.success();
+    Ok((lane, outcome))
 }
 
 fn apply_target_headers(
@@ -1236,6 +2128,8 @@ async fn validate_response(
         }
     }
     let status_ok = response.status() == StatusCode::OK;
+    let sse_content_type_ok =
+        workload != Workload::Sse || exact_sse_content_type(response.headers());
     let headers_sanitized = !response
         .headers()
         .contains_key("x-auth-mini-fixture-secret")
@@ -1295,6 +2189,7 @@ async fn validate_response(
         status_ok,
         eos_ok: true,
         payload_ok,
+        sse_content_type_ok,
         response_headers_sanitized: headers_sanitized,
         connection: OperationConnection {
             close_tokens: u64::from(close),
@@ -1311,6 +2206,14 @@ fn has_connection_token(headers: &http::HeaderMap, expected: &str) -> bool {
                 .any(|token| token.trim().eq_ignore_ascii_case(expected))
         })
     })
+}
+
+fn exact_sse_content_type(headers: &http::HeaderMap) -> bool {
+    headers
+        .get_all(http::header::CONTENT_TYPE)
+        .iter()
+        .map(HeaderValue::as_bytes)
+        .eq([b"text/event-stream".as_slice()])
 }
 
 fn validate_sse(bytes: &[u8], corpus: &Corpus) -> bool {
@@ -1368,42 +2271,28 @@ async fn run_fresh_h1_upload(
     }
 
     // Socket creation, the sole connect attempt, request/response, and terminal
-    // EOF all happen inside the caller's operation timer.
+    // peer EOF all happen inside the caller's operation timer.  This path does
+    // not call shutdown and does not hand ownership to Hyper, so a local close
+    // cannot masquerade as peer EOF.
     let socket = if endpoint.is_ipv4() {
-        TcpSocket::new_v4().context("create fresh H1 socket")?
+        TcpSocket::new_v4()
+            .context("create fresh H1 socket")
+            .map_err(|error| error.with_role_code(RoleErrorCode::ConnectFailed))?
     } else {
-        TcpSocket::new_v6().context("create fresh H1 socket")?
+        TcpSocket::new_v6()
+            .context("create fresh H1 socket")
+            .map_err(|error| error.with_role_code(RoleErrorCode::ConnectFailed))?
     };
     let _active = tracker.acquire();
     let stream = socket
         .connect(endpoint)
         .await
-        .context("sole fresh H1 connect attempt")?;
-    stream.set_nodelay(true)?;
-    let (mut sender, connection) = http1::handshake(TokioIo::new(stream))
-        .await
-        .context("fresh H1 client handshake")?;
-    let driver = tokio::spawn(async move {
-        connection
-            .await
-            .map_err(|error| Error::new(format!("fresh H1 connection driver: {error}")))
-    });
-    sender.ready().await.context("fresh H1 sender ready")?;
-    let response = sender
-        .send_request(request)
-        .await
-        .context("send sole fresh H1 upload request")?;
-    let mut outcome = validate_response(
-        workload,
-        Protocol::H1,
-        operation_text,
-        response,
-        corpus,
-        true,
-    )
-    .await?;
-    drop(sender);
-    driver.await.context("join fresh H1 connection driver")??;
+        .context("sole fresh H1 connect attempt")
+        .map_err(|error| error.with_role_code(RoleErrorCode::ConnectFailed))?;
+    stream
+        .set_nodelay(true)
+        .map_err(|error| Error::from(error).with_role_code(RoleErrorCode::ConnectFailed))?;
+    let mut outcome = raw_h1_upload_exchange(stream, request, operation_text, corpus).await?;
     outcome.connection.planned_id = Some(connection_text);
     outcome.connection.socket_creations = 1;
     outcome.connection.connect_attempts = 1;
@@ -1416,7 +2305,350 @@ async fn run_fresh_h1_upload(
     Ok(outcome)
 }
 
-async fn open_h1(endpoint: SocketAddr) -> Result<(http1::SendRequest<BenchBody>, JoinHandle<()>)> {
+async fn raw_h1_upload_exchange(
+    stream: TcpStream,
+    request: Request<BenchBody>,
+    operation_text: &str,
+    corpus: &Corpus,
+) -> Result<OperationOutcome> {
+    raw_h1_upload_exchange_with_eof_cap(
+        stream,
+        request,
+        operation_text,
+        corpus,
+        Duration::from_secs(2),
+    )
+    .await
+}
+
+async fn raw_h1_upload_exchange_with_eof_cap(
+    mut stream: TcpStream,
+    request: Request<BenchBody>,
+    operation_text: &str,
+    corpus: &Corpus,
+    eof_cap: Duration,
+) -> Result<OperationOutcome> {
+    let (parts, _) = request.into_parts();
+    if parts.method != Method::POST
+        || parts.version != Version::HTTP_11
+        || parts.headers.contains_key(CONNECTION)
+        || parts
+            .headers
+            .get(CONTENT_LENGTH)
+            .is_none_or(|value| value != "1048576")
+    {
+        return Err(Error::new("fresh H1 upload request framing changed")
+            .with_role_code(RoleErrorCode::InvalidConfiguration));
+    }
+    let mut head = Vec::with_capacity(2_048);
+    head.extend_from_slice(format!("{} {} HTTP/1.1\r\n", parts.method, parts.uri).as_bytes());
+    for (name, value) in &parts.headers {
+        head.extend_from_slice(name.as_str().as_bytes());
+        head.extend_from_slice(b": ");
+        head.extend_from_slice(value.as_bytes());
+        head.extend_from_slice(b"\r\n");
+    }
+    head.extend_from_slice(b"\r\n");
+    stream
+        .write_all(&head)
+        .await
+        .map_err(|error| Error::from(error).with_role_code(RoleErrorCode::RequestWriteFailed))?;
+    for chunk in corpus.chunks() {
+        stream.write_all(chunk).await.map_err(|error| {
+            Error::from(error).with_role_code(RoleErrorCode::RequestWriteFailed)
+        })?;
+    }
+    stream
+        .flush()
+        .await
+        .map_err(|error| Error::from(error).with_role_code(RoleErrorCode::RequestWriteFailed))?;
+
+    let mut received = Vec::with_capacity(2_048);
+    let header_end = loop {
+        if let Some(offset) = received.windows(4).position(|bytes| bytes == b"\r\n\r\n") {
+            break offset + 4;
+        }
+        if received.len() >= 16_384 {
+            return Err(Error::new("fresh H1 response header exceeds 16 KiB")
+                .with_role_code(RoleErrorCode::ResponseHeadInvalid));
+        }
+        let mut bytes = [0_u8; 1_024];
+        let count = stream.read(&mut bytes).await.map_err(|error| {
+            Error::from(error).with_role_code(RoleErrorCode::ResponseHeadReadFailed)
+        })?;
+        if count == 0 {
+            return Err(
+                Error::new("peer EOF arrived before the complete H1 response header")
+                    .with_role_code(RoleErrorCode::ResponseHeadReadFailed),
+            );
+        }
+        received.extend_from_slice(&bytes[..count]);
+    };
+    let header_text = std::str::from_utf8(&received[..header_end]).map_err(|_| {
+        Error::new("fresh H1 response header is not UTF-8")
+            .with_role_code(RoleErrorCode::ResponseHeadInvalid)
+    })?;
+    let mut lines = header_text[..header_text.len() - 4].split("\r\n");
+    let status_line = lines.next().ok_or_else(|| {
+        Error::new("fresh H1 response status line missing")
+            .with_role_code(RoleErrorCode::ResponseHeadInvalid)
+    })?;
+    let status_ok = status_line.starts_with("HTTP/1.1 200 ") || status_line == "HTTP/1.1 200";
+    let exact_version = status_line.starts_with("HTTP/1.1 ");
+    let mut headers = http::HeaderMap::new();
+    for line in lines {
+        let (name, value) = line.split_once(':').ok_or_else(|| {
+            Error::new("malformed fresh H1 response header")
+                .with_role_code(RoleErrorCode::ResponseHeadInvalid)
+        })?;
+        let name = http::header::HeaderName::from_bytes(name.as_bytes()).map_err(|_| {
+            Error::new("invalid fresh H1 response header name")
+                .with_role_code(RoleErrorCode::ResponseHeadInvalid)
+        })?;
+        let value = HeaderValue::from_str(value.trim()).map_err(|_| {
+            Error::new("invalid fresh H1 response header value")
+                .with_role_code(RoleErrorCode::ResponseHeadInvalid)
+        })?;
+        headers.append(name, value);
+    }
+    let close = has_connection_token(&headers, "close");
+    let keep_alive =
+        has_connection_token(&headers, "keep-alive") || headers.contains_key("keep-alive");
+    if !close || keep_alive {
+        return Err(Error::new(
+            "fresh downstream H1 upload requires observed Connection: close and no keep-alive",
+        )
+        .with_role_code(RoleErrorCode::ConnectionCloseMissing));
+    }
+    let body = read_fresh_h1_response_body(&mut stream, &headers, &received[header_end..]).await?;
+    let mut eof_probe = [0_u8; 1];
+    let eof = tokio::time::timeout(eof_cap, stream.read(&mut eof_probe))
+        .await
+        .map_err(|_| {
+            Error::new("peer did not produce EOF within the bounded close wait")
+                .with_role_code(RoleErrorCode::PeerEofMissing)
+        })?
+        .map_err(|error| Error::from(error).with_role_code(RoleErrorCode::PeerEofMissing))?;
+    if eof != 0 {
+        return Err(
+            Error::new("fresh H1 response carried bytes after response EOS")
+                .with_role_code(RoleErrorCode::PeerEofMissing),
+        );
+    }
+    let expected = format!("{operation_text}:{}", CORPUS_BYTES);
+    let payload_ok = body == expected.as_bytes();
+    let headers_sanitized = !headers.contains_key("x-auth-mini-fixture-secret")
+        && !has_gateway_session_set_cookie(&headers)
+        && headers
+            .get("x-fixture-marker")
+            .is_some_and(|value| value == "present");
+    Ok(OperationOutcome {
+        operation_id: operation_text.to_owned(),
+        request_bytes: CORPUS_BYTES as u64,
+        response_bytes: body.len() as u64,
+        latency_ns: 0,
+        start_ns: 0,
+        completed_ns: 0,
+        status_ok: status_ok && exact_version,
+        eos_ok: true,
+        payload_ok,
+        sse_content_type_ok: true,
+        response_headers_sanitized: headers_sanitized,
+        connection: OperationConnection {
+            close_tokens: 1,
+            transport_eof: 1,
+            ..OperationConnection::default()
+        },
+    })
+}
+
+const FRESH_H1_RESPONSE_BODY_MAX: usize = 4_096;
+const FRESH_H1_RESPONSE_ENCODED_MAX: usize = 16_384;
+
+async fn read_fresh_h1_response_body(
+    stream: &mut TcpStream,
+    headers: &http::HeaderMap,
+    initial: &[u8],
+) -> Result<Vec<u8>> {
+    let content_lengths = headers.get_all(CONTENT_LENGTH).iter().collect::<Vec<_>>();
+    let transfer_encodings = headers
+        .get_all(TRANSFER_ENCODING)
+        .iter()
+        .collect::<Vec<_>>();
+    if !content_lengths.is_empty() && !transfer_encodings.is_empty() {
+        return Err(
+            Error::new("fresh H1 response has both Content-Length and Transfer-Encoding")
+                .with_role_code(RoleErrorCode::ResponseHeadInvalid),
+        );
+    }
+    if content_lengths.len() == 1 {
+        let content_length = content_lengths[0]
+            .to_str()
+            .map_err(|_| {
+                Error::new("fresh H1 response Content-Length is not ASCII")
+                    .with_role_code(RoleErrorCode::ResponseHeadInvalid)
+            })?
+            .parse::<usize>()
+            .context("parse fresh H1 response Content-Length")
+            .map_err(|error| error.with_role_code(RoleErrorCode::ResponseHeadInvalid))?;
+        if content_length > FRESH_H1_RESPONSE_BODY_MAX {
+            return Err(
+                Error::new("fresh H1 upload response body exceeds fixed bound")
+                    .with_role_code(RoleErrorCode::ResponseBodyInvalid),
+            );
+        }
+        let mut body = initial.to_vec();
+        if body.len() > content_length {
+            return Err(
+                Error::new("fresh H1 response has bytes after its declared body")
+                    .with_role_code(RoleErrorCode::ResponseBodyInvalid),
+            );
+        }
+        while body.len() < content_length {
+            let remaining = content_length - body.len();
+            read_bounded_response_bytes(stream, &mut body, remaining).await?;
+        }
+        return Ok(body);
+    }
+    if content_lengths.len() > 1 {
+        return Err(
+            Error::new("fresh H1 response has multiple Content-Length fields")
+                .with_role_code(RoleErrorCode::ResponseHeadInvalid),
+        );
+    }
+    if transfer_encodings.len() != 1
+        || transfer_encodings[0].to_str().ok().is_none_or(|value| {
+            let mut tokens = value.split(',').map(str::trim);
+            !tokens
+                .next()
+                .is_some_and(|token| token.eq_ignore_ascii_case("chunked"))
+                || tokens.next().is_some()
+        })
+    {
+        return Err(
+            Error::new("fresh H1 response lacks one supported body framing")
+                .with_role_code(RoleErrorCode::ResponseHeadInvalid),
+        );
+    }
+    decode_chunked_response_body(stream, initial).await
+}
+
+async fn decode_chunked_response_body(stream: &mut TcpStream, initial: &[u8]) -> Result<Vec<u8>> {
+    let mut encoded = initial.to_vec();
+    let mut cursor = 0_usize;
+    let mut decoded = Vec::new();
+    loop {
+        let line_end = loop {
+            if let Some(relative) = encoded[cursor..]
+                .windows(2)
+                .position(|bytes| bytes == b"\r\n")
+            {
+                break cursor + relative;
+            }
+            read_chunked_response_bytes(stream, &mut encoded).await?;
+        };
+        let line = std::str::from_utf8(&encoded[cursor..line_end]).map_err(|_| {
+            Error::new("fresh H1 chunk size is not ASCII")
+                .with_role_code(RoleErrorCode::ResponseBodyInvalid)
+        })?;
+        let size_text = line.split_once(';').map_or(line, |(size, _)| size).trim();
+        if size_text.is_empty() || size_text.len() > 16 {
+            return Err(Error::new("fresh H1 chunk size is malformed")
+                .with_role_code(RoleErrorCode::ResponseBodyInvalid));
+        }
+        let chunk_size = usize::from_str_radix(size_text, 16).map_err(|_| {
+            Error::new("fresh H1 chunk size is malformed")
+                .with_role_code(RoleErrorCode::ResponseBodyInvalid)
+        })?;
+        cursor = line_end
+            .checked_add(2)
+            .ok_or_else(|| Error::new("fresh H1 chunk cursor overflow"))?;
+        if chunk_size == 0 {
+            while encoded.len() < cursor + 2 {
+                read_chunked_response_bytes(stream, &mut encoded).await?;
+            }
+            if encoded.get(cursor..cursor + 2) != Some(b"\r\n") {
+                return Err(
+                    Error::new("fresh H1 chunked response trailers are forbidden")
+                        .with_role_code(RoleErrorCode::ResponseBodyInvalid),
+                );
+            }
+            cursor += 2;
+            if encoded.len() != cursor {
+                return Err(
+                    Error::new("fresh H1 chunked response has bytes after response EOS")
+                        .with_role_code(RoleErrorCode::ResponseBodyInvalid),
+                );
+            }
+            return Ok(decoded);
+        }
+        if decoded
+            .len()
+            .checked_add(chunk_size)
+            .is_none_or(|total| total > FRESH_H1_RESPONSE_BODY_MAX)
+        {
+            return Err(
+                Error::new("fresh H1 upload response body exceeds fixed bound")
+                    .with_role_code(RoleErrorCode::ResponseBodyInvalid),
+            );
+        }
+        let chunk_end = cursor
+            .checked_add(chunk_size)
+            .ok_or_else(|| Error::new("fresh H1 chunk length overflow"))?;
+        let framed_end = chunk_end
+            .checked_add(2)
+            .ok_or_else(|| Error::new("fresh H1 chunk framing overflow"))?;
+        while encoded.len() < framed_end {
+            read_chunked_response_bytes(stream, &mut encoded).await?;
+        }
+        if encoded.get(chunk_end..framed_end) != Some(b"\r\n") {
+            return Err(Error::new("fresh H1 chunk data lacks its terminal CRLF")
+                .with_role_code(RoleErrorCode::ResponseBodyInvalid));
+        }
+        decoded.extend_from_slice(&encoded[cursor..chunk_end]);
+        cursor = framed_end;
+    }
+}
+
+async fn read_chunked_response_bytes(stream: &mut TcpStream, encoded: &mut Vec<u8>) -> Result<()> {
+    if encoded.len() >= FRESH_H1_RESPONSE_ENCODED_MAX {
+        return Err(
+            Error::new("fresh H1 chunked response exceeds encoded bound")
+                .with_role_code(RoleErrorCode::ResponseBodyInvalid),
+        );
+    }
+    let mut bytes = [0_u8; 1_024];
+    let capacity = (FRESH_H1_RESPONSE_ENCODED_MAX - encoded.len()).min(bytes.len());
+    let count = stream.read(&mut bytes[..capacity]).await.map_err(|error| {
+        Error::from(error).with_role_code(RoleErrorCode::ResponseBodyReadFailed)
+    })?;
+    if count == 0 {
+        return Err(Error::new("peer EOF arrived before response EOS")
+            .with_role_code(RoleErrorCode::ResponseBodyReadFailed));
+    }
+    encoded.extend_from_slice(&bytes[..count]);
+    Ok(())
+}
+
+async fn read_bounded_response_bytes(
+    stream: &mut TcpStream,
+    body: &mut Vec<u8>,
+    remaining: usize,
+) -> Result<()> {
+    let mut bytes = [0_u8; 1_024];
+    let read_len = remaining.min(bytes.len());
+    let count = stream.read(&mut bytes[..read_len]).await.map_err(|error| {
+        Error::from(error).with_role_code(RoleErrorCode::ResponseBodyReadFailed)
+    })?;
+    if count == 0 {
+        return Err(Error::new("peer EOF arrived before response EOS")
+            .with_role_code(RoleErrorCode::ResponseBodyReadFailed));
+    }
+    body.extend_from_slice(&bytes[..count]);
+    Ok(())
+}
+
+async fn open_h1(endpoint: SocketAddr, connection_id: u64) -> Result<(HttpSender, JoinHandle<()>)> {
     if !endpoint.ip().is_loopback() {
         return Err(Error::new("H1 client target is not loopback"));
     }
@@ -1433,10 +2665,24 @@ async fn open_h1(endpoint: SocketAddr) -> Result<(http1::SendRequest<BenchBody>,
             Err(error) => eprintln!("load-role: H1 connection ended: {error}"),
         }
     });
-    Ok((sender, driver))
+    Ok((
+        HttpSender::H1 {
+            sender,
+            connection_id,
+        },
+        driver,
+    ))
 }
 
-async fn open_h2(endpoint: SocketAddr) -> Result<(http2::SendRequest<BenchBody>, JoinHandle<()>)> {
+async fn open_h2(
+    endpoint: SocketAddr,
+    connection_id: u64,
+    require_enable_connect: bool,
+) -> Result<(
+    http2::SendRequest<BenchBody>,
+    JoinHandle<()>,
+    H2FrameObserver,
+)> {
     if !endpoint.ip().is_loopback() {
         return Err(Error::new("H2 client target is not loopback"));
     }
@@ -1444,8 +2690,9 @@ async fn open_h2(endpoint: SocketAddr) -> Result<(http2::SendRequest<BenchBody>,
         .await
         .context("connect H2 endpoint")?;
     stream.set_nodelay(true)?;
+    let observer = H2FrameObserver::client(connection_id)?;
     let (sender, connection) = http2::Builder::new(TokioExecutor::new())
-        .handshake(TokioIo::new(stream))
+        .handshake(TokioIo::new(ObservedH2Io::client(stream, observer.clone())))
         .await
         .context("H2 prior-knowledge handshake")?;
     let driver = tokio::spawn(async move {
@@ -1454,7 +2701,10 @@ async fn open_h2(endpoint: SocketAddr) -> Result<(http2::SendRequest<BenchBody>,
             Err(error) => eprintln!("load-role: H2 connection ended: {error}"),
         }
     });
-    Ok((sender, driver))
+    observer
+        .wait_initial_exchange(require_enable_connect, Duration::from_secs(2))
+        .await?;
+    Ok((sender, driver, observer))
 }
 
 #[cfg(test)]
@@ -1472,6 +2722,32 @@ mod tests {
         let mut wrong = exact;
         wrong[0] = b'x';
         assert!(!validate_sse(&wrong, &corpus));
+    }
+
+    #[test]
+    fn sse_media_type_is_one_exact_header_without_parameters() {
+        let mut headers = http::HeaderMap::new();
+        headers.insert(
+            http::header::CONTENT_TYPE,
+            HeaderValue::from_static("text/event-stream"),
+        );
+        assert!(exact_sse_content_type(&headers));
+        headers.insert(
+            http::header::CONTENT_TYPE,
+            HeaderValue::from_static("text/event-stream; charset=utf-8"),
+        );
+        assert!(!exact_sse_content_type(&headers));
+        headers.remove(http::header::CONTENT_TYPE);
+        assert!(!exact_sse_content_type(&headers));
+        headers.append(
+            http::header::CONTENT_TYPE,
+            HeaderValue::from_static("text/event-stream"),
+        );
+        headers.append(
+            http::header::CONTENT_TYPE,
+            HeaderValue::from_static("text/event-stream"),
+        );
+        assert!(!exact_sse_content_type(&headers));
     }
 
     #[test]
@@ -1507,17 +2783,171 @@ mod tests {
         ledger.response_eos = 2;
         ledger.transport_eof = 2;
         ledger.max_active_connections = 1;
-        validate_connection_ledger(&mut ledger, 2, 1).expect("exact fresh ledger");
+        ledger.max_requests_per_connection = 1;
+        validate_connection_ledger(&ledger, 2, 1).expect("exact fresh ledger");
         assert_eq!(ledger.max_requests_per_connection, 1);
 
         let mut missing_eof = ledger.clone();
         missing_eof.transport_eof = 1;
-        assert!(validate_connection_ledger(&mut missing_eof, 2, 1).is_err());
+        assert!(validate_connection_ledger(&missing_eof, 2, 1).is_err());
         let mut hidden_retry = ledger.clone();
         hidden_retry.retry_attempts = 1;
-        assert!(validate_connection_ledger(&mut hidden_retry, 2, 1).is_err());
+        assert!(validate_connection_ledger(&hidden_retry, 2, 1).is_err());
         let mut reused = ledger;
         reused.cumulative_connections = 1;
-        assert!(validate_connection_ledger(&mut reused, 2, 1).is_err());
+        assert!(validate_connection_ledger(&reused, 2, 1).is_err());
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn fresh_h1_upload_accepts_gateway_chunked_response_through_peer_eof() {
+        assert_eq!(
+            crate::control::role_error_detail_sha256(
+                Role::Load,
+                RoleErrorClass::Command,
+                "fresh H1 response lacks exact Content-Length",
+            ),
+            "ce137486024aac087e3a522cdb31433c73e92ec473be89ce092e3bafcf572ce5"
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind chunked fixture");
+        let address = listener.local_addr().expect("chunked fixture address");
+        let operation = operation_id_text(operation_id(1, 0, 0));
+        let expected_body = format!("{operation}:{}", CORPUS_BYTES);
+        let server_body = expected_body.clone();
+        let server = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.expect("accept upload");
+            let mut received = Vec::new();
+            let mut body_start = None;
+            while body_start.is_none()
+                || received.len() - body_start.unwrap_or(received.len()) < CORPUS_BYTES
+            {
+                let mut bytes = [0_u8; 16_384];
+                let count = stream.read(&mut bytes).await.expect("read upload");
+                assert_ne!(count, 0, "upload reached request EOS");
+                received.extend_from_slice(&bytes[..count]);
+                if body_start.is_none() {
+                    body_start = received
+                        .windows(4)
+                        .position(|window| window == b"\r\n\r\n")
+                        .map(|offset| offset + 4);
+                }
+            }
+            let split = server_body.len() / 2;
+            let first = &server_body.as_bytes()[..split];
+            let second = &server_body.as_bytes()[split..];
+            let head = "HTTP/1.1 200 OK\r\nConnection: close\r\nTransfer-Encoding: chunked\r\nx-fixture-marker: present\r\n\r\n";
+            stream.write_all(head.as_bytes()).await.expect("write head");
+            stream
+                .write_all(format!("{:x}\r\n", first.len()).as_bytes())
+                .await
+                .expect("write first size");
+            stream.write_all(first).await.expect("write first chunk");
+            stream.write_all(b"\r\n").await.expect("end first chunk");
+            stream
+                .write_all(format!("{:x}\r\n", second.len()).as_bytes())
+                .await
+                .expect("write second size");
+            stream.write_all(second).await.expect("write second chunk");
+            stream
+                .write_all(b"\r\n0\r\n\r\n")
+                .await
+                .expect("write response EOS");
+            stream.flush().await.expect("flush response");
+        });
+        let stream = TcpStream::connect(address).await.expect("connect fixture");
+        let request = Request::builder()
+            .method(Method::POST)
+            .version(Version::HTTP_11)
+            .uri("/bench/upload")
+            .header(HOST, "public.example")
+            .header(CONTENT_LENGTH, "1048576")
+            .body(BenchBody::empty())
+            .expect("build chunked regression request");
+        let outcome = raw_h1_upload_exchange_with_eof_cap(
+            stream,
+            request,
+            &operation,
+            &Corpus::fixed(),
+            Duration::from_secs(1),
+        )
+        .await
+        .expect("chunked response and peer EOF accepted");
+        server.await.expect("chunked fixture task");
+        assert!(outcome.status_ok);
+        assert!(outcome.eos_ok);
+        assert!(outcome.payload_ok);
+        assert!(outcome.response_headers_sanitized);
+        assert_eq!(outcome.response_bytes, expected_body.len() as u64);
+        assert_eq!(outcome.connection.close_tokens, 1);
+        assert_eq!(outcome.connection.transport_eof, 1);
+    }
+
+    async fn eof_negative(delay: Duration) -> Result<()> {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
+        let address = listener.local_addr()?;
+        let operation = operation_id_text(operation_id(2, 0, 0));
+        let response_body = format!("{operation}:{}", CORPUS_BYTES);
+        let server = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            let mut received = Vec::new();
+            let mut body_start = None;
+            while body_start.is_none()
+                || received.len() - body_start.unwrap_or(received.len()) < CORPUS_BYTES
+            {
+                let mut bytes = [0_u8; 16_384];
+                let count = stream.read(&mut bytes).await.unwrap();
+                if count == 0 {
+                    return;
+                }
+                received.extend_from_slice(&bytes[..count]);
+                if body_start.is_none() {
+                    body_start = received
+                        .windows(4)
+                        .position(|window| window == b"\r\n\r\n")
+                        .map(|offset| offset + 4);
+                }
+            }
+            let head = format!(
+                "HTTP/1.1 200 OK\r\nConnection: close\r\nContent-Length: {}\r\nx-fixture-marker: present\r\n\r\n",
+                response_body.len()
+            );
+            stream.write_all(head.as_bytes()).await.unwrap();
+            stream.write_all(response_body.as_bytes()).await.unwrap();
+            stream.flush().await.unwrap();
+            tokio::time::sleep(delay).await;
+        });
+        let stream = TcpStream::connect(address).await?;
+        let request = Request::builder()
+            .method(Method::POST)
+            .version(Version::HTTP_11)
+            .uri("/bench/upload")
+            .header(HOST, "public.example")
+            .header(CONTENT_LENGTH, "1048576")
+            .body(BenchBody::empty())
+            .map_err(|error| Error::new(format!("build EOF test request: {error}")))?;
+        let result = raw_h1_upload_exchange_with_eof_cap(
+            stream,
+            request,
+            &operation,
+            &Corpus::fixed(),
+            Duration::from_millis(1),
+        )
+        .await;
+        server.abort();
+        if result.is_ok() {
+            return Err(Error::new("delayed/no peer EOF was accepted"));
+        }
+        Ok(())
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn fresh_h1_rejects_delayed_and_absent_peer_eof_without_local_shutdown() {
+        eof_negative(Duration::from_millis(25))
+            .await
+            .expect("delayed EOF rejected");
+        eof_negative(Duration::from_secs(60))
+            .await
+            .expect("absent EOF rejected");
     }
 }

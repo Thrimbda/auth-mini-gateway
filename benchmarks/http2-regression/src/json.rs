@@ -3,9 +3,25 @@ use serde::de::{DeserializeOwned, MapAccess, SeqAccess, Visitor};
 use serde::{Deserializer, Serialize};
 use serde_json::{Map, Number, Value};
 use std::fmt::Formatter;
-use std::fs::{self, OpenOptions};
+use std::fs::{self, File, OpenOptions};
 use std::io::Write;
 use std::path::Path;
+use std::sync::atomic::{AtomicU64, Ordering};
+
+static NEXT_TEMP: AtomicU64 = AtomicU64::new(0);
+
+struct TempFileGuard {
+    path: std::path::PathBuf,
+    armed: bool,
+}
+
+impl Drop for TempFileGuard {
+    fn drop(&mut self) {
+        if self.armed {
+            let _ = fs::remove_file(&self.path);
+        }
+    }
+}
 
 struct StrictValueVisitor;
 
@@ -168,14 +184,49 @@ where
 
 pub fn write_new_canonical<T: Serialize>(path: &Path, value: &T) -> Result<Vec<u8>> {
     let bytes = canonical_bytes(value)?;
+    write_new_bytes(path, &bytes)?;
+    Ok(bytes)
+}
+
+pub fn write_new_bytes(path: &Path, bytes: &[u8]) -> Result<()> {
+    let parent = path
+        .parent()
+        .ok_or_else(|| Error::new("output path has no parent"))?;
+    let parent_metadata = fs::symlink_metadata(parent)?;
+    if !parent_metadata.file_type().is_dir() {
+        return Err(Error::new("output parent is not a directory"));
+    }
+    let name = path
+        .file_name()
+        .and_then(|value| value.to_str())
+        .ok_or_else(|| Error::new("output file name is not UTF-8"))?;
+    let temp = parent.join(format!(
+        ".{name}.tmp.{}.{}",
+        std::process::id(),
+        NEXT_TEMP.fetch_add(1, Ordering::Relaxed)
+    ));
     let mut file = OpenOptions::new()
         .create_new(true)
         .write(true)
-        .open(path)
-        .map_err(|error| Error::new(format!("cannot create {}: {error}", path.display())))?;
-    file.write_all(&bytes)?;
+        .open(&temp)
+        .map_err(|error| Error::new(format!("cannot create {}: {error}", temp.display())))?;
+    let mut guard = TempFileGuard {
+        path: temp.clone(),
+        armed: true,
+    };
+    file.write_all(bytes)?;
     file.sync_all()?;
-    Ok(bytes)
+    drop(file);
+    if let Err(error) = fs::hard_link(&temp, path) {
+        return Err(Error::new(format!(
+            "cannot atomically install {} without replacement: {error}",
+            path.display()
+        )));
+    }
+    fs::remove_file(&temp)?;
+    guard.armed = false;
+    File::open(parent)?.sync_all()?;
+    Ok(())
 }
 
 #[cfg(test)]
@@ -205,5 +256,30 @@ mod tests {
             Fixture { a: 1, z: 2 }
         );
         assert!(require_canonical::<Fixture>(b"{\"z\":2,\"a\":1}\n").is_err());
+    }
+
+    #[test]
+    fn atomic_no_replace_write_preserves_destination_and_cleans_failed_temp() {
+        let directory = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("target")
+            .join(format!("atomic-write-test-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&directory);
+        fs::create_dir_all(&directory).expect("atomic test directory");
+        let destination = directory.join("result.json");
+        fs::write(&destination, b"original").expect("existing destination");
+        assert!(write_new_bytes(&destination, b"replacement").is_err());
+        assert_eq!(fs::read(&destination).expect("destination"), b"original");
+        assert!(fs::read_dir(&directory)
+            .expect("directory")
+            .all(|entry| !entry
+                .expect("entry")
+                .file_name()
+                .to_string_lossy()
+                .contains(".tmp.")));
+
+        let fresh = directory.join("fresh.json");
+        write_new_bytes(&fresh, b"complete").expect("atomic fresh write");
+        assert_eq!(fs::read(fresh).expect("fresh bytes"), b"complete");
+        fs::remove_dir_all(directory).expect("clean atomic fixture");
     }
 }

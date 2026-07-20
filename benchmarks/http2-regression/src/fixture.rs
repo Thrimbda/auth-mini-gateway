@@ -1,8 +1,8 @@
 //! Dual cleartext H1/H2-prior-knowledge fixture and auth-mini tripwire role.
 
 use crate::control::{
-    connect_loopback, ControlBody, ControlContext, EndpointObservation, FixtureResult, LoadTarget,
-    Role,
+    ControlBody, ControlContext, EndpointObservation, FixtureResult, FramedControl, LoadTarget,
+    Role, RoleErrorCode, RoleErrorStage,
 };
 use crate::linux::process_identity;
 use crate::schema::Workload;
@@ -11,6 +11,7 @@ use crate::topology::{
     parse_masked_ping, parse_operation_id, unmasked_pong, websocket_accept, Corpus, Protocol,
     CORPUS_BYTES,
 };
+use crate::wire::{H2FrameObserver, ObservedH2Io};
 use crate::{Error, Result, ResultContext};
 use bytes::Bytes;
 use http::header::{
@@ -27,7 +28,6 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::convert::Infallible;
-use std::net::SocketAddr;
 use std::pin::Pin;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, RwLock};
@@ -57,6 +57,7 @@ struct FixtureState {
     operation_ids: Mutex<BTreeSet<String>>,
     requests_per_connection: Mutex<BTreeMap<u64, u64>>,
     observations: Mutex<Vec<EndpointObservation>>,
+    h2_wire: Mutex<BTreeMap<u64, H2FrameObserver>>,
 }
 
 impl FixtureState {
@@ -75,6 +76,7 @@ impl FixtureState {
             operation_ids: Mutex::new(BTreeSet::new()),
             requests_per_connection: Mutex::new(BTreeMap::new()),
             observations: Mutex::new(Vec::new()),
+            h2_wire: Mutex::new(BTreeMap::new()),
         }
     }
 }
@@ -128,14 +130,11 @@ impl Body for BenchBody {
     }
 }
 
-pub async fn run_fixture_role(context: ControlContext, control_address: SocketAddr) -> Result<()> {
-    let mut control = connect_loopback(control_address, context).await?;
+pub async fn run_fixture_role(_context: ControlContext, control: &mut FramedControl) -> Result<()> {
     control
-        .send(ControlBody::Hello {
-            role: Role::Fixture,
-            identity: process_identity(std::process::id())?,
-        })
+        .authenticate_inherited_role(Role::Fixture, process_identity(std::process::id())?)
         .await?;
+    control.mark_failure_stage(RoleErrorStage::Startup);
     let data_listener = TcpListener::bind("127.0.0.1:0")
         .await
         .context("bind fixture data listener")?;
@@ -158,6 +157,7 @@ pub async fn run_fixture_role(context: ControlContext, control_address: SocketAd
         })
         .await?;
     loop {
+        control.mark_failure_stage(RoleErrorStage::Prepare);
         match control.receive().await? {
             ControlBody::ConfigureFixture {
                 target,
@@ -165,6 +165,7 @@ pub async fn run_fixture_role(context: ControlContext, control_address: SocketAd
                 expected_protocol,
                 corpus_sha256,
             } => {
+                control.mark_failure_stage(RoleErrorStage::Prepare);
                 let expected = state.corpus.sha256();
                 if corpus_sha256 != expected {
                     return Err(Error::new("fixture corpus hash mismatch"));
@@ -187,6 +188,7 @@ pub async fn run_fixture_role(context: ControlContext, control_address: SocketAd
                 control.send(ControlBody::FixtureConfigured).await?;
             }
             ControlBody::FixtureSnapshot => {
+                control.mark_failure_stage(RoleErrorStage::Drain);
                 control
                     .send(ControlBody::FixtureObserved {
                         result: snapshot(&state)?,
@@ -194,6 +196,7 @@ pub async fn run_fixture_role(context: ControlContext, control_address: SocketAd
                     .await?;
             }
             ControlBody::Stop => {
+                control.mark_failure_stage(RoleErrorStage::Exit);
                 data_task.abort();
                 tripwire_task.abort();
                 control
@@ -206,7 +209,8 @@ pub async fn run_fixture_role(context: ControlContext, control_address: SocketAd
             other => {
                 return Err(Error::new(format!(
                     "fixture received unexpected control message: {other:?}"
-                )))
+                ))
+                .with_role_diagnostic(control.failure_stage(), RoleErrorCode::ControlProtocol))
             }
         }
     }
@@ -274,12 +278,23 @@ async fn serve_auto(stream: TcpStream, connection_id: u64, state: Arc<FixtureSta
             config.expected_protocol, actual
         )));
     }
-    let next_stream = Arc::new(AtomicU64::new(1));
+    let observer = if h2 {
+        let observer = H2FrameObserver::server(connection_id)?;
+        state
+            .h2_wire
+            .lock()
+            .map_err(|_| Error::new("fixture H2 observer map poisoned"))?
+            .insert(connection_id, observer.clone());
+        Some(observer)
+    } else {
+        None
+    };
+    let service_observer = observer.clone();
     let service = service_fn(move |request| {
         fixture_response(
             request,
             connection_id,
-            Arc::clone(&next_stream),
+            service_observer.clone(),
             Arc::clone(&state),
         )
     });
@@ -290,8 +305,12 @@ async fn serve_auto(stream: TcpStream, connection_id: u64, state: Arc<FixtureSta
             .max_header_list_size(16_384)
             .enable_connect_protocol()
             .auto_date_header(false);
+        let observer = observer.ok_or_else(|| Error::new("fixture H2 observer missing"))?;
         builder
-            .serve_connection(TokioIo::new(stream), service)
+            .serve_connection(
+                TokioIo::new(ObservedH2Io::server(stream, observer)),
+                service,
+            )
             .await
             .context("serve fixture H2 connection")?;
     } else {
@@ -309,10 +328,10 @@ async fn serve_auto(stream: TcpStream, connection_id: u64, state: Arc<FixtureSta
 async fn fixture_response(
     mut request: Request<Incoming>,
     connection_id: u64,
-    next_stream: Arc<AtomicU64>,
+    observer: Option<H2FrameObserver>,
     state: Arc<FixtureState>,
 ) -> std::result::Result<Response<BenchBody>, Infallible> {
-    let response = fixture_response_inner(&mut request, connection_id, next_stream, state)
+    let response = fixture_response_inner(&mut request, connection_id, observer, state)
         .await
         .unwrap_or_else(error_response);
     Ok(response)
@@ -321,7 +340,7 @@ async fn fixture_response(
 async fn fixture_response_inner(
     request: &mut Request<Incoming>,
     connection_id: u64,
-    next_stream: Arc<AtomicU64>,
+    observer: Option<H2FrameObserver>,
     state: Arc<FixtureState>,
 ) -> Result<Response<BenchBody>> {
     let protocol = match request.version() {
@@ -333,7 +352,20 @@ async fn fixture_response_inner(
             )))
         }
     };
-    let stream_id = (protocol == Protocol::H2).then(|| next_stream.fetch_add(2, Ordering::SeqCst));
+    let wire_stream_id = if protocol == Protocol::H2 {
+        Some(
+            observer
+                .as_ref()
+                .ok_or_else(|| Error::new("H2 request has no frame observer"))?
+                .claim_stream_now()?,
+        )
+    } else {
+        if observer.is_some() {
+            return Err(Error::new("H1 request unexpectedly has an H2 observer"));
+        }
+        None
+    };
+    let stream_id = wire_stream_id.map(u64::from);
     let operation_id = request
         .headers()
         .get("x-amg-bench-op")
@@ -381,6 +413,9 @@ async fn fixture_response_inner(
         ));
     }
     if config.workload == Workload::WebSocket {
+        if let (Some(observer), Some(stream_id)) = (observer.as_ref(), wire_stream_id) {
+            observer.mark_observed_stream_as_extended_connect(stream_id)?;
+        }
         return websocket_response(
             request,
             protocol,
@@ -718,6 +753,14 @@ fn snapshot(state: &FixtureState) -> Result<FixtureResult> {
         .copied()
         .max()
         .unwrap_or(0);
+    let mut h2_wire = state
+        .h2_wire
+        .lock()
+        .map_err(|_| Error::new("fixture H2 observer map poisoned"))?
+        .values()
+        .map(H2FrameObserver::snapshot)
+        .collect::<Result<Vec<_>>>()?;
+    h2_wire.sort_by_key(|evidence| evidence.connection_id);
     Ok(FixtureResult {
         target: config.target,
         expected_protocol: config.expected_protocol,
@@ -731,6 +774,7 @@ fn snapshot(state: &FixtureState) -> Result<FixtureResult> {
         unknown_requests: state.unknown_requests.load(Ordering::SeqCst),
         observations,
         operation_hash_sha256: format!("{:x}", hasher.finalize()),
+        h2_wire,
     })
 }
 

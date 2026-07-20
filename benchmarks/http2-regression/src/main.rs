@@ -1,16 +1,12 @@
 use auth_mini_http2_regression::bundle::{
-    create_bundle, ensure_cli_scratch, ensure_repository_local, repository_root, verify_bundle,
-    verify_source,
+    create_bundle_derived, ensure_cli_scratch, ensure_repository_local, repository_root,
+    verify_bundle, verify_source,
 };
-use auth_mini_http2_regression::json;
-use auth_mini_http2_regression::schema::{
-    AuthoritativeManifest, Cell, TerminalState, INITIAL_CANDIDATE_COMMIT, JSON_MAX_BYTES,
-};
-use auth_mini_http2_regression::statistics;
+use auth_mini_http2_regression::schema::{Cell, TerminalState, INITIAL_CANDIDATE_COMMIT};
+use auth_mini_http2_regression::{evidence, json};
 use auth_mini_http2_regression::{Error, Result};
 use serde::Serialize;
 use std::collections::BTreeMap;
-use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
 
 fn main() {
@@ -92,6 +88,44 @@ fn run() -> Result<()> {
                 auth_mini_http2_regression::orchestrator::direct_upload_probe(&repository),
             )?)?;
         }
+        "diagnose-b11-c1-upload" => {
+            require_only(&options, &["candidate"])?;
+            let candidate = options
+                .get("candidate")
+                .map(String::as_str)
+                .unwrap_or(INITIAL_CANDIDATE_COMMIT);
+            let host = auth_mini_http2_regression::orchestrator::run_preflight(&repository)?;
+            auth_mini_http2_regression::linux::set_affinity(
+                std::process::id(),
+                auth_mini_http2_regression::linux::CONTROL_CPUS,
+            )?;
+            let runtime = tokio::runtime::Builder::new_multi_thread()
+                .worker_threads(2)
+                .enable_all()
+                .build()
+                .map_err(|error| Error::new(format!("create diagnostic runtime: {error}")))?;
+            let summary = runtime.block_on(
+                auth_mini_http2_regression::orchestrator::diagnose_b11_c1_upload(
+                    &repository,
+                    candidate,
+                    host,
+                ),
+            )?;
+            let succeeded = summary.case_succeeded;
+            let stage = summary.stage;
+            let code = summary.code;
+            let detail_sha256 = summary.detail_sha256.clone();
+            let evidence_root = summary.evidence_root.clone();
+            print_json(&summary)?;
+            if !succeeded {
+                return Err(Error::new(format!(
+                    "B11 C1 upload diagnostic retained failure stage={} code={} detail-sha256={} evidence={evidence_root}",
+                    stage.map_or("unknown", |value| value.label()),
+                    code.map_or("unknown", |value| value.label()),
+                    detail_sha256.as_deref().unwrap_or("unknown"),
+                )));
+            }
+        }
         "scout" => {
             require_only(&options, &["dry-run", "seed"])?;
             require_true(&options, "dry-run")?;
@@ -119,26 +153,20 @@ fn run() -> Result<()> {
         "role" => {
             require_only(
                 &options,
-                &[
-                    "kind",
-                    "control",
-                    "run",
-                    "workload",
-                    "concurrency",
-                    "arm",
-                    "block",
-                ],
+                &["kind", "run", "workload", "concurrency", "arm", "block"],
             )?;
             run_role(&options)?;
         }
         "analyze" => {
-            let input = local_required(&options, "input", &repository)?;
+            let source = local_required(&options, "source", &repository)?;
             let output = local_required(&options, "output", &repository)?;
-            require_only(&options, &["input", "output"])?;
-            let manifest: AuthoritativeManifest = json::read_strict(&input, JSON_MAX_BYTES)?;
-            let result = statistics::analyze_manifest(&manifest)?;
+            require_only(&options, &["source", "output"])?;
+            let verified = evidence::verify_raw_closure(&source)?;
+            let terminal = verified.terminal_state;
+            let result = verified.derived_analysis()?;
             json::write_new_canonical(&output, &result)?;
             println!("{}", output.display());
+            require_pass_terminal(terminal)?;
         }
         "verify" => {
             let source = local_required(&options, "source", &repository)?;
@@ -148,15 +176,19 @@ fn run() -> Result<()> {
                 seal_root_sha256: verification.seal.root_sha256,
                 seal_entries: verification.seal.entries.len() as u64,
                 raw_arms: verification.raw_arm_count,
+                terminal_state: verification.terminal_state,
+                reasons: verification.reasons,
             })?;
+            require_pass_terminal(verification.terminal_state)?;
         }
         "bundle" => {
             let source = local_required(&options, "source", &repository)?;
             let output = local_required(&options, "output", &repository)?;
-            let terminal = parse_terminal(required(&options, "terminal")?)?;
-            require_only(&options, &["source", "output", "terminal"])?;
-            let index = create_bundle(&source, &output, terminal)?;
+            require_only(&options, &["source", "output"])?;
+            let index = create_bundle_derived(&source, &output)?;
+            let terminal = index.terminal_state;
             print_json(&index)?;
+            require_pass_terminal(terminal)?;
         }
         "verify-bundle" => {
             let index = local_required(&options, "index", &repository)?;
@@ -171,6 +203,7 @@ fn run() -> Result<()> {
             } else {
                 print_json(&receipt)?;
             }
+            require_pass_terminal(receipt.terminal_state)?;
         }
         _ => return Err(Error::new(usage())),
     }
@@ -254,6 +287,9 @@ fn run_role(options: &BTreeMap<String, String>) -> Result<()> {
     let concurrency = required(options, "concurrency")?
         .parse::<u16>()
         .map_err(|_| Error::new("--concurrency must be a u16"))?;
+    let self_identity = auth_mini_http2_regression::linux::process_identity(std::process::id())?;
+    let orchestrator =
+        auth_mini_http2_regression::linux::process_identity(self_identity.parent_pid)?;
     let context = auth_mini_http2_regression::control::ControlContext {
         run_id: required(options, "run")?.to_owned(),
         cell: Cell {
@@ -264,48 +300,109 @@ fn run_role(options: &BTreeMap<String, String>) -> Result<()> {
         block: required(options, "block")?
             .parse::<u64>()
             .map_err(|_| Error::new("--block must be a u64"))?,
+        orchestrator,
     };
-    let address = required(options, "control")?
-        .parse::<SocketAddr>()
-        .map_err(|_| Error::new("--control must be a socket address"))?;
-    if !address.ip().is_loopback() {
-        return Err(Error::new("role control address is not loopback"));
-    }
     let kind = required(options, "kind")?;
+    let role = match kind {
+        "fixture" => auth_mini_http2_regression::control::Role::Fixture,
+        "load" => auth_mini_http2_regression::control::Role::Load,
+        "sampler" => auth_mini_http2_regression::control::Role::Sampler,
+        _ => return Err(Error::new("role kind must be fixture, load, or sampler")),
+    };
     let runtime = tokio::runtime::Builder::new_multi_thread()
         .worker_threads(match kind {
             "fixture" => 4,
             "load" => 4,
             "sampler" => 2,
-            _ => return Err(Error::new("role kind must be fixture, load, or sampler")),
+            _ => unreachable!("role kind checked above"),
         })
         .enable_all()
         .build()
         .map_err(|error| Error::new(format!("create role runtime: {error}")))?;
-    let result = match kind {
-        "fixture" => runtime.block_on(auth_mini_http2_regression::fixture::run_fixture_role(
-            context, address,
-        )),
-        "load" => runtime.block_on(auth_mini_http2_regression::load::run_load_role(
-            context, address,
-        )),
-        "sampler" => runtime.block_on(auth_mini_http2_regression::sampler::run_sampler_role(
-            context, address,
-        )),
-        _ => unreachable!("role kind checked above"),
-    };
-    result.map_err(|error| error.context(format!("{kind} role")))
+    let mut control = runtime.block_on(async {
+        auth_mini_http2_regression::control::inherited_stdin(context.clone())
+    })?;
+    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        runtime.block_on(async {
+            match kind {
+                "fixture" => {
+                    auth_mini_http2_regression::fixture::run_fixture_role(
+                        context.clone(),
+                        &mut control,
+                    )
+                    .await
+                }
+                "load" => {
+                    auth_mini_http2_regression::load::run_load_role(context.clone(), &mut control)
+                        .await
+                }
+                "sampler" => {
+                    auth_mini_http2_regression::sampler::run_sampler_role(
+                        context.clone(),
+                        &mut control,
+                    )
+                    .await
+                }
+                _ => unreachable!("role kind checked above"),
+            }
+        })
+    }));
+    match result {
+        Ok(Ok(())) => Ok(()),
+        Ok(Err(error)) => {
+            let class = control.failure_class();
+            let diagnostic = error.role_diagnostic();
+            let stage = diagnostic.map_or(control.failure_stage(), |value| value.stage);
+            let code = diagnostic.map_or_else(
+                || {
+                    error
+                        .role_code()
+                        .unwrap_or(auth_mini_http2_regression::control::RoleErrorCode::Internal)
+                },
+                |value| value.code,
+            );
+            let detail = error.to_string();
+            let detail_sha256 =
+                auth_mini_http2_regression::control::role_error_detail_sha256(role, class, &detail);
+            if control.can_send_terminal_error() {
+                let _ = runtime
+                    .block_on(control.send_terminal_error(class, stage, code, &detail, None));
+            }
+            Err(Error::new(format!(
+                "{kind} role terminated class={} stage={} code={} detail-sha256={detail_sha256}",
+                class.label(),
+                stage.label(),
+                code.label(),
+            )))
+        }
+        Err(_) => {
+            let class = auth_mini_http2_regression::control::RoleErrorClass::Panic;
+            let stage = control.failure_stage();
+            let code = auth_mini_http2_regression::control::RoleErrorCode::Panic;
+            let detail = "bounded-role-panic";
+            let detail_sha256 =
+                auth_mini_http2_regression::control::role_error_detail_sha256(role, class, detail);
+            if control.can_send_terminal_error() {
+                let _ =
+                    runtime.block_on(control.send_terminal_error(class, stage, code, detail, None));
+            }
+            Err(Error::new(format!(
+                "{kind} role terminated class={} stage={} code={} detail-sha256={detail_sha256}",
+                class.label(),
+                stage.label(),
+                code.label(),
+            )))
+        }
+    }
 }
 
-fn parse_terminal(value: &str) -> Result<TerminalState> {
-    match value {
-        "PASS" => Ok(TerminalState::Pass),
-        "FAIL" => Ok(TerminalState::Fail),
-        "BLOCKED" => Ok(TerminalState::Blocked),
-        "SUPERSEDED" => Ok(TerminalState::Superseded),
-        _ => Err(Error::new(
-            "--terminal must be PASS, FAIL, BLOCKED, or SUPERSEDED",
-        )),
+fn require_pass_terminal(terminal: TerminalState) -> Result<()> {
+    if terminal == TerminalState::Pass {
+        Ok(())
+    } else {
+        Err(Error::new(format!(
+            "derived terminal state is {terminal:?}; non-PASS commands exit nonzero"
+        )))
     }
 }
 
@@ -321,6 +418,8 @@ struct VerifySummary {
     seal_root_sha256: String,
     seal_entries: u64,
     raw_arms: u64,
+    terminal_state: TerminalState,
+    reasons: Vec<String>,
 }
 
 #[derive(Serialize)]
@@ -330,5 +429,5 @@ struct SmokeOutput {
 }
 
 fn usage() -> &'static str {
-    "usage: auth-mini-http2-regression <self-test|preflight|build|smoke|direct-upload-probe|scout|calibrate|campaign|analyze|verify|bundle|verify-bundle> [--name value ...]"
+    "usage: auth-mini-http2-regression <self-test|preflight|build|smoke|diagnose-b11-c1-upload|direct-upload-probe|scout|calibrate|campaign|analyze|verify|bundle|verify-bundle> [--name value ...]"
 }

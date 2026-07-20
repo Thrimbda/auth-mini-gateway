@@ -1,6 +1,10 @@
 use crate::rng::{fisher_yates, SplitMix64};
-use crate::schema::{all_cells, comparison_id, Arm, Cell, ComparisonKind, RoundPlan};
+use crate::schema::{
+    all_cells, comparison_id, validate_identifier, validate_non_placeholder_sha256, Arm, Cell,
+    ComparisonKind, RoundPlan,
+};
 use crate::{Error, Result};
+use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 
 const BASE_ROWS: [[usize; 5]; 5] = [
@@ -93,6 +97,7 @@ pub fn generate_rounds(seed: u64, n: u32) -> Result<Vec<RoundPlan>> {
         rounds.push(RoundPlan {
             round: u32::try_from(round).map_err(|_| Error::new("round index overflow"))?,
             row,
+            arm_order: williams_rows()[usize::from(row)].to_vec(),
             cells,
         });
     }
@@ -120,7 +125,8 @@ pub fn validate_rounds(rounds: &[RoundPlan], n: u32) -> Result<()> {
     Ok(())
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct PairIdentity {
     pub comparison_id: String,
     pub round: u32,
@@ -129,7 +135,37 @@ pub struct PairIdentity {
     pub reference: Arm,
     pub treatment_observation_id: String,
     pub reference_observation_id: String,
+    pub treatment_raw_sha256: String,
+    pub reference_raw_sha256: String,
+    pub treatment_position: u8,
+    pub reference_position: u8,
     pub treatment_before_reference: bool,
+}
+
+impl PairIdentity {
+    pub fn validate(&self) -> Result<()> {
+        self.cell.validate()?;
+        validate_identifier("pair comparison_id", &self.comparison_id)?;
+        validate_identifier(
+            "pair treatment_observation_id",
+            &self.treatment_observation_id,
+        )?;
+        validate_identifier(
+            "pair reference_observation_id",
+            &self.reference_observation_id,
+        )?;
+        validate_non_placeholder_sha256("pair treatment_raw_sha256", &self.treatment_raw_sha256)?;
+        validate_non_placeholder_sha256("pair reference_raw_sha256", &self.reference_raw_sha256)?;
+        if self.treatment_position >= 5
+            || self.reference_position >= 5
+            || self.treatment_position == self.reference_position
+            || self.treatment_before_reference
+                != (self.treatment_position < self.reference_position)
+        {
+            return Err(Error::new("pair position identity is invalid"));
+        }
+        Ok(())
+    }
 }
 
 pub fn pair_identity(
@@ -137,6 +173,7 @@ pub fn pair_identity(
     cell: Cell,
     kind: ComparisonKind,
     observation_ids: &BTreeMap<Arm, String>,
+    raw_hashes: &BTreeMap<Arm, String>,
     row: u8,
 ) -> Result<PairIdentity> {
     let (treatment, reference) = match kind {
@@ -157,7 +194,7 @@ pub fn pair_identity(
         .iter()
         .position(|arm| *arm == reference)
         .ok_or_else(|| Error::new("reference absent from Williams row"))?;
-    Ok(PairIdentity {
+    let identity = PairIdentity {
         comparison_id: comparison_id(cell, kind),
         round,
         cell,
@@ -171,8 +208,22 @@ pub fn pair_identity(
             .get(&reference)
             .cloned()
             .ok_or_else(|| Error::new("missing reference observation identity"))?,
+        treatment_raw_sha256: raw_hashes
+            .get(&treatment)
+            .cloned()
+            .ok_or_else(|| Error::new("missing treatment raw identity"))?,
+        reference_raw_sha256: raw_hashes
+            .get(&reference)
+            .cloned()
+            .ok_or_else(|| Error::new("missing reference raw identity"))?,
+        treatment_position: u8::try_from(treatment_position)
+            .map_err(|_| Error::new("treatment position exceeds u8"))?,
+        reference_position: u8::try_from(reference_position)
+            .map_err(|_| Error::new("reference position exceeds u8"))?,
         treatment_before_reference: treatment_position < reference_position,
-    })
+    };
+    identity.validate()?;
+    Ok(identity)
 }
 
 pub fn self_test() -> Result<()> {
@@ -226,6 +277,10 @@ mod tests {
             .into_iter()
             .map(|arm| (arm, format!("obs-{}", arm.code())))
             .collect();
+        let hashes: BTreeMap<_, _> = Arm::ALL
+            .into_iter()
+            .map(|arm| (arm, format!("{:064x}", arm.index() + 1)))
+            .collect();
         let cell = all_cells()[4];
         let pairs: Vec<_> = [
             ComparisonKind::H2ToH1,
@@ -233,14 +288,24 @@ mod tests {
             ComparisonKind::H2ToH2,
         ]
         .into_iter()
-        .map(|kind| pair_identity(3, cell, kind, &ids, 7).expect("pair"))
+        .map(|kind| pair_identity(3, cell, kind, &ids, &hashes, 7).expect("pair"))
         .collect();
         assert!(pairs
             .iter()
             .all(|pair| pair.reference_observation_id == "obs-C11"));
+        assert!(pairs
+            .iter()
+            .all(|pair| pair.reference_raw_sha256 == hashes[&Arm::C11]));
         assert_eq!(
             pairs.iter().map(|pair| pair.round).collect::<Vec<_>>(),
             vec![3; 3]
         );
+
+        let mut drifted = pairs[0].clone();
+        drifted.reference_raw_sha256 = "00".repeat(32);
+        assert!(drifted.validate().is_err());
+        assert_ne!(drifted.reference_raw_sha256, pairs[0].reference_raw_sha256);
+        drifted.reference_position = drifted.treatment_position;
+        assert!(drifted.validate().is_err());
     }
 }

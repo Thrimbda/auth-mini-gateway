@@ -48,12 +48,12 @@ pub fn validate_lifecycle(workload: Workload, events: &[LifecycleEvent]) -> Resu
         LifecycleStage::QuietObservation,
         LifecycleStage::SetupReadiness,
         LifecycleStage::ProtocolProof,
-        LifecycleStage::Materialization,
-        LifecycleStage::WarmupDrain,
     ]
     .into_iter()
     .chain((workload == Workload::WebSocket).then_some(LifecycleStage::WebsocketRetirement))
     .chain([
+        LifecycleStage::Materialization,
+        LifecycleStage::WarmupDrain,
         LifecycleStage::Freeze,
         LifecycleStage::Steady,
         LifecycleStage::MeasuredDrain,
@@ -191,7 +191,7 @@ pub fn execution_primitive(
     let retain_latencies = matches!(arm.evidence_class, EvidenceClass::C | EvidenceClass::A);
     let measurement = match arm.evidence_class {
         EvidenceClass::S => ControlBody::MeasureCount {
-            phase: 2,
+            phase: 3,
             operations: arm
                 .target
                 .ok_or_else(|| Error::new("scout primitive has no target"))?,
@@ -206,7 +206,7 @@ pub fn execution_primitive(
                 ));
             }
             ControlBody::MeasureDuration {
-                phase: 2,
+                phase: 3,
                 duration_ns: seconds
                     .checked_mul(1_000_000_000)
                     .ok_or_else(|| Error::new("fixed-duration primitive overflow"))?,
@@ -465,7 +465,7 @@ pub fn campaign_dry_run(seed: u64, n: u32) -> Result<CampaignDryRun> {
             },
         })
         .collect::<Vec<_>>();
-    let runtime_projection = project_runtime(n, 17_217, 0, &durations)?;
+    let runtime_projection = project_runtime(n, 17_217_000_000_000, 0, &durations)?;
     let mut plan = CampaignDryRun {
         schema: PROCESS_PLAN_SCHEMA.to_owned(),
         seed,
@@ -595,9 +595,15 @@ mod tests {
         let n30 = campaign_dry_run(42, 30).expect("N30");
         assert_eq!(n30.authoritative_gateway_arms, 2_250);
         assert_eq!(n30.authoritative_direct_arms, 90);
-        assert_eq!(n30.runtime_projection.projected_total_seconds, 98_757);
+        assert_eq!(
+            n30.runtime_projection.projected_total_ns,
+            98_757_000_000_000
+        );
         let n50 = campaign_dry_run(42, 50).expect("N50");
-        assert_eq!(n50.runtime_projection.projected_total_seconds, 147_117);
+        assert_eq!(
+            n50.runtime_projection.projected_total_ns,
+            147_117_000_000_000
+        );
         assert!(campaign_dry_run(42, 70).is_err());
     }
 
@@ -607,9 +613,9 @@ mod tests {
             LifecycleStage::QuietObservation,
             LifecycleStage::SetupReadiness,
             LifecycleStage::ProtocolProof,
+            LifecycleStage::WebsocketRetirement,
             LifecycleStage::Materialization,
             LifecycleStage::WarmupDrain,
-            LifecycleStage::WebsocketRetirement,
             LifecycleStage::Freeze,
             LifecycleStage::Steady,
             LifecycleStage::MeasuredDrain,
@@ -631,7 +637,7 @@ mod tests {
             cursor += elapsed;
         }
         validate_lifecycle(Workload::WebSocket, &events).expect("valid lifecycle");
-        events[5].monotonic_end_ns = events[5].monotonic_start_ns + 11_999_999_999;
+        events[3].monotonic_end_ns = events[3].monotonic_start_ns + 11_999_999_999;
         assert!(validate_lifecycle(Workload::WebSocket, &events).is_err());
     }
 

@@ -44,3 +44,19 @@
 - H1 upload smoke confirms B11/C11/C12 use one fresh connection per operation with required close/EOF and zero retry/reuse; C21/C22 use one persistent H2 connection and unique streams.
 - N30/N50 dry-run inventories are structurally admissible at 98,757s and 147,117s before empirical calibration; no authoritative sample has run.
 - Remaining empirical gates: required C64 smoke, quiet/noise/headroom, thread signatures, scout, 750-arm Williams calibration, calibration direct panel, selected N/W/T projection, complete authoritative campaign, bundle cap, and independent verdict.
+
+## 2026-07-19 - Sealed second-smoke B11 upload failure remediated
+
+- Preserved both blocked smoke calibrations and bundles. A new bounded, non-authoritative B11/C1 upload diagnostic reproduced load-role detail hash `ce137486...` as stage `proof`, code `response-head-invalid`.
+- Root cause: the fresh-H1 raw response reader required `Content-Length`, while the exact gateway validly emitted a chunked response before its required connection close. Added bounded chunked decoding without changing one-connect/one-POST/close/peer-EOF/no-retry semantics or ledgers.
+- Authenticated terminal frames and new retained role-failure schema v2 now carry fixed allowlisted stage/code fields; raw detail remains absent and v1 sealed evidence remains verifiable.
+- Final diagnostic `diag-b11-c1-upload-1784472591816797084-f229f563b759` passed with 2 distinct downstream connections, 2 close tokens, 2 EOFs, and zero retry/reconnect/reuse. Seal root `502ece5890eb0d41205f5d8733ebccfc06efcac11acc139e51847a65efc42d5e`; bundle index SHA-256 `b5513c4241077f777e242327c633f93735dd462fa73481925654219cc4e1121a`.
+- Benchmark tests (117 unit + 13 integration), repository tests (110 unit + 50 integration), formatting, strict Clippy, locked/offline release builds, self-test, bundle reconstruction/recompression, and production-root diff passed. No full topology smoke or campaign was rerun.
+- Next: run one new additive C1+C64 topology smoke with the corrected harness; prior evidence remains retained.
+
+## 2026-07-20 - Full topology smoke hardened and passed
+
+- Fail-closed smoke iterations exposed and fixed benchmark-only defects in full-concurrency auth-worker materialization, checkpoint comparison, upstream-H1 cumulative connection accounting, H2 observer capacity, repeated executable hashing, and WebSocket cold-start sequencing. Every failed calibration and bundle remains additive and sealed.
+- The release harness completed the exact C1/C64 matrix in 152.724 seconds: 50 gateway cases plus four direct controls, all 54 with semantic class `ok` and no terminal integrity failure.
+- Provisional smoke `cal-smoke-50028c5f6764-84f0174d30b7` has seal root `8e14bd90bc85ac0eca1b2218a4f90e21cf22f49ce45e340c36190e302ce26c01`; bundle index SHA-256 `51767bce233c5adcc38f14cfda1774c45f83c2c221f56b63b0af59140f87fbb7` independently reconstructs and recompresses byte-for-byte.
+- This smoke proves topology only and used the pre-commit harness candidate. No performance sample or non-regression claim exists yet. Commit the final harness, rerun smoke against that exact Git object, then enter scout/calibration only if all gates remain clean.

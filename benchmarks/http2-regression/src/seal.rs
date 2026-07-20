@@ -1,5 +1,7 @@
 use crate::json;
-use crate::schema::{validate_sha256, EXECUTION_SCHEMA, JSON_MAX_BYTES};
+use crate::schema::{
+    validate_non_placeholder_sha256, validate_sha256, EXECUTION_SCHEMA, JSON_MAX_BYTES,
+};
 use crate::{Error, Result};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
@@ -20,7 +22,7 @@ pub struct SealEntry {
 impl SealEntry {
     pub fn validate(&self) -> Result<()> {
         validate_relative_path(&self.path)?;
-        validate_sha256("seal entry sha256", &self.sha256)
+        validate_non_placeholder_sha256("seal entry sha256", &self.sha256)
     }
 }
 
@@ -38,7 +40,7 @@ impl SealManifest {
         if self.schema != EXECUTION_SCHEMA || self.hash_algorithm != "sha256" {
             return Err(Error::new("unsupported seal schema or hash algorithm"));
         }
-        validate_sha256("seal root", &self.root_sha256)?;
+        validate_non_placeholder_sha256("seal root", &self.root_sha256)?;
         let mut previous: Option<&[u8]> = None;
         let mut unique = BTreeSet::new();
         for entry in &self.entries {

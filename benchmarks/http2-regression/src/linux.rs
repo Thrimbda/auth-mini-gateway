@@ -8,6 +8,7 @@ use crate::{Error, Result, ResultContext};
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
+use std::net::{IpAddr, SocketAddr};
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
@@ -116,6 +117,7 @@ pub struct ProcStat {
     pub parent_pid: u32,
     pub user_ticks: u64,
     pub system_ticks: u64,
+    pub major_faults: u64,
     pub start_time_ticks: u64,
     pub processor: i32,
 }
@@ -137,6 +139,65 @@ pub fn process_identity(pid: u32) -> Result<ProcessIdentity> {
         start_time_ticks: stat.start_time_ticks,
         parent_pid: stat.parent_pid,
     })
+}
+
+/// Proves that `identity` owns the exact listening socket before any
+/// benchmark credential or request is sent to it.
+pub fn verify_listening_socket_owner(
+    identity: &ProcessIdentity,
+    address: SocketAddr,
+) -> Result<u64> {
+    validate_identity(identity)?;
+    let IpAddr::V4(ip) = address.ip() else {
+        return Err(Error::new(
+            "gateway listener ownership currently requires literal IPv4 loopback",
+        ));
+    };
+    if !ip.is_loopback() {
+        return Err(Error::new("gateway listener is not literal loopback"));
+    }
+    let encoded_ip = u32::from_le_bytes(ip.octets());
+    let expected = format!("{encoded_ip:08X}:{:04X}", address.port());
+    let table = fs::read_to_string("/proc/net/tcp")?;
+    let mut inodes = BTreeSet::new();
+    for line in table.lines().skip(1) {
+        let fields = line.split_ascii_whitespace().collect::<Vec<_>>();
+        if fields.len() > 9 && fields[1] == expected && fields[3] == "0A" {
+            inodes.insert(fields[9].parse::<u64>().context("parse TCP socket inode")?);
+        }
+    }
+    if inodes.len() != 1 {
+        return Err(Error::new(format!(
+            "expected one LISTEN inode for {address}, observed {}",
+            inodes.len()
+        )));
+    }
+    let inode = *inodes
+        .iter()
+        .next()
+        .ok_or_else(|| Error::new("listener inode vanished"))?;
+    let expected_link = format!("socket:[{inode}]");
+    let mut owned = false;
+    for entry in fs::read_dir(format!("/proc/{}/fd", identity.pid))? {
+        let entry = entry?;
+        match fs::read_link(entry.path()) {
+            Ok(target) if target.to_string_lossy() == expected_link => {
+                owned = true;
+                break;
+            }
+            Ok(_) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => return Err(error.into()),
+        }
+    }
+    if !owned {
+        return Err(Error::new(format!(
+            "LISTEN inode {inode} is not owned by spawned gateway PID {}",
+            identity.pid
+        )));
+    }
+    validate_identity(identity)?;
+    Ok(inode)
 }
 
 pub fn validate_identity(identity: &ProcessIdentity) -> Result<ProcStat> {
@@ -195,6 +256,7 @@ pub fn parse_proc_stat(text: &str) -> Result<ProcStat> {
         parent_pid: fields[1].parse::<u32>().context("parse /proc stat ppid")?,
         user_ticks: parse_u64(11, "utime")?,
         system_ticks: parse_u64(12, "stime")?,
+        major_faults: parse_u64(9, "majflt")?,
         start_time_ticks: parse_u64(19, "starttime")?,
         processor: fields[36]
             .parse::<i32>()
@@ -465,6 +527,27 @@ pub fn tctl_millidegrees() -> Result<u64> {
         .context("parse Tctl")
 }
 
+pub fn scaling_cur_frequencies_khz(cpus: &[u16]) -> Result<BTreeMap<u16, u64>> {
+    if cpus.is_empty() {
+        return Err(Error::new("frequency sample has an empty CPU set"));
+    }
+    let mut values = BTreeMap::new();
+    for cpu in cpus {
+        let path = PathBuf::from(format!(
+            "/sys/devices/system/cpu/cpu{cpu}/cpufreq/scaling_cur_freq"
+        ));
+        let value = fs::read_to_string(&path)
+            .context(format!("read {}", path.display()))?
+            .trim()
+            .parse::<u64>()
+            .context(format!("parse {}", path.display()))?;
+        if value == 0 || values.insert(*cpu, value).is_some() {
+            return Err(Error::new("invalid/duplicate CPU frequency sample"));
+        }
+    }
+    Ok(values)
+}
+
 #[allow(unsafe_code)]
 pub fn filesystem_free_bytes(path: &Path) -> Result<u64> {
     use std::os::unix::ffi::OsStrExt;
@@ -680,6 +763,113 @@ pub fn preflight(repository: &Path, observation: Duration) -> Result<HostPreflig
     })
 }
 
+pub fn observe_quiet_exact() -> Result<crate::raw::QuietEvidence> {
+    let start_ns = clock_ns(ClockKind::Monotonic)?;
+    let end_ns = start_ns
+        .checked_add(10_000_000_000)
+        .ok_or_else(|| Error::new("Q_obs deadline overflow"))?;
+    let pressure_before = pressure_totals()?;
+    let swap_before = swap_counters()?;
+    let cpu_before = read_per_cpu_ticks()?;
+    loop {
+        let now = clock_ns(ClockKind::Monotonic)?;
+        if now >= end_ns {
+            break;
+        }
+        std::thread::sleep(Duration::from_nanos((end_ns - now).min(5_000_000)));
+    }
+    let pressure_after = pressure_totals()?;
+    let swap_after = swap_counters()?;
+    let cpu_after = read_per_cpu_ticks()?;
+    let mut steal_delta = 0_u64;
+    let mut external_time_clean = true;
+    let mut cpu_deltas = BTreeMap::new();
+    for (cpu, before) in &cpu_before {
+        let after = cpu_after
+            .get(cpu)
+            .ok_or_else(|| Error::new("Q_obs per-CPU row disappeared"))?;
+        let scheduled = after
+            .scheduled()?
+            .checked_sub(before.scheduled()?)
+            .ok_or_else(|| Error::new("Q_obs scheduled ticks decreased"))?;
+        let capacity = after
+            .capacity()?
+            .checked_sub(before.capacity()?)
+            .ok_or_else(|| Error::new("Q_obs capacity ticks decreased"))?;
+        steal_delta = steal_delta
+            .checked_add(
+                after
+                    .steal
+                    .checked_sub(before.steal)
+                    .ok_or_else(|| Error::new("Q_obs steal ticks decreased"))?,
+            )
+            .ok_or_else(|| Error::new("Q_obs steal delta overflow"))?;
+        // No fresh benchmark role exists in Q_obs.  Charging all scheduled
+        // ticks as external is conservative; the persistent orchestrator is
+        // not hidden by an inferred subtraction.
+        if capacity == 0 || u128::from(scheduled) * 100 > u128::from(capacity) {
+            external_time_clean = false;
+        }
+        cpu_deltas.insert(*cpu, (scheduled, capacity));
+    }
+    for first in 0_u16..16 {
+        let Some((left_external, left_capacity)) = cpu_deltas.get(&first) else {
+            external_time_clean = false;
+            continue;
+        };
+        let Some((right_external, right_capacity)) = cpu_deltas.get(&(first + 16)) else {
+            external_time_clean = false;
+            continue;
+        };
+        let external = left_external.saturating_add(*right_external);
+        let capacity = left_capacity.saturating_add(*right_capacity);
+        if capacity == 0 || u128::from(external) * 200 > u128::from(capacity) {
+            external_time_clean = false;
+        }
+    }
+    for cpus in [GATEWAY_CPUS, FIXTURE_CPUS, LOAD_CPUS, CONTROL_CPUS] {
+        let (external, capacity) = cpus.iter().fold((0_u64, 0_u64), |totals, cpu| {
+            let delta = cpu_deltas.get(cpu).copied().unwrap_or((u64::MAX, 0));
+            (
+                totals.0.saturating_add(delta.0),
+                totals.1.saturating_add(delta.1),
+            )
+        });
+        if capacity == 0 || u128::from(external) * 400 > u128::from(capacity) {
+            external_time_clean = false;
+        }
+    }
+    Ok(crate::raw::QuietEvidence {
+        schema: "amg-http2-perf/quiet/v1".to_owned(),
+        clock: "CLOCK_MONOTONIC".to_owned(),
+        start_ns,
+        end_ns,
+        q_extra_ns: 0,
+        cpu_psi_some_us: pressure_after
+            .cpu_some_us
+            .checked_sub(pressure_before.cpu_some_us)
+            .ok_or_else(|| Error::new("Q_obs CPU PSI decreased"))?,
+        memory_psi_full_us: pressure_after
+            .memory_full_us
+            .checked_sub(pressure_before.memory_full_us)
+            .ok_or_else(|| Error::new("Q_obs memory PSI decreased"))?,
+        io_psi_full_us: pressure_after
+            .io_full_us
+            .checked_sub(pressure_before.io_full_us)
+            .ok_or_else(|| Error::new("Q_obs I/O PSI decreased"))?,
+        swap_in_delta: swap_after
+            .0
+            .checked_sub(swap_before.0)
+            .ok_or_else(|| Error::new("Q_obs swap-in decreased"))?,
+        swap_out_delta: swap_after
+            .1
+            .checked_sub(swap_before.1)
+            .ok_or_else(|| Error::new("Q_obs swap-out decreased"))?,
+        steal_ticks_delta: steal_delta,
+        external_time_clean,
+    })
+}
+
 fn check_cpu_policy(
     observations: &mut BTreeMap<String, String>,
     blockers: &mut Vec<String>,
@@ -716,6 +906,7 @@ mod tests {
     fn parses_proc_stat_with_spaces_and_parentheses_in_comm() {
         let mut fields = vec!["S".to_owned(); 50];
         fields[1] = "41".to_owned();
+        fields[9] = "3".to_owned();
         fields[11] = "101".to_owned();
         fields[12] = "7".to_owned();
         fields[19] = "123456".to_owned();
@@ -727,6 +918,7 @@ mod tests {
         assert_eq!(parsed.parent_pid, 41);
         assert_eq!(parsed.user_ticks + parsed.system_ticks, 108);
         assert_eq!(parsed.start_time_ticks, 123456);
+        assert_eq!(parsed.major_faults, 3);
         assert_eq!(parsed.processor, 15);
     }
 
@@ -759,5 +951,16 @@ mod tests {
         assert_eq!(parsed.vm_hwm_kib, Some(120));
         assert_eq!(parsed.vm_rss_kib, Some(100));
         assert_eq!(parsed.cpus_allowed_list, "0,16");
+    }
+
+    #[test]
+    fn listener_inode_must_be_owned_by_the_exact_pid_start_tuple() {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("listener");
+        let address = listener.local_addr().expect("address");
+        let identity = process_identity(std::process::id()).expect("identity");
+        assert!(verify_listening_socket_owner(&identity, address).is_ok());
+        let mut wrong = identity;
+        wrong.start_time_ticks += 1;
+        assert!(verify_listening_socket_owner(&wrong, address).is_err());
     }
 }

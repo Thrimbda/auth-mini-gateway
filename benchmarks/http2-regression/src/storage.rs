@@ -1,4 +1,5 @@
 use crate::schema::{EvidenceClass, CHUNK_BYTES, TASK_CAP_BYTES};
+use crate::seal::sha256_hex;
 use crate::{Error, Result};
 use serde::{Deserialize, Serialize};
 use std::fs;
@@ -7,6 +8,7 @@ use std::path::Path;
 pub const KIB: u64 = 1_024;
 pub const MIB: u64 = 1_048_576;
 pub const GIB: u64 = 1_073_741_824;
+pub const COMPRESSION_PROFILE_SCHEMA: &str = "amg-http2-perf/compression-profile/v1";
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -32,6 +34,7 @@ pub struct ComponentBounds {
     pub resources_bin: u64,
     pub endpoints_bin: u64,
     pub operation_summary_bin: u64,
+    pub materialization_json: u64,
     pub latencies_u64le: u64,
     pub total: u64,
 }
@@ -64,11 +67,12 @@ pub fn component_bounds(input: &ArmStorageInput) -> Result<ComponentBounds> {
     let resource_width = checked_sum(&[32, input.tid_slots, 4])?;
     let resources_bin = checked_sum(&[128, checked_mul(checked_mul(160, h100)?, resource_width)?])?;
     let endpoints_bin = checked_sum(&[
-        256,
+        512,
         checked_mul(160, input.connection_records)?,
-        checked_mul(128, input.concurrency)?,
+        checked_mul(512, input.concurrency)?,
     ])?;
     let operation_summary_bin = checked_sum(&[256, checked_mul(96, input.concurrency)?])?;
+    let materialization_json = if input.gateway { MIB } else { 0 };
     let latencies_u64le = if input.class.has_latencies() {
         checked_sum(&[32, checked_mul(8, input.latency_records)?])?
     } else {
@@ -83,6 +87,7 @@ pub fn component_bounds(input: &ArmStorageInput) -> Result<ComponentBounds> {
         resources_bin,
         endpoints_bin,
         operation_summary_bin,
+        materialization_json,
         latencies_u64le,
         total: 0,
     };
@@ -95,6 +100,7 @@ pub fn component_bounds(input: &ArmStorageInput) -> Result<ComponentBounds> {
         result.resources_bin,
         result.endpoints_bin,
         result.operation_summary_bin,
+        result.materialization_json,
         result.latencies_u64le,
     ])?;
     Ok(result)
@@ -240,19 +246,152 @@ pub struct CompressionWitness {
     pub compressed_bytes_per_arm: u64,
     pub compressed_record_count: u64,
     pub witness_sha256: String,
+    pub compressed_bytes_per_record: u64,
+    pub record_witness_sha256: String,
 }
 
 impl CompressionWitness {
     pub fn validate(&self) -> Result<()> {
         if self.match_key.is_empty()
+            || self.match_key.len() > 1_024
             || self.component.is_empty()
+            || !matches!(
+                self.component.as_str(),
+                "metadata.json"
+                    | "quiet.json"
+                    | "thread-map.json"
+                    | "thread-lifecycle.bin"
+                    | "session-clock.bin"
+                    | "resources.bin"
+                    | "endpoints.bin"
+                    | "operation-summary.bin"
+                    | "latencies.u64le"
+            )
             || self.compressed_bytes_per_arm == 0
             || self.compressed_record_count == 0
+            || self.compressed_bytes_per_record == 0
         {
             return Err(Error::new("invalid compression-profile witness"));
         }
-        crate::schema::validate_sha256("witness_sha256", &self.witness_sha256)
+        crate::schema::validate_non_placeholder_sha256("witness_sha256", &self.witness_sha256)?;
+        crate::schema::validate_non_placeholder_sha256(
+            "record_witness_sha256",
+            &self.record_witness_sha256,
+        )
     }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct CompressionProfile {
+    pub schema: String,
+    pub evidence_id: String,
+    pub intent_sha256: String,
+    pub witnesses: Vec<CompressionWitness>,
+    pub root_sha256: String,
+}
+
+impl CompressionProfile {
+    pub fn validate(&self) -> Result<()> {
+        if self.schema != COMPRESSION_PROFILE_SCHEMA || self.evidence_id.is_empty() {
+            return Err(Error::new(
+                "unsupported or unidentified compression profile",
+            ));
+        }
+        crate::schema::validate_identifier("compression profile evidence_id", &self.evidence_id)?;
+        crate::schema::validate_non_placeholder_sha256(
+            "compression profile intent",
+            &self.intent_sha256,
+        )?;
+        crate::schema::validate_non_placeholder_sha256(
+            "compression profile root",
+            &self.root_sha256,
+        )?;
+        let mut previous: Option<(&[u8], &[u8])> = None;
+        for witness in &self.witnesses {
+            witness.validate()?;
+            let key = (witness.match_key.as_bytes(), witness.component.as_bytes());
+            if previous.is_some_and(|old| old >= key) {
+                return Err(Error::new(
+                    "compression witnesses are not strictly sorted and unique",
+                ));
+            }
+            previous = Some(key);
+        }
+        if compression_profile_root(&self.witnesses)? != self.root_sha256 {
+            return Err(Error::new(
+                "compression profile root differs from its witnesses",
+            ));
+        }
+        Ok(())
+    }
+}
+
+pub fn compression_profile_root(witnesses: &[CompressionWitness]) -> Result<String> {
+    let mut bytes = Vec::new();
+    bytes.extend_from_slice(b"amg-http2-perf/compression-profile-root/v1\0");
+    for witness in witnesses {
+        witness.validate()?;
+        for value in [witness.match_key.as_bytes(), witness.component.as_bytes()] {
+            let length = u32::try_from(value.len())
+                .map_err(|_| Error::new("compression profile string exceeds u32"))?;
+            bytes.extend_from_slice(&length.to_be_bytes());
+            bytes.extend_from_slice(value);
+        }
+        bytes.extend_from_slice(&witness.compressed_bytes_per_arm.to_be_bytes());
+        bytes.extend_from_slice(&witness.compressed_record_count.to_be_bytes());
+        bytes.extend_from_slice(witness.witness_sha256.as_bytes());
+        bytes.extend_from_slice(&witness.compressed_bytes_per_record.to_be_bytes());
+        bytes.extend_from_slice(witness.record_witness_sha256.as_bytes());
+    }
+    Ok(sha256_hex(&bytes))
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct CompressionRequirement {
+    pub match_key: String,
+    pub component: String,
+    pub future_records: u64,
+    pub future_arms: u64,
+}
+
+pub fn verified_compression_projection(
+    profile: &CompressionProfile,
+    requirements: &[CompressionRequirement],
+) -> Result<u64> {
+    profile.validate()?;
+    let lookup = profile
+        .witnesses
+        .iter()
+        .map(|witness| {
+            (
+                (witness.match_key.as_str(), witness.component.as_str()),
+                witness,
+            )
+        })
+        .collect::<std::collections::BTreeMap<_, _>>();
+    requirements.iter().try_fold(0_u64, |total, requirement| {
+        if requirement.match_key.is_empty()
+            || requirement.component.is_empty()
+            || requirement.future_arms == 0
+        {
+            return Err(Error::new("invalid compression projection requirement"));
+        }
+        let witness = lookup
+            .get(&(
+                requirement.match_key.as_str(),
+                requirement.component.as_str(),
+            ))
+            .ok_or_else(|| Error::new("compression profile lacks an exact matching component"))?;
+        let per_arm = projected_component_bytes(witness, requirement.future_records)?;
+        let term = per_arm
+            .checked_mul(requirement.future_arms)
+            .ok_or_else(|| Error::new("compression projection arm product overflow"))?;
+        total
+            .checked_add(term)
+            .ok_or_else(|| Error::new("compression projection total overflow"))
+    })
 }
 
 pub fn projected_component_bytes(witness: &CompressionWitness, future_records: u64) -> Result<u64> {
@@ -261,7 +400,13 @@ pub fn projected_component_bytes(witness: &CompressionWitness, future_records: u
         witness.compressed_bytes_per_arm,
         witness.compressed_record_count,
     )?;
-    let record_projection = rounded_per_record
+    if witness.compressed_bytes_per_record < rounded_per_record {
+        return Err(Error::new(
+            "compression profile per-record maximum underpredicts its arm witness",
+        ));
+    }
+    let record_projection = witness
+        .compressed_bytes_per_record
         .checked_mul(future_records.max(1))
         .ok_or_else(|| Error::new("component record projection overflow"))?;
     witness
@@ -291,6 +436,12 @@ pub fn tracked_projection(
     direct_terms: &[u64],
     fixed_overhead_bytes: u64,
 ) -> Result<TrackedProjection> {
+    let minimum_fixed_overhead = checked_mul(5, MIB)?;
+    if fixed_overhead_bytes < minimum_fixed_overhead {
+        return Err(Error::new(
+            "tracked projection omits the five mandatory 1 MiB fixed-output reserves",
+        ));
+    }
     let authoritative_projection_bytes = checked_sum(authoritative_terms)?;
     let direct_projection_bytes = checked_sum(direct_terms)?;
     let projected_total_bytes = checked_sum(&[
@@ -337,6 +488,17 @@ pub fn actual_regular_bytes(root: &Path) -> Result<u64> {
     walk_regular_bytes(root)
 }
 
+pub fn actual_regular_bytes_if_exists(root: &Path) -> Result<u64> {
+    match fs::symlink_metadata(root) {
+        Ok(_) => actual_regular_bytes(root),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(0),
+        Err(error) => Err(Error::new(format!(
+            "cannot inspect artifact root {}: {error}",
+            root.display()
+        ))),
+    }
+}
+
 fn walk_regular_bytes(directory: &Path) -> Result<u64> {
     let mut total = 0_u64;
     for entry in fs::read_dir(directory)? {
@@ -355,6 +517,16 @@ fn walk_regular_bytes(directory: &Path) -> Result<u64> {
                 .checked_add(walk_regular_bytes(&path)?)
                 .ok_or_else(|| Error::new("artifact byte total overflow"))?;
         } else if kind.is_file() {
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::MetadataExt;
+                if metadata.nlink() != 1 {
+                    return Err(Error::new(format!(
+                        "artifact hard link is forbidden: {}",
+                        path.display()
+                    )));
+                }
+            }
             let maximum = if path
                 .file_name()
                 .and_then(|name| name.to_str())
@@ -418,7 +590,7 @@ mod tests {
             duration_ns: 15_000_000_000,
             tid_slots: 8,
             lifecycle_events: 10,
-            connection_records: 136,
+            connection_records: 200,
             latency_records: 0,
             concurrency: 64,
         })
@@ -426,7 +598,7 @@ mod tests {
         assert_eq!(scout.thread_lifecycle_bin, 97_216);
         assert_eq!(scout.session_clock_bin, 192_384);
         assert_eq!(scout.resources_bin, 1_070_208);
-        assert_eq!(scout.endpoints_bin, 30_208);
+        assert_eq!(scout.endpoints_bin, 65_280);
         assert_eq!(scout.operation_summary_bin, 6_400);
         assert_eq!(scout.latencies_u64le, 0);
         assert_eq!(ustar_bound(&[]).expect("empty archive bound"), 1_024);
@@ -524,7 +696,9 @@ mod tests {
             component: "resources.bin".to_owned(),
             compressed_bytes_per_arm: 101,
             compressed_record_count: 10,
-            witness_sha256: "00".repeat(32),
+            witness_sha256: "22".repeat(32),
+            compressed_bytes_per_record: 11,
+            record_witness_sha256: "11".repeat(32),
         };
         assert_eq!(projected_component_bytes(&witness, 5).expect("small"), 202);
         assert_eq!(projected_component_bytes(&witness, 20).expect("large"), 440);
@@ -532,16 +706,58 @@ mod tests {
 
     #[test]
     fn tracked_and_actual_cap_accept_equality_and_reject_one_byte_over() {
-        let projection =
-            tracked_projection(TASK_CAP_BYTES - 4, 1, &[1], &[1], 1).expect("equal projection");
+        let fixed = 5 * MIB;
+        let projection = tracked_projection(TASK_CAP_BYTES - fixed - 3, 1, &[1], &[1], fixed)
+            .expect("equal projection");
         assert_eq!(projection.projected_total_bytes, TASK_CAP_BYTES);
         assert!(projection.admissible);
-        let over =
-            tracked_projection(TASK_CAP_BYTES - 3, 1, &[1], &[1], 1).expect("over projection");
+        let over = tracked_projection(TASK_CAP_BYTES - fixed - 2, 1, &[1], &[1], fixed)
+            .expect("over projection");
         assert!(!over.admissible);
         assert!(actual_cap_allows(TASK_CAP_BYTES));
         assert!(!actual_cap_allows(TASK_CAP_BYTES + 1));
         assert!(actual_checkpoint_allows(TASK_CAP_BYTES - 1, 1).expect("checkpoint equality"));
         assert!(!actual_checkpoint_allows(TASK_CAP_BYTES - 1, 2).expect("checkpoint over"));
+    }
+
+    #[test]
+    fn verified_component_profile_requires_exact_matches_and_blocks_underprediction() {
+        let witness = CompressionWitness {
+            match_key: "gateway:C11:get:c16:down-h1-persistent:up-h1-persistent".to_owned(),
+            component: "resources.bin".to_owned(),
+            compressed_bytes_per_arm: 101,
+            compressed_record_count: 10,
+            witness_sha256: "12".repeat(32),
+            compressed_bytes_per_record: 11,
+            record_witness_sha256: "34".repeat(32),
+        };
+        let witnesses = vec![witness.clone()];
+        let profile = CompressionProfile {
+            schema: COMPRESSION_PROFILE_SCHEMA.to_owned(),
+            evidence_id: "calibration-fixture".to_owned(),
+            intent_sha256: "56".repeat(32),
+            root_sha256: compression_profile_root(&witnesses).expect("profile root"),
+            witnesses,
+        };
+        let requirement = CompressionRequirement {
+            match_key: witness.match_key.clone(),
+            component: witness.component.clone(),
+            future_records: 20,
+            future_arms: 2,
+        };
+        assert_eq!(
+            verified_compression_projection(&profile, std::slice::from_ref(&requirement))
+                .expect("verified projection"),
+            880
+        );
+        let mut missing = requirement;
+        missing.match_key.push_str(":different-policy");
+        assert!(verified_compression_projection(&profile, &[missing]).is_err());
+
+        let mut underpredicted = profile;
+        underpredicted.witnesses[0].compressed_bytes_per_record = 10;
+        underpredicted.root_sha256 =
+            compression_profile_root(&underpredicted.witnesses).expect("mutated root");
+        assert!(projected_component_bytes(&underpredicted.witnesses[0], 20).is_err());
     }
 }

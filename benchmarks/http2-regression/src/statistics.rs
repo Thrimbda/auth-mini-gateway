@@ -1,11 +1,14 @@
 use crate::rng::{bounded, SplitMix64};
+use crate::schedule::PairIdentity;
 use crate::schema::{
-    hard_comparisons, ArmMetrics, AuthoritativeManifest, BlockedCode, BlockedReason,
-    ComparisonSpec, QualityEvidence, Verdict, ANALYSIS_SCHEMA,
+    hard_comparisons, ArmMetrics, AuthoritativeManifest, AuthoritativeRecord, BlockedCode,
+    BlockedReason, ComparisonSpec, QualityEvidence, Verdict, ANALYSIS_SCHEMA,
 };
+use crate::seal::sha256_hex;
 use crate::{Error, Result};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
+use std::collections::BTreeMap;
 
 pub const BOOTSTRAP_REPLICATES: usize = 100_000;
 pub const LOWER_PERCENTILE_INDEX: usize = 4_999;
@@ -133,10 +136,34 @@ pub struct VerdictDecision {
 pub struct AnalysisResult {
     pub schema: String,
     pub run_id: String,
+    pub math_target_sha256: String,
     pub comparison_count: u32,
     pub scalar_gate_count: u32,
     pub comparisons: Vec<ComparisonResult>,
     pub decision: VerdictDecision,
+}
+
+/// Names every target property that can affect the RFC's pinned floating-point result bits.
+/// This identity is deliberately part of sealed analysis input rather than an output label.
+#[must_use]
+pub fn math_target_identity() -> String {
+    format!(
+        "rustc-1.96.0/{}/{}/endian-{}/pointer-{}/fma-{}/f64-ieee754-v1",
+        std::env::consts::ARCH,
+        std::env::consts::OS,
+        if cfg!(target_endian = "little") {
+            "little"
+        } else {
+            "big"
+        },
+        usize::BITS,
+        cfg!(target_feature = "fma")
+    )
+}
+
+#[must_use]
+pub fn math_target_sha256() -> String {
+    sha256_hex(math_target_identity().as_bytes())
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -422,9 +449,44 @@ pub fn analyze_comparison(
     })
 }
 
-pub fn analyze_manifest(manifest: &AuthoritativeManifest) -> Result<AnalysisResult> {
+pub(crate) fn analyze_derived_manifest(
+    manifest: &AuthoritativeManifest,
+    pair_identities: &[PairIdentity],
+) -> Result<AnalysisResult> {
     manifest.validate()?;
+    if manifest.math_target_sha256 != math_target_sha256() {
+        return Err(Error::new(
+            "sealed deterministic math target identity mismatch",
+        ));
+    }
     let by_key = manifest.by_key();
+    let expected_pair_count = hard_comparisons()
+        .len()
+        .checked_mul(usize::try_from(manifest.n).map_err(|_| Error::new("N does not fit usize"))?)
+        .ok_or_else(|| Error::new("authoritative pair count overflow"))?;
+    if pair_identities.len() != expected_pair_count {
+        return Err(Error::new(
+            "authoritative pair identity inventory is incomplete",
+        ));
+    }
+    let mut pairs_by_key = BTreeMap::new();
+    for identity in pair_identities {
+        crate::schema::validate_identifier("pair comparison_id", &identity.comparison_id)?;
+        crate::schema::validate_sha256(
+            "pair treatment raw sha256",
+            &identity.treatment_raw_sha256,
+        )?;
+        crate::schema::validate_sha256(
+            "pair reference raw sha256",
+            &identity.reference_raw_sha256,
+        )?;
+        if pairs_by_key
+            .insert((identity.comparison_id.clone(), identity.round), identity)
+            .is_some()
+        {
+            return Err(Error::new("duplicate authoritative pair identity"));
+        }
+    }
     let mut comparison_results = Vec::with_capacity(45);
     for spec in hard_comparisons() {
         let mut pairs = Vec::with_capacity(usize::try_from(manifest.n).unwrap_or(0));
@@ -435,10 +497,14 @@ pub fn analyze_manifest(manifest: &AuthoritativeManifest) -> Result<AnalysisResu
             let reference = by_key
                 .get(&(round, spec.cell, spec.reference))
                 .ok_or_else(|| Error::new("missing reference record"))?;
+            let identity = pairs_by_key
+                .get(&(spec.id.clone(), round))
+                .ok_or_else(|| Error::new("missing sealed pair identity"))?;
+            validate_pair_binding(&spec, treatment, reference, identity)?;
             pairs.push(PairedMetrics {
                 treatment: treatment.metrics,
                 reference: reference.metrics,
-                treatment_before_reference: treatment.position < reference.position,
+                treatment_before_reference: identity.treatment_before_reference,
             });
         }
         comparison_results.push(analyze_comparison(
@@ -461,6 +527,7 @@ pub fn analyze_manifest(manifest: &AuthoritativeManifest) -> Result<AnalysisResu
     Ok(AnalysisResult {
         schema: ANALYSIS_SCHEMA.to_owned(),
         run_id: manifest.run_id.clone(),
+        math_target_sha256: math_target_sha256(),
         comparison_count: 45,
         scalar_gate_count: 190,
         comparisons: comparison_results,
@@ -468,7 +535,34 @@ pub fn analyze_manifest(manifest: &AuthoritativeManifest) -> Result<AnalysisResu
     })
 }
 
-pub fn classify_verdict(
+fn validate_pair_binding(
+    spec: &ComparisonSpec,
+    treatment: &AuthoritativeRecord,
+    reference: &AuthoritativeRecord,
+    identity: &PairIdentity,
+) -> Result<()> {
+    if identity.comparison_id != spec.id
+        || identity.round != treatment.round
+        || identity.round != reference.round
+        || identity.cell != spec.cell
+        || identity.treatment != spec.treatment
+        || identity.reference != spec.reference
+        || identity.treatment_observation_id != treatment.observation_id
+        || identity.reference_observation_id != reference.observation_id
+        || identity.treatment_raw_sha256 != treatment.raw_sha256
+        || identity.reference_raw_sha256 != reference.raw_sha256
+        || identity.treatment_position != treatment.position
+        || identity.reference_position != reference.position
+        || identity.treatment_before_reference != (treatment.position < reference.position)
+    {
+        return Err(Error::new(
+            "sealed pair identity/position/raw hash differs from derived observations",
+        ));
+    }
+    identity.validate()
+}
+
+pub(crate) fn classify_verdict(
     quality: &QualityEvidence,
     comparisons: &[ComparisonResult],
 ) -> VerdictDecision {
@@ -567,7 +661,7 @@ fn hex_nibble(value: u8) -> Result<u8> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::schema::{all_cells, BlockedCode, ComparisonKind, QualityEvidence};
+    use crate::schema::{all_cells, Arm, BlockedCode, ComparisonKind, QualityEvidence};
 
     fn metric(value: f64) -> ArmMetrics {
         ArmMetrics {
@@ -830,5 +924,60 @@ mod tests {
             classify_verdict(&clean_quality(), &comparisons).stage,
             VerdictStage::Performance
         );
+    }
+
+    #[test]
+    fn deterministic_math_target_identity_is_hash_bound() {
+        let identity = math_target_identity();
+        assert!(identity.contains(std::env::consts::ARCH));
+        assert!(identity.contains("rustc-1.96.0"));
+        assert_eq!(math_target_sha256(), sha256_hex(identity.as_bytes()));
+        assert_ne!(
+            math_target_sha256(),
+            sha256_hex(format!("{identity}-different-default").as_bytes())
+        );
+    }
+
+    #[test]
+    fn pair_binding_rejects_position_and_shared_raw_hash_drift() {
+        let spec = hard_comparisons()
+            .into_iter()
+            .find(|value| value.kind == ComparisonKind::CandidateH1)
+            .expect("candidate H1 comparison");
+        let record = |arm, position, observation: &str, hash: &str| AuthoritativeRecord {
+            schema: crate::schema::EXECUTION_SCHEMA.to_owned(),
+            run_id: "run".to_owned(),
+            round: 0,
+            cell: spec.cell,
+            arm,
+            position,
+            observation_id: observation.to_owned(),
+            raw_sha256: hash.to_owned(),
+            metrics: metric(100.0),
+        };
+        let treatment = record(Arm::C11, 1, "candidate", &"11".repeat(32));
+        let reference = record(Arm::B11, 0, "baseline", &"22".repeat(32));
+        let identity = PairIdentity {
+            comparison_id: spec.id.clone(),
+            round: 0,
+            cell: spec.cell,
+            treatment: Arm::C11,
+            reference: Arm::B11,
+            treatment_observation_id: treatment.observation_id.clone(),
+            reference_observation_id: reference.observation_id.clone(),
+            treatment_raw_sha256: treatment.raw_sha256.clone(),
+            reference_raw_sha256: reference.raw_sha256.clone(),
+            treatment_position: 1,
+            reference_position: 0,
+            treatment_before_reference: false,
+        };
+        validate_pair_binding(&spec, &treatment, &reference, &identity)
+            .expect("exact pair binding");
+        let mut drifted = identity.clone();
+        drifted.reference_raw_sha256 = "33".repeat(32);
+        assert!(validate_pair_binding(&spec, &treatment, &reference, &drifted).is_err());
+        drifted = identity;
+        drifted.treatment_position = 2;
+        assert!(validate_pair_binding(&spec, &treatment, &reference, &drifted).is_err());
     }
 }

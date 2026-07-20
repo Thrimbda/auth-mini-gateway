@@ -7,10 +7,12 @@ pub mod calibration;
 pub mod codec;
 pub mod control;
 pub mod error;
+pub mod evidence;
 pub mod fixture;
 pub mod json;
 pub mod linux;
 pub mod load;
+pub mod materialization;
 pub mod orchestrator;
 pub mod process_plan;
 pub mod raw;
@@ -23,6 +25,7 @@ pub mod session;
 pub mod statistics;
 pub mod storage;
 pub mod topology;
+pub mod wire;
 
 pub use error::{Error, Result, ResultContext};
 

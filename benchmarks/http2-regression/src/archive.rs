@@ -1,3 +1,4 @@
+use crate::schema::{MAX_ARCHIVE_MEMBERS, TASK_CAP_BYTES};
 use crate::seal::{sha256_hex, ustar_path_parts, validate_relative_path, SealManifest};
 use crate::{Error, Result};
 use std::collections::BTreeSet;
@@ -14,6 +15,11 @@ pub struct ArchiveMember {
 
 pub fn canonical_archive(root: &Path, seal: &SealManifest) -> Result<Vec<u8>> {
     seal.validate()?;
+    if u64::try_from(seal.entries.len()).unwrap_or(u64::MAX) >= MAX_ARCHIVE_MEMBERS {
+        return Err(Error::new(
+            "seal member count exceeds canonical archive limit",
+        ));
+    }
     let mut members = Vec::with_capacity(seal.entries.len() + 1);
     for entry in &seal.entries {
         let bytes = fs::read(root.join(&entry.path))?;
@@ -59,6 +65,11 @@ pub fn canonical_archive_from_members(members: &[ArchiveMember]) -> Result<Vec<u
             .and_then(|value| value.checked_add(padded))
             .ok_or_else(|| Error::new("archive length overflow"))?;
     }
+    if projected > TASK_CAP_BYTES {
+        return Err(Error::new(
+            "canonical archive projection exceeds bounded allocation limit",
+        ));
+    }
     let capacity = usize::try_from(projected)
         .map_err(|_| Error::new("canonical archive does not fit memory"))?;
     let mut output = Vec::with_capacity(capacity);
@@ -79,7 +90,10 @@ pub fn canonical_archive_from_members(members: &[ArchiveMember]) -> Result<Vec<u
 }
 
 pub fn parse_canonical_archive(bytes: &[u8]) -> Result<Vec<ArchiveMember>> {
-    if bytes.len() < 2 * BLOCK_BYTES || !bytes.len().is_multiple_of(BLOCK_BYTES) {
+    if u64::try_from(bytes.len()).unwrap_or(u64::MAX) > TASK_CAP_BYTES
+        || bytes.len() < 2 * BLOCK_BYTES
+        || !bytes.len().is_multiple_of(BLOCK_BYTES)
+    {
         return Err(Error::new(
             "canonical archive length is not block-aligned with two end blocks",
         ));
@@ -163,6 +177,9 @@ pub fn parse_canonical_archive(bytes: &[u8]) -> Result<Vec<ArchiveMember>> {
             path,
             bytes: payload,
         });
+        if u64::try_from(members.len()).unwrap_or(u64::MAX) > MAX_ARCHIVE_MEMBERS {
+            return Err(Error::new("canonical archive member-count limit exceeded"));
+        }
         offset = next;
     }
     Ok(members)
