@@ -629,7 +629,11 @@ pub fn verify_clean_scratch_rebuild(
             "clean rebuild vendor tree differs from sealed provenance",
         ));
     }
-    let cargo_config_sha256 = sha256_hex(&fs::read(cargo_home.join("config.toml"))?);
+    let original_vendor = repository
+        .join(&manifest.object_relative_path)
+        .join("vendor");
+    let cargo_config_sha256 =
+        relocated_cargo_config_sha256(&cargo_home.join("config.toml"), &vendor, &original_vendor)?;
     if cargo_config_sha256 != manifest.cargo_config_sha256 {
         return Err(Error::new(
             "clean rebuild Cargo config differs from sealed provenance",
@@ -670,6 +674,27 @@ pub fn verify_clean_scratch_rebuild(
         binary_sha256,
         elf_build_id: build_id,
     })
+}
+
+fn relocated_cargo_config_sha256(
+    path: &Path,
+    from_vendor: &Path,
+    to_vendor: &Path,
+) -> Result<String> {
+    let config =
+        String::from_utf8(fs::read(path)?).map_err(|_| Error::new("Cargo config is not UTF-8"))?;
+    let from = from_vendor
+        .to_str()
+        .ok_or_else(|| Error::new("scratch vendor path is not UTF-8"))?;
+    let to = to_vendor
+        .to_str()
+        .ok_or_else(|| Error::new("sealed vendor path is not UTF-8"))?;
+    if from == to || config.matches(from).count() != 1 {
+        return Err(Error::new(
+            "Cargo config does not contain one exact relocatable vendor path",
+        ));
+    }
+    Ok(sha256_hex(config.replace(from, to).as_bytes()))
 }
 
 pub fn build_pair(repository: &Path, execution_root: &Path, candidate: &str) -> Result<BuildSet> {
