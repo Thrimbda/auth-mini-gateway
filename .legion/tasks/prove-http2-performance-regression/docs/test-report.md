@@ -22,6 +22,20 @@
 
 Implementation readiness is **PASS**.
 
+## Closeout verification at `d19ce2e`: PASS
+
+Fresh verification on the closeout worktree produced:
+
+- `cargo test --locked --offline` at the repository root: 110 unit and 50 integration tests passed.
+- `cargo test --locked --offline` in `benchmarks/http2-regression`: 126 unit and 25 integration tests passed, plus `process-arms: PASS`. A first run made concurrently with the root suite had one transient `spawned role cycle changed after freeze` failure; the exact test then passed, followed by two complete isolated benchmark-suite passes.
+- `cargo clippy --locked --offline --all-targets --all-features -- -D warnings`: passed at both the repository root and benchmark package.
+- `cargo build --release --locked --offline` for the benchmark verifier: passed.
+- `delivery-ready --commit d19ce2e8083111ec5989d11225809ed09597c6ac`: `success=true` with committed artifact tree `266a1341af0b2309b50503266ea8be5865fc15ae0623bb51c5c7b15c4dfd0be8`, ledger `9e9fe765a485785365aa26ae7bb218a89b2bf29893bfa6d95b920169af83142e`, and exact verifier source tree `9c7fa8c0ca437a7f3bf54cae7a4290b4520dbc9c`.
+- Clean candidate rebuild: 11,213,072 bytes, SHA-256 `6f1dc2713d99cd65ac478c718b4ebaeef7b4a45241913d69434af69e5704cf4d`, Build-ID `null`.
+- Clean baseline rebuild: 9,192,512 bytes, SHA-256 `9a32bab7281ed672b1d27327a23000b6968cf7630452b68813a987c8fb372d73`, Build-ID `null`.
+
+Diff and byte checks confirmed no production source, Cargo manifest/lock, statistical threshold, retry, or evidence-analysis code changed after PR #13. The tracked bundle index, compressed chunk, and verification receipt exactly match the retained `.perf` staging bytes. Closeout verification is **PASS**; the retained empirical result remains **BLOCKED** without a no-regression claim.
+
 ## Retained smoke evidence
 
 ### First exact implementation checkpoint

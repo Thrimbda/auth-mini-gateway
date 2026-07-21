@@ -80,3 +80,12 @@
 - The receipt records `success=true`, `byte_equal=true`, and terminal `BLOCKED`.
 - Current branch is `legion/prove-http2-performance-regression-closeout`. A second closeout PR must merge before the fetched-base retention check can authorize `.perf` cleanup, worktree/branch removal, and main-workspace refresh.
 - Conclusion unchanged: implementation `PASS`, empirical proof `BLOCKED`, and no performance or no-regression claim.
+
+## 2026-07-21 - Closeout artifact passed delivery readiness
+
+- Exact-commit `delivery-ready` passed for artifact commit `d19ce2e8083111ec5989d11225809ed09597c6ac`.
+- The committed artifact tree is `266a1341af0b2309b50503266ea8be5865fc15ae0623bb51c5c7b15c4dfd0be8`, the delivery ledger SHA-256 is `9e9fe765a485785365aa26ae7bb218a89b2bf29893bfa6d95b920169af83142e`, and the exact verifier source tree is `9c7fa8c0ca437a7f3bf54cae7a4290b4520dbc9c`.
+- The complete tracked delivery set is 40,405 bytes. Clean scratch rebuilds exactly matched the sealed candidate binary (11,213,072 bytes, SHA-256 `6f1dc2713d99cd65ac478c718b4ebaeef7b4a45241913d69434af69e5704cf4d`) and baseline binary (9,192,512 bytes, SHA-256 `9a32bab7281ed672b1d27327a23000b6968cf7630452b68813a987c8fb372d73`).
+- Fresh verification passed all 160 root tests, all 151 nested benchmark tests plus `process-arms`, and strict Clippy. Focused closeout review records **PASS** with no remaining finding.
+- The closeout PR is still pending. After it merges, the remaining order is fetched-base `delivery-retained`, authorized retained-state/worktree/branch cleanup, and main-workspace refresh.
+- Conclusion unchanged: implementation `PASS`, empirical proof `BLOCKED`, and no performance or no-regression claim.
