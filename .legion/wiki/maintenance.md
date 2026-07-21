@@ -23,5 +23,6 @@
 ## HTTP/2 performance proof follow-up
 
 - Treat exact-candidate smoke `cal-smoke-91bb210cbf67-b2297c713de2` as terminal `BLOCKED`: do not retry it, change thresholds, or convert the absence of samples into a no-regression claim.
-- Preserve partial unsealed root `cal-smoke-743fa30d7371-a03fd3cf021e` and the sealed terminal evidence until the delivery lifecycle authorizes cleanup.
-- Main implementation PR #13 is merged, and artifact commit `d19ce2e` passed `delivery-ready`, full tests, strict Clippy, and focused closeout review. The closeout PR is still pending; after it merges, run `delivery-retained` against the fetched durable base before cleaning ignored benchmark evidence, removing the worktree/branches, or refreshing main.
+- PRs #13 and #14 are merged, and `delivery-retained` passed against fetched base/merge `9c4122d2cd2eabe73f4d3785daf22197242de54d`. Its cleanup authorization is content-bound and permits deletion only of matching `.perf` evidence.
+- Preserve partial unsealed root `cal-smoke-743fa30d7371-a03fd3cf021e` and any other non-authorized historical local evidence outside the worktree before worktree removal.
+- After the finalization docs PR merges, re-fetch `master`, rerun retained verification against that commit, perform only the authorized matching-evidence deletion, remove the worktree and merged local branches, and refresh main. This is a local mechanical handoff after repository delivery completed at `8/8`, not a performance-verification follow-up.

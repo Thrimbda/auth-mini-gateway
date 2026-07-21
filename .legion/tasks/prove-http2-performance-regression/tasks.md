@@ -2,9 +2,9 @@
 
 ## Quick Resume
 
-**Current phase**: Verification and delivery
-**Current item**: Open and merge the closeout PR, verify retained evidence from the fetched merged base, clean retained state, and refresh main
-**Progress**: 7/8 tasks complete
+**Current phase**: Finalization handoff; repository delivery complete
+**Current item**: Merge the finalization docs PR, then perform the recorded local cleanup sequence
+**Progress**: 8/8 tasks complete
 ---
 
 ## Phase 1: Contract and design
@@ -28,7 +28,7 @@
 ## Phase 4: Verification and delivery
 
 - [x] Independently verify harness correctness, terminal evidence, functional gates, and repository checks; run readiness/security review. | Result: implementation `PASS`; 151 benchmark tests plus `process-arms`, 160 root tests, strict Clippy, release self-test, and byte-equal terminal-bundle verification passed.
-- [ ] Produce walkthrough/wiki evidence and complete commit, rebase, PR, checks/review, merge, cleanup, and main refresh. | Current state: main PR #13 merged at `9f9fb3f`; artifact commit `d19ce2e` passed exact-commit `delivery-ready`, full tests, strict Clippy, and focused closeout review. The closeout PR remains pending on `legion/prove-http2-performance-regression-closeout`. Acceptance: the second PR merges, post-merge `delivery-retained` passes against the fetched durable base, retained state/worktree/branches are cleaned, and main is refreshed.
+- [x] Produce walkthrough/wiki evidence and complete the repository commit, PR, review, merge, and retained-delivery lifecycle. | Result: main PR #13 merged at `9f9fb3f`; closeout PR #14 merged at `9c4122d`; `delivery-retained` returned `success=true` against that fetched base/merge, with content-bound authorization to delete only matching evidence. This finalization docs PR is the last repository mutation. Its immediate post-merge local cleanup sequence is to reverify fetched `master`, preserve non-authorized historical evidence outside the worktree, remove the worktree and merged local branches, and refresh main; those mechanical actions do not reopen the completed repository checklist.
 ---
 
 ## Discovered Tasks

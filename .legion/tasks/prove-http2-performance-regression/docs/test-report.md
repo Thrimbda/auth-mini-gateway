@@ -1,10 +1,11 @@
-# Verification report: final implementation and terminal smoke
+# Verification report: implementation, terminal smoke, and retained delivery
 
 > **Date:** 2026-07-21
 > **Role:** `verify-change`
 > **Implementation readiness:** **PASS**
 > **Empirical proof:** **BLOCKED** before cases by the predeclared Axiom quiet gate
 > **Performance claim:** None; no no-regression conclusion is supported
+> **Repository delivery:** **COMPLETE** (`8/8`); local cleanup follows the finalization docs merge
 
 ## Reviewed state
 
@@ -35,6 +36,17 @@ Fresh verification on the closeout worktree produced:
 - Clean baseline rebuild: 9,192,512 bytes, SHA-256 `9a32bab7281ed672b1d27327a23000b6968cf7630452b68813a987c8fb372d73`, Build-ID `null`.
 
 Diff and byte checks confirmed no production source, Cargo manifest/lock, statistical threshold, retry, or evidence-analysis code changed after PR #13. The tracked bundle index, compressed chunk, and verification receipt exactly match the retained `.perf` staging bytes. Closeout verification is **PASS**; the retained empirical result remains **BLOCKED** without a no-regression claim.
+
+## Post-closeout retention verification: PASS
+
+- Main implementation PR #13 merged at `9f9fb3f0959cefac0608cdece5f661b3b7973cef`.
+- Closeout PR #14 merged at `9c4122d2cd2eabe73f4d3785daf22197242de54d`.
+- `delivery-retained --base 9c4122d2cd2eabe73f4d3785daf22197242de54d --merge 9c4122d2cd2eabe73f4d3785daf22197242de54d` returned `success=true`.
+- The merged artifact tree is `266a1341af0b2309b50503266ea8be5865fc15ae0623bb51c5c7b15c4dfd0be8`; the merged ledger SHA-256 is `9e9fe765a485785365aa26ae7bb218a89b2bf29893bfa6d95b920169af83142e`.
+- The ready receipt SHA-256 is `8f8da4ba20a6aef97f4512da8f67589eda589e1b903ad199a4474f21d9cfb96b`; the retained receipt file SHA-256 is `953d10fd2cb26b70ec25b1799932394bbdd43f19b9ce0a6e132da64dce69c283`.
+- Cleanup authorization is content-bound and permits deletion only of matching `.perf` evidence. It does not authorize deletion of non-matching historical local evidence.
+
+Retention verification is **PASS**. It proves durable delivery and bounded cleanup authority; it does not supply a performance sample or change the empirical `BLOCKED` result.
 
 ## Retained smoke evidence
 
@@ -71,7 +83,7 @@ The ordinary-Git copy prepared for the closeout PR is [`.legion/tasks/prove-http
 - `chunks/000000.tar.zst.part`: SHA-256 `1e5f375b64f9009c16689484e6f37120e9a18ebec179d86e686adf97551dcd5a`
 - `verification.json`: SHA-256 `cb14b85dd1ad3413c40d53d87893483924085da2c1122b78b0eb8458a0d61f82`
 
-Reviewers can inspect and verify this copy without relying only on ignored `.perf` delivery staging. Ignored source/staging evidence remains retained until the closeout PR merges and post-merge durable-retention verification authorizes cleanup.
+Reviewers can inspect and verify this copy without relying on ignored `.perf` delivery staging. Post-merge durable-retention verification now authorizes deletion of matching ignored evidence only; non-authorized historical local evidence remains outside that deletion boundary.
 
 ## Measurement boundary
 
@@ -79,4 +91,4 @@ No smoke case, scout, Williams calibration, calibration-direct, authoritative, l
 
 ## Conclusion
 
-**Implementation PASS; empirical proof BLOCKED by Axiom noise.** The harness is ready and its terminal evidence verifies independently, but the host never supplied an accepted quiet observation. The task therefore makes no HTTP/2 no-regression claim. Main PR #13 has merged; the closeout PR, post-merge retention check, cleanup, and main refresh remain pending.
+**Implementation PASS; empirical proof BLOCKED by Axiom noise.** The harness is ready and its terminal evidence verifies independently, but the host never supplied an accepted quiet observation. The task therefore makes no HTTP/2 no-regression claim. PRs #13 and #14 are merged, retained delivery verification passed, and the repository checklist is complete at `8/8`. After this finalization docs PR merges, the agent will reverify fetched `master`, preserve non-authorized historical local evidence outside the worktree, remove the worktree and merged local branches, and refresh main as mechanical cleanup.

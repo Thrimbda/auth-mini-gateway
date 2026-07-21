@@ -89,3 +89,12 @@
 - Fresh verification passed all 160 root tests, all 151 nested benchmark tests plus `process-arms`, and strict Clippy. Focused closeout review records **PASS** with no remaining finding.
 - The closeout PR is still pending. After it merges, the remaining order is fetched-base `delivery-retained`, authorized retained-state/worktree/branch cleanup, and main-workspace refresh.
 - Conclusion unchanged: implementation `PASS`, empirical proof `BLOCKED`, and no performance or no-regression claim.
+
+## 2026-07-21 - Closeout merged and retained delivery verified
+
+- Closeout PR [#14](https://github.com/Thrimbda/auth-mini-gateway/pull/14) merged at `9c4122d2cd2eabe73f4d3785daf22197242de54d` after main implementation PR #13 merged at `9f9fb3f0959cefac0608cdece5f661b3b7973cef`.
+- `delivery-retained --base 9c4122d2cd2eabe73f4d3785daf22197242de54d --merge 9c4122d2cd2eabe73f4d3785daf22197242de54d` returned `success=true`.
+- Retention revalidated artifact tree `266a1341af0b2309b50503266ea8be5865fc15ae0623bb51c5c7b15c4dfd0be8`, ledger `9e9fe765a485785365aa26ae7bb218a89b2bf29893bfa6d95b920169af83142e`, and ready receipt SHA-256 `8f8da4ba20a6aef97f4512da8f67589eda589e1b903ad199a4474f21d9cfb96b`. The retained receipt file SHA-256 is `953d10fd2cb26b70ec25b1799932394bbdd43f19b9ce0a6e132da64dce69c283`.
+- Cleanup authorization is content-bound to the fetched base, merge, artifact tree, ledger, and retained entries. It permits deletion only of matching `.perf` evidence; non-authorized historical local evidence must be preserved.
+- Repository delivery is complete at `8/8`. This finalization docs PR is the last repository mutation. Immediately after it merges, re-fetch `master`, rerun retained verification against that fetched commit, preserve non-authorized historical evidence outside the worktree, remove the worktree and merged local branches, and refresh main.
+- The post-merge actions are mechanical local cleanup, not further empirical verification. Conclusion remains implementation `PASS`, empirical proof `BLOCKED`, and no performance or no-regression claim.
