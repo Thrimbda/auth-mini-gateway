@@ -571,11 +571,14 @@ pub fn verify_clean_scratch_rebuild(
     if !scratch.starts_with(&repository) {
         return Err(Error::new("clean rebuild scratch escaped repository"));
     }
-    let source = scratch.join("source");
-    let vendor = scratch.join("vendor");
-    let cargo_home = scratch.join("cargo-home");
-    let target = scratch.join("target");
-    let temporary = scratch.join("tmp");
+    let original_object_root = repository.join(&manifest.object_relative_path);
+    let rebuild_root = equal_length_rebuild_root(&scratch, &original_object_root)?;
+    create_private_dir(&rebuild_root)?;
+    let source = rebuild_root.join("source");
+    let vendor = rebuild_root.join("vendor");
+    let cargo_home = rebuild_root.join("cargo-home");
+    let target = rebuild_root.join("target");
+    let temporary = rebuild_root.join("tmp");
     for directory in [&source, &vendor, &cargo_home, &target, &temporary] {
         create_private_dir(directory)?;
     }
@@ -618,7 +621,7 @@ pub fn verify_clean_scratch_rebuild(
         &cargo_home,
         &external_cargo_home,
         &temporary,
-        &scratch,
+        &rebuild_root,
     )?;
     validate_registry_cache_inputs(&external_cargo_home, &manifest.registry_cache_inputs)?;
     let vendor_entries = tree_entries(&vendor)?;
@@ -648,13 +651,15 @@ pub fn verify_clean_scratch_rebuild(
         &cargo_home,
         &target,
         &temporary,
-        &scratch,
+        &rebuild_root,
     )?;
     let binary = fs::read(target.join("release/auth-mini-gateway"))?;
     let binary_bytes = u64::try_from(binary.len())
         .map_err(|_| Error::new("clean rebuild binary length exceeds u64"))?;
-    let binary_sha256 = sha256_hex(&binary);
-    let build_id = elf_build_id(&binary);
+    let relocated_binary =
+        relocate_equal_length_path(&binary, &rebuild_root, &original_object_root)?;
+    let binary_sha256 = sha256_hex(&relocated_binary);
+    let build_id = elf_build_id(&relocated_binary);
     if binary_bytes != manifest.binary_bytes
         || binary_sha256 != manifest.binary_sha256
         || build_id != manifest.elf_build_id
@@ -674,6 +679,69 @@ pub fn verify_clean_scratch_rebuild(
         binary_sha256,
         elf_build_id: build_id,
     })
+}
+
+fn equal_length_rebuild_root(scratch: &Path, sealed_root: &Path) -> Result<PathBuf> {
+    let scratch = scratch
+        .to_str()
+        .ok_or_else(|| Error::new("clean rebuild scratch path is not UTF-8"))?;
+    let sealed = sealed_root
+        .to_str()
+        .ok_or_else(|| Error::new("sealed build root path is not UTF-8"))?;
+    let component_length = sealed
+        .len()
+        .checked_sub(scratch.len().saturating_add(1))
+        .ok_or_else(|| Error::new("clean rebuild scratch path cannot match sealed root length"))?;
+    if !(1..=255).contains(&component_length) {
+        return Err(Error::new(
+            "clean rebuild path padding exceeds one filesystem component",
+        ));
+    }
+    let root = PathBuf::from(scratch).join("r".repeat(component_length));
+    if root.as_os_str().len() != sealed_root.as_os_str().len() {
+        return Err(Error::new(
+            "clean rebuild root length does not match sealed root",
+        ));
+    }
+    Ok(root)
+}
+
+fn relocate_equal_length_path(bytes: &[u8], from: &Path, to: &Path) -> Result<Vec<u8>> {
+    let from = from
+        .to_str()
+        .ok_or_else(|| Error::new("clean rebuild root is not UTF-8"))?
+        .as_bytes();
+    let to = to
+        .to_str()
+        .ok_or_else(|| Error::new("sealed build root is not UTF-8"))?
+        .as_bytes();
+    if from.len() != to.len() {
+        return Err(Error::new("relocated build roots have different lengths"));
+    }
+    let mut output = bytes.to_vec();
+    let mut offset = 0_usize;
+    let mut replacements = 0_u64;
+    while let Some(relative) = output[offset..]
+        .windows(from.len())
+        .position(|window| window == from)
+    {
+        let start = offset
+            .checked_add(relative)
+            .ok_or_else(|| Error::new("binary path relocation offset overflow"))?;
+        output[start..start + from.len()].copy_from_slice(to);
+        offset = start
+            .checked_add(from.len())
+            .ok_or_else(|| Error::new("binary path relocation offset overflow"))?;
+        replacements = replacements
+            .checked_add(1)
+            .ok_or_else(|| Error::new("binary path relocation count overflow"))?;
+    }
+    if replacements == 0 {
+        return Err(Error::new(
+            "clean rebuild binary contains no relocatable build-root path",
+        ));
+    }
+    Ok(output)
 }
 
 fn relocated_cargo_config_sha256(
