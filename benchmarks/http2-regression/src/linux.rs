@@ -765,6 +765,14 @@ pub fn preflight(repository: &Path, observation: Duration) -> Result<HostPreflig
 
 pub fn observe_quiet_exact() -> Result<crate::raw::QuietEvidence> {
     let pid = std::process::id();
+    let tids = task_ids(pid)?;
+    if tids.is_empty() {
+        return Err(Error::new("orchestrator has no persistent TID for Q_obs"));
+    }
+    for (index, tid) in tids.into_iter().enumerate() {
+        let cpu = CONTROL_CPUS[index % CONTROL_CPUS.len()];
+        set_affinity(tid, &[cpu])?;
+    }
     let frozen = quiet_thread_snapshot(pid)?;
     let orchestrator_threads = frozen
         .values()
