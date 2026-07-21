@@ -652,6 +652,7 @@ pub fn verify_clean_scratch_rebuild(
         &target,
         &temporary,
         &rebuild_root,
+        Some((&rebuild_root, &original_object_root)),
     )?;
     let binary = fs::read(target.join("release/auth-mini-gateway"))?;
     let binary_bytes = u64::try_from(binary.len())
@@ -1071,6 +1072,7 @@ fn derive_gateway_build(
         &target,
         &temporary,
         object_root,
+        None,
     )?;
     let produced = target.join("release").join("auth-mini-gateway");
     let produced_metadata = fs::symlink_metadata(&produced)
@@ -1523,6 +1525,7 @@ fn vendor_dependencies(
     Ok(())
 }
 
+#[allow(clippy::too_many_arguments)]
 fn build_release(
     cargo: &Path,
     rustc: &Path,
@@ -1531,9 +1534,11 @@ fn build_release(
     target: &Path,
     temporary: &Path,
     working_directory: &Path,
+    remap: Option<(&Path, &Path)>,
 ) -> Result<()> {
     let path = std::env::var_os("PATH").ok_or_else(|| Error::new("PATH is not set"))?;
-    let status = Command::new(cargo)
+    let mut command = Command::new(cargo);
+    command
         .current_dir(working_directory)
         .args([
             "build",
@@ -1556,7 +1561,18 @@ fn build_release(
         .env("TMPDIR", temporary)
         .stdin(Stdio::null())
         .stdout(Stdio::null())
-        .stderr(Stdio::piped())
+        .stderr(Stdio::piped());
+    if let Some((from, to)) = remap {
+        command.env(
+            "RUSTFLAGS",
+            format!(
+                "--remap-path-prefix={}={}",
+                from.to_string_lossy(),
+                to.to_string_lossy()
+            ),
+        );
+    }
+    let status = command
         .output()
         .context("offline frozen release gateway build")?;
     if !status.status.success() {
