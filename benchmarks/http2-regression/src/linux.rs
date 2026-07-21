@@ -794,9 +794,7 @@ pub fn observe_quiet_exact() -> Result<crate::raw::QuietEvidence> {
     loop {
         let start_ns = clock_ns(ClockKind::Monotonic)?;
         if start_ns.saturating_sub(search_start_ns) > 120_000_000_000 {
-            return Err(Error::new(
-                "Q_obs did not find a clean interval within 120 seconds of Q_extra",
-            ));
+            return finish_quiet_search(search_start_ns, orchestrator_threads, candidates);
         }
         let end_ns = start_ns
             .checked_add(10_000_000_000)
@@ -921,30 +919,38 @@ pub fn observe_quiet_exact() -> Result<crate::raw::QuietEvidence> {
         let accepted = candidate.accepted;
         candidates.push(candidate);
         if accepted {
-            let final_candidate = candidates
-                .last()
-                .ok_or_else(|| Error::new("Q_obs accepted candidate vanished"))?;
-            let evidence = crate::raw::QuietEvidence {
-                schema: "amg-http2-perf/quiet/v2".to_owned(),
-                clock: "CLOCK_MONOTONIC".to_owned(),
-                start_ns: final_candidate.start_ns,
-                end_ns: final_candidate.end_ns,
-                q_extra_ns: final_candidate.start_ns.saturating_sub(search_start_ns),
-                cpu_psi_some_us: final_candidate.cpu_psi_some_us,
-                memory_psi_full_us: final_candidate.memory_psi_full_us,
-                io_psi_full_us: final_candidate.io_psi_full_us,
-                swap_in_delta: final_candidate.swap_in_delta,
-                swap_out_delta: final_candidate.swap_out_delta,
-                steal_ticks_delta: final_candidate.steal_ticks_delta,
-                external_time_clean: final_candidate.external_time_clean(),
-                search_start_ns,
-                orchestrator_threads,
-                candidates,
-            };
-            evidence.validate()?;
-            return Ok(evidence);
+            return finish_quiet_search(search_start_ns, orchestrator_threads, candidates);
         }
     }
+}
+
+fn finish_quiet_search(
+    search_start_ns: u64,
+    orchestrator_threads: Vec<crate::raw::QuietOrchestratorThread>,
+    candidates: Vec<crate::raw::QuietCandidateEvidence>,
+) -> Result<crate::raw::QuietEvidence> {
+    let final_candidate = candidates
+        .last()
+        .ok_or_else(|| Error::new("Q_obs candidate inventory vanished"))?;
+    let evidence = crate::raw::QuietEvidence {
+        schema: "amg-http2-perf/quiet/v2".to_owned(),
+        clock: "CLOCK_MONOTONIC".to_owned(),
+        start_ns: final_candidate.start_ns,
+        end_ns: final_candidate.end_ns,
+        q_extra_ns: final_candidate.start_ns.saturating_sub(search_start_ns),
+        cpu_psi_some_us: final_candidate.cpu_psi_some_us,
+        memory_psi_full_us: final_candidate.memory_psi_full_us,
+        io_psi_full_us: final_candidate.io_psi_full_us,
+        swap_in_delta: final_candidate.swap_in_delta,
+        swap_out_delta: final_candidate.swap_out_delta,
+        steal_ticks_delta: final_candidate.steal_ticks_delta,
+        external_time_clean: final_candidate.external_time_clean(),
+        search_start_ns,
+        orchestrator_threads,
+        candidates,
+    };
+    evidence.validate()?;
+    Ok(evidence)
 }
 
 fn quiet_thread_snapshot(pid: u32) -> Result<BTreeMap<u32, ProcStat>> {

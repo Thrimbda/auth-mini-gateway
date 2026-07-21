@@ -207,8 +207,7 @@ impl QuietEvidence {
             .candidates
             .last()
             .ok_or_else(|| Error::new("quiet candidate inventory is empty"))?;
-        if !accepted.accepted
-            || self.start_ns != accepted.start_ns
+        if self.start_ns != accepted.start_ns
             || self.end_ns != accepted.end_ns
             || self.q_extra_ns != accepted.start_ns.saturating_sub(self.search_start_ns)
             || self.cpu_psi_some_us != accepted.cpu_psi_some_us
@@ -228,7 +227,12 @@ impl QuietEvidence {
 
     #[must_use]
     pub fn clean(&self) -> bool {
-        self.cpu_psi_some_us <= 50_000
+        (self.schema == "amg-http2-perf/quiet/v1"
+            || self
+                .candidates
+                .last()
+                .is_some_and(|candidate| candidate.accepted))
+            && self.cpu_psi_some_us <= 50_000
             && self.memory_psi_full_us == 0
             && self.io_psi_full_us == 0
             && self.swap_in_delta == 0

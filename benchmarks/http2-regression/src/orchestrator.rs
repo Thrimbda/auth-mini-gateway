@@ -4583,6 +4583,30 @@ async fn smoke_all_mode(
     let quiet = crate::linux::observe_quiet_exact()?;
     quiet.validate()?;
     json::write_new_canonical(&root.join("quiet.json"), &quiet)?;
+    if !quiet.clean() {
+        let error = Error::new("Q_obs did not find a clean interval within 120 seconds of Q_extra");
+        retain_failed_smoke(
+            repository,
+            &root,
+            &run_id,
+            monotonic_start_ns,
+            monotonic_deadline_ns,
+            &builds,
+            &harness_binary_sha256,
+            &build_set_sha256,
+            Vec::new(),
+            SmokeCaseKey {
+                kind: SmokeKind::Gateway,
+                concurrency: 1,
+                workload: Workload::Get,
+                arm: Some(Arm::B11),
+                direct_protocol: None,
+            },
+            &error,
+            standalone,
+        )?;
+        return Err(error);
+    }
     let cases_root = root.join("smoke-cases");
     fs::create_dir(&cases_root)?;
     set_mode(&cases_root, 0o700)?;
