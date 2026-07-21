@@ -19,3 +19,9 @@
 - Keep `TRUSTED_PROXY_CIDRS` empty until Axiom proves the exact frpc direct peer and Acorn proves one-value `$remote_addr` XFF overwrite; then enable only the observed CIDR and repeat non-influence checks.
 - Run native maintenance-deny, hardened underscore, and old-binary rollback probes before relying on the checked nginx rollback artifact.
 - Expand structured proxy/admission observability toward the RFC recommendations without logging URI, Host, identity, cookies, tokens, upstream values, or raw transport errors.
+
+## HTTP/2 performance proof follow-up
+
+- Treat exact-candidate smoke `cal-smoke-91bb210cbf67-b2297c713de2` as terminal `BLOCKED`: do not retry it, change thresholds, or convert the absence of samples into a no-regression claim.
+- Preserve partial unsealed root `cal-smoke-743fa30d7371-a03fd3cf021e` and the sealed terminal evidence until the delivery lifecycle authorizes cleanup.
+- Complete commit/rebase, PR checks and review, merge, and main refresh; run `delivery-ready` on the committed artifact and `delivery-retained` after merge before cleaning ignored benchmark evidence.

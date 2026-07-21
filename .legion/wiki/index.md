@@ -2,6 +2,7 @@
 
 ## Current Task Summaries
 
+- [prove-http2-performance-regression](tasks/prove-http2-performance-regression.md): implementation PASS; exact-candidate empirical proof BLOCKED before sampling by Axiom noise, with no no-regression claim and only delivery lifecycle closure pending.
 - [enable-http2-proxy](tasks/enable-http2-proxy.md): ALPN-authoritative HTTPS H2, explicit cleartext protocol selection, no-replay multiplexing, and RFC 8441 capability monitoring.
 - [harden-proxy-production-boundaries](tasks/harden-proxy-production-boundaries.md): bound downstream/upstream/resolver lifetimes, harden proxy header and forwarding trust, and make Acorn/FRP rollout executable.
 - [authenticated-reverse-proxy](tasks/authenticated-reverse-proxy.md): optional fixed-upstream authenticated streaming proxy while preserving the nginx `auth_request` adapter mode.

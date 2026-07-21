@@ -119,3 +119,17 @@ For a known nginx-to-FRP-to-gateway chain:
 - accept one strict bare IP only, remove every inbound forwarding field, and regenerate one canonical value
 - keep client IP out of authentication, authorization, session, return-target, route, DNS, TLS, and pool interfaces
 - verify that varying accepted XFF changes only the application metadata header and never logs the raw value
+
+## Durable benchmark-evidence delivery pattern
+
+For long-running evidence whose measured state must be sealed before derived artifacts are published:
+
+- separate immutable evidence sealing from terminal outcome publication
+- persist a write-once, hash-chained delivery transaction and make every post-seal phase idempotently resumable
+- evaluate exact storage and retention caps before publishing the outcome-bearing ledger, then revalidate the complete current closure whenever reading a sealed outcome
+- derive committed acceptance from committed bundle bytes plus explicit Git/toolchain/dependency inputs, never from ignored execution caches
+- bind postmerge retention and cleanup authorization to fetched commit reachability, the committed receipt, merged tree and ledger hashes, and every retained content identity
+- compute prospective storage from the exact reached branch and persist raw, archive, compression, reconstruction, recompression, coexistence, reserve, free-space, and tracked-cap terms before each phase
+- retain every candidate from a bounded environmental search, including a terminal dirty candidate; structural validity must permit sealing the failure while cleanliness still requires an independently accepted observation
+- stop before measured cases when a predeclared environmental gate fails; do not retry, weaken thresholds, or infer a performance result from the absence of samples
+- preserve partial unsealed attempts for provenance only, and base reviewer claims exclusively on complete seals whose deterministic bundles reconstruct and re-encode byte-for-byte under independent verification
