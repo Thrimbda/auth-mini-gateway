@@ -10,6 +10,20 @@
 
 None. The focused changes do not create a false-PASS or evidence-retention path. The preceding implementation-readiness **PASS** remains valid.
 
+## Closeout review: PASS
+
+**Scope:** commits `2ab0fc2` through `d19ce2e`, the tracked artifact ledger added after merged PR #13, and exact-commit `delivery-ready` verification at `d19ce2e8083111ec5989d11225809ed09597c6ac`. The security lens was applied to receipt identity, committed-evidence integrity, dependency provenance, and clean-build reproducibility.
+
+No blocking or non-blocking finding remains.
+
+- Verifier portability does not normalize evidence-derived content. `verify_artifact_tree` freshly verifies the index, chunks, canonical reconstruction, exact recompression, seal, intent, terminal state, and receipt fields, then substitutes only the stored `verifier_executable_sha256` before exact receipt comparison (`benchmarks/http2-regression/src/delivery.rs:693-759`). The stored executable hash remains a validated non-placeholder SHA-256 bound by the canonical stored receipt and ledger (`benchmarks/http2-regression/src/bundle.rs:213-265`, `1486-1551`). Exact artifact-commit verifier source is separately required before `delivery-ready` succeeds (`benchmarks/http2-regression/src/delivery.rs:577-623`, `909-958`).
+- The clean Cargo config is accepted only after the generated scratch vendor path occurs exactly once, is replaced with the sealed vendor path, and the complete resulting config hash equals the sealed manifest (`benchmarks/http2-regression/src/build.rs:635-644`, `739-758`). This preserves the existing frozen/offline, exact toolchain, vendor-tree, and registry-cache checks rather than accepting an alternate config.
+- Each rebuild uses a fresh repository-local scratch directory and a one-component rebuild root whose byte length exactly matches the sealed object root (`benchmarks/http2-regression/src/build.rs:554-585`, `685-708`). The scratch compilation remaps that root to the sealed root; any remaining equal-length path bytes are normalized, after which the complete binary length, SHA-256, and parsed ELF Build-ID value must equal the sealed manifest (`benchmarks/http2-regression/src/build.rs:647-681`, `710-737`, `1519-1573`). Allowing zero post-build replacements at `d19ce2e` is correct when compile-time remapping already removed every scratch-root occurrence; it does not weaken the full-file comparison.
+- Fresh `delivery-ready --commit d19ce2e8083111ec5989d11225809ed09597c6ac` returned `success=true`, artifact tree `266a1341af0b2309b50503266ea8be5865fc15ae0623bb51c5c7b15c4dfd0be8`, ledger `9e9fe765a485785365aa26ae7bb218a89b2bf29893bfa6d95b920169af83142e`, and verifier source tree `9c7fa8c0ca437a7f3bf54cae7a4290b4520dbc9c`. Clean rebuilds reproduced candidate binary `6f1dc2713d99cd65ac478c718b4ebaeef7b4a45241913d69434af69e5704cf4d` and baseline binary `9a32bab7281ed672b1d27327a23000b6968cf7630452b68813a987c8fb372d73`; both sealed Build-ID values are `null`, and equality was preserved.
+- Scope is clean. Since PR #13, tracked changes are limited to closeout docs/wiki, the new ordinary-Git evidence copy and ledger, and benchmark-only `build.rs`/`delivery.rs`. Production code, Cargo manifests/locks, statistical code, retry behavior, and thresholds are unchanged. The tracked bundle index, chunk, and verification receipt are byte-for-byte identical to their retained `.perf` staging sources.
+
+**Closeout decision: PASS.** Commit `d19ce2e` is delivery-ready. The empirical outcome remains terminal `BLOCKED`, and no performance or no-regression claim is authorized.
+
 ## Focused review
 
 ### 1. Dirty quiet-search retention: PASS

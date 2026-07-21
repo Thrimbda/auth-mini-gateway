@@ -24,4 +24,4 @@
 
 - Treat exact-candidate smoke `cal-smoke-91bb210cbf67-b2297c713de2` as terminal `BLOCKED`: do not retry it, change thresholds, or convert the absence of samples into a no-regression claim.
 - Preserve partial unsealed root `cal-smoke-743fa30d7371-a03fd3cf021e` and the sealed terminal evidence until the delivery lifecycle authorizes cleanup.
-- Complete commit/rebase, PR checks and review, merge, and main refresh; run `delivery-ready` on the committed artifact and `delivery-retained` after merge before cleaning ignored benchmark evidence.
+- Main implementation PR #13 is merged, and artifact commit `d19ce2e` passed `delivery-ready`, full tests, strict Clippy, and focused closeout review. The closeout PR is still pending; after it merges, run `delivery-retained` against the fetched durable base before cleaning ignored benchmark evidence, removing the worktree/branches, or refreshing main.

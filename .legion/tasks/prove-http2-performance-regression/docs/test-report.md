@@ -22,6 +22,20 @@
 
 Implementation readiness is **PASS**.
 
+## Closeout verification at `d19ce2e`: PASS
+
+Fresh verification on the closeout worktree produced:
+
+- `cargo test --locked --offline` at the repository root: 110 unit and 50 integration tests passed.
+- `cargo test --locked --offline` in `benchmarks/http2-regression`: 126 unit and 25 integration tests passed, plus `process-arms: PASS`. A first run made concurrently with the root suite had one transient `spawned role cycle changed after freeze` failure; the exact test then passed, followed by two complete isolated benchmark-suite passes.
+- `cargo clippy --locked --offline --all-targets --all-features -- -D warnings`: passed at both the repository root and benchmark package.
+- `cargo build --release --locked --offline` for the benchmark verifier: passed.
+- `delivery-ready --commit d19ce2e8083111ec5989d11225809ed09597c6ac`: `success=true` with committed artifact tree `266a1341af0b2309b50503266ea8be5865fc15ae0623bb51c5c7b15c4dfd0be8`, ledger `9e9fe765a485785365aa26ae7bb218a89b2bf29893bfa6d95b920169af83142e`, and exact verifier source tree `9c7fa8c0ca437a7f3bf54cae7a4290b4520dbc9c`.
+- Clean candidate rebuild: 11,213,072 bytes, SHA-256 `6f1dc2713d99cd65ac478c718b4ebaeef7b4a45241913d69434af69e5704cf4d`, Build-ID `null`.
+- Clean baseline rebuild: 9,192,512 bytes, SHA-256 `9a32bab7281ed672b1d27327a23000b6968cf7630452b68813a987c8fb372d73`, Build-ID `null`.
+
+Diff and byte checks confirmed no production source, Cargo manifest/lock, statistical threshold, retry, or evidence-analysis code changed after PR #13. The tracked bundle index, compressed chunk, and verification receipt exactly match the retained `.perf` staging bytes. Closeout verification is **PASS**; the retained empirical result remains **BLOCKED** without a no-regression claim.
+
 ## Retained smoke evidence
 
 ### First exact implementation checkpoint
@@ -49,10 +63,20 @@ The unchanged contract requires immediate `BLOCKED`; it permits no retry and no 
 
 The verifier independently reconstructed and re-encoded the bundle byte-for-byte. Its nonzero command status reflects the retained non-PASS terminal, not verification failure.
 
+## Tracked terminal artifact
+
+The ordinary-Git copy prepared for the closeout PR is [`.legion/tasks/prove-http2-performance-regression/artifacts/cal-smoke-91bb210cbf67-b2297c713de2/`](../artifacts/cal-smoke-91bb210cbf67-b2297c713de2/):
+
+- `bundle-index.json`: SHA-256 `681d6fa1c8c28dfe0a666dae13dcffca970cf7d09d923441d2c9b4c2f1ad35e0`
+- `chunks/000000.tar.zst.part`: SHA-256 `1e5f375b64f9009c16689484e6f37120e9a18ebec179d86e686adf97551dcd5a`
+- `verification.json`: SHA-256 `cb14b85dd1ad3413c40d53d87893483924085da2c1122b78b0eb8458a0d61f82`
+
+Reviewers can inspect and verify this copy without relying only on ignored `.perf` delivery staging. Ignored source/staging evidence remains retained until the closeout PR merges and post-merge durable-retention verification authorizes cleanup.
+
 ## Measurement boundary
 
 No smoke case, scout, Williams calibration, calibration-direct, authoritative, latency, throughput, CPU/op, RSS, confidence-interval, or performance-verdict sample was produced by the final candidate run. With no confirmed performance regression, remediation was not needed and no production change was attempted.
 
 ## Conclusion
 
-**Implementation PASS; empirical proof BLOCKED by Axiom noise.** The harness is ready and its terminal evidence verifies independently, but the host never supplied an accepted quiet observation. The task therefore makes no HTTP/2 no-regression claim. The delivery lifecycle remains pending.
+**Implementation PASS; empirical proof BLOCKED by Axiom noise.** The harness is ready and its terminal evidence verifies independently, but the host never supplied an accepted quiet observation. The task therefore makes no HTTP/2 no-regression claim. Main PR #13 has merged; the closeout PR, post-merge retention check, cleanup, and main refresh remain pending.

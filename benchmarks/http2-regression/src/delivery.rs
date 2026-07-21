@@ -722,7 +722,9 @@ fn verify_artifact_tree(
             &artifact_root.join(&entry.verification_path),
             JSON_MAX_BYTES,
         )?;
-        if stored != receipt
+        let mut portable_receipt = receipt.clone();
+        portable_receipt.verifier_executable_sha256 = stored.verifier_executable_sha256.clone();
+        if stored != portable_receipt
             || sha256_hex(&json::canonical_bytes(&stored)?) != entry.verification_sha256
         {
             return Err(Error::new(
