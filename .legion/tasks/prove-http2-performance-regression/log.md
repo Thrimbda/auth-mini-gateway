@@ -60,3 +60,14 @@
 - The release harness completed the exact C1/C64 matrix in 152.724 seconds: 50 gateway cases plus four direct controls, all 54 with semantic class `ok` and no terminal integrity failure.
 - Provisional smoke `cal-smoke-50028c5f6764-84f0174d30b7` has seal root `8e14bd90bc85ac0eca1b2218a4f90e21cf22f49ce45e340c36190e302ce26c01`; bundle index SHA-256 `51767bce233c5adcc38f14cfda1774c45f83c2c221f56b63b0af59140f87fbb7` independently reconstructs and recompresses byte-for-byte.
 - This smoke proves topology only and used the pre-commit harness candidate. No performance sample or non-regression claim exists yet. Commit the final harness, rerun smoke against that exact Git object, then enter scout/calibration only if all gates remain clean.
+
+## 2026-07-21 - Implementation passed; empirical proof blocked
+
+- Implementation checkpoints are `743fa30`, `0017c9d`, and final candidate `91bb210cbf6703e1f3258b517cee1acfd337da79`.
+- Final implementation review passed with no open finding. Verification passed 151 benchmark tests plus `process-arms`, 160 root tests, strict Clippy, and the release self-test.
+- The first exact-`743fa30` smoke exposed missing quiet-failure retention. Its partial unsealed root `cal-smoke-743fa30d7371-a03fd3cf021e` remains preserved and was not used for any claim.
+- Exact-candidate smoke `cal-smoke-91bb210cbf67-b2297c713de2` reached terminal `BLOCKED` before running a case: 12 consecutive 10-second `Q_obs` candidates produced zero accepted observations and `q_extra=110002598526ns`.
+- The persistent orchestrator inventory remained stable. External logical-CPU activity was approximately 38%-81%, and I/O PSI `full` was nonzero. The contract permits neither a retry nor a threshold change.
+- The terminal source seal root is `a78786cedf214fcff3fe779fa985bfdcc3eb203d007945dcac6e29f02d3e3e0e`; bundle index SHA-256 is `681d6fa1c8c28dfe0a666dae13dcffca970cf7d09d923441d2c9b4c2f1ad35e0`. Independent verification returned `success=true`, `byte_equal=true`, and terminal `BLOCKED`.
+- No scout, calibration, authoritative, or performance-verdict sample was produced. No production change or regression remediation was attempted.
+- Main conclusion: implementation readiness is `PASS`, but empirical proof is `BLOCKED` by Axiom host noise; therefore this task makes no no-regression claim. Only the delivery lifecycle remains.

@@ -2,9 +2,9 @@
 
 ## Quick Resume
 
-**Current phase**: Measurement and remediation
-**Current item**: Run C64 smoke, scout, calibration, and the authoritative matrix
-**Progress**: 4/8 tasks complete
+**Current phase**: Verification and delivery
+**Current item**: Complete the commit, PR, retention, merge, cleanup, and main-refresh lifecycle
+**Progress**: 7/8 tasks complete
 ---
 
 ## Phase 1: Contract and design
@@ -21,13 +21,13 @@
 
 ## Phase 3: Measurement and remediation
 
-- [ ] Run the authoritative 30-100-pair H1 and H2 matrix on the current machine. | Acceptance: immutable raw results and a complete scenario report produce PASS, FAIL, or honest BLOCKED without selective omission.
-- [ ] Fix confirmed regressions without weakening safety, then rerun when required. | Acceptance: failing evidence is retained and the final candidate is measured by the complete matrix; mark not-needed if the first run passes.
+- [x] Attempt the authoritative H1 and H2 matrix under its predeclared entry gates. | Result: exact candidate `91bb210` stopped honestly `BLOCKED` before cases when 12 quiet candidates yielded zero accepted observations; no sample was omitted.
+- [x] Fix confirmed regressions without weakening safety, then rerun when required. | Result: not needed; no performance sample, verdict, or confirmed regression existed, and retry or threshold changes were forbidden.
 ---
 
 ## Phase 4: Verification and delivery
 
-- [ ] Independently verify harness correctness, raw statistics, functional gates, and repository checks; run readiness/security review. | Acceptance: test and review artifacts record PASS or a precise blocker.
+- [x] Independently verify harness correctness, terminal evidence, functional gates, and repository checks; run readiness/security review. | Result: implementation `PASS`; 151 benchmark tests plus `process-arms`, 160 root tests, strict Clippy, release self-test, and byte-equal terminal-bundle verification passed.
 - [ ] Produce walkthrough/wiki evidence and complete commit, rebase, PR, checks/review, merge, cleanup, and main refresh. | Acceptance: reviewer artifacts exist and the delivery lifecycle reaches terminal state.
 ---
 
@@ -36,4 +36,4 @@
 (None)
 ---
 
-*Last updated: 2026-07-18*
+*Last updated: 2026-07-21*

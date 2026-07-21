@@ -47,3 +47,11 @@
 - Expanded proxy and lifetime patterns with one-dispatch/no-downgrade behavior, per-exchange H2 capacity, same-connection SETTINGS proof, fixed-memory revocation monitoring, and physical-close ownership.
 - Recorded the pinned Hyper CONNECT behavior, generation-retirement and conservative-capability residuals, missing real-auth fixture, upgrade review gate, and separate production rollout requirement.
 - Recorded PR #11 squash merge `5638fb0` and the completed task lifecycle.
+
+## 2026-07-21
+
+- Added the active `prove-http2-performance-regression` task summary after focused implementation, verification, and review closed findings 4-6.
+- Added the durable benchmark-evidence delivery pattern for resumable post-seal publication, portable commit/retention verification, and exact reached-branch storage admission.
+- Recorded the interim implementation and delivery gates; no performance verdict was claimed.
+- Updated the task after final implementation review closed all findings and exact candidate `91bb210` terminated `BLOCKED` at the Axiom quiet gate before cases.
+- Recorded the independently byte-equal terminal bundle, the prohibition on retry or threshold changes, the absence of performance samples/remediation, and the remaining delivery-only lifecycle.
