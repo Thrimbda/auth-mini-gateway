@@ -23,6 +23,7 @@ pub const REFRESH_TOKEN: &str = "amg-benchmark-synthetic-refresh-token-v1";
 pub const SESSION_TTL_SECONDS: u64 = 604_800;
 pub const ABSOLUTE_TTL_SECONDS: u64 = 2_592_000;
 pub const TOUCH_INTERVAL_SECONDS: u64 = 604_800;
+pub const REFRESH_SKEW_SECONDS: u64 = 60;
 
 type HmacSha256 = Hmac<Sha256>;
 
@@ -49,7 +50,20 @@ pub struct ReadySessionEvidence {
     pub session_ttl_seconds: u64,
     pub absolute_ttl_seconds: u64,
     pub touch_interval_seconds: u64,
+    #[serde(
+        default = "default_refresh_skew_seconds",
+        skip_serializing_if = "is_default_refresh_skew_seconds"
+    )]
+    pub refresh_skew_seconds: u64,
     pub predicates: ReadyPredicates,
+}
+
+const fn default_refresh_skew_seconds() -> u64 {
+    REFRESH_SKEW_SECONDS
+}
+
+const fn is_default_refresh_skew_seconds(value: &u64) -> bool {
+    *value == REFRESH_SKEW_SECONDS
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -157,7 +171,7 @@ pub fn create_ready_session_at(path: &Path, unix_seconds: u64) -> Result<ReadySe
     set_runtime_file_modes(parent)?;
     let cookie_value = sign_cookie_value(SESSION_ID, COOKIE_SECRET)?;
     let database_sha256 = sha256_hex(&fs::read(path)?);
-    let evidence = ReadySessionEvidence {
+    let mut evidence = ReadySessionEvidence {
         schema: SESSION_SCHEMA.to_owned(),
         sqlite_user_version: 2,
         journal_mode: "wal".to_owned(),
@@ -178,19 +192,100 @@ pub fn create_ready_session_at(path: &Path, unix_seconds: u64) -> Result<ReadySe
         session_ttl_seconds: SESSION_TTL_SECONDS,
         absolute_ttl_seconds: ABSOLUTE_TTL_SECONDS,
         touch_interval_seconds: TOUCH_INTERVAL_SECONDS,
+        refresh_skew_seconds: REFRESH_SKEW_SECONDS,
         predicates: ReadyPredicates {
-            ready: true,
-            active: true,
-            access_refresh_due: false,
-            touch_due: false,
+            ready: false,
+            active: false,
+            access_refresh_due: true,
+            touch_due: true,
         },
     };
+    evidence.predicates = ready_predicates_at(&evidence, unix_seconds * 1_000_000_000)?;
     Ok(ReadySessionRuntime {
         database_path: path.to_owned(),
         cookie_header: format!("amg_session={cookie_value}"),
         cookie_value,
         evidence,
     })
+}
+
+pub fn ready_predicates_at(
+    evidence: &ReadySessionEvidence,
+    realtime_ns: u64,
+) -> Result<ReadyPredicates> {
+    let now = realtime_ns / 1_000_000_000;
+    let access_expires = parse_utc_rfc3339_seconds(&evidence.access_expires_at)?;
+    let idle_expires = parse_utc_rfc3339_seconds(&evidence.idle_expires_at)?;
+    let absolute_expires = parse_utc_rfc3339_seconds(&evidence.absolute_expires_at)?;
+    let last_touched = parse_utc_rfc3339_seconds(&evidence.last_touched_at)?;
+    let refresh_boundary = now
+        .checked_add(evidence.refresh_skew_seconds)
+        .ok_or_else(|| Error::new("refresh boundary overflow"))?;
+    let touch_elapsed = now.saturating_sub(last_touched);
+    let touch_candidate = now
+        .checked_add(evidence.session_ttl_seconds)
+        .ok_or_else(|| Error::new("touch candidate overflow"))?
+        .min(absolute_expires);
+    Ok(ReadyPredicates {
+        ready: evidence.identity_state == "ready",
+        active: now < idle_expires && now < absolute_expires,
+        access_refresh_due: access_expires <= refresh_boundary,
+        touch_due: touch_elapsed >= evidence.touch_interval_seconds
+            && touch_candidate > idle_expires,
+    })
+}
+
+fn parse_utc_rfc3339_seconds(value: &str) -> Result<u64> {
+    let bytes = value.as_bytes();
+    if bytes.len() != 24
+        || bytes[4] != b'-'
+        || bytes[7] != b'-'
+        || bytes[10] != b'T'
+        || bytes[13] != b':'
+        || bytes[16] != b':'
+        || &bytes[19..24] != b".000Z"
+    {
+        return Err(Error::new(
+            "session UTC field is not exact RFC3339 milliseconds",
+        ));
+    }
+    let parse = |range: std::ops::Range<usize>| -> Result<i64> {
+        std::str::from_utf8(&bytes[range])
+            .map_err(|_| Error::new("session UTC field is not ASCII"))?
+            .parse::<i64>()
+            .map_err(|_| Error::new("session UTC field contains a non-decimal component"))
+    };
+    let year = parse(0..4)?;
+    let month = parse(5..7)?;
+    let day = parse(8..10)?;
+    let hour = parse(11..13)?;
+    let minute = parse(14..16)?;
+    let second = parse(17..19)?;
+    if !(1..=12).contains(&month)
+        || !(1..=31).contains(&day)
+        || !(0..=23).contains(&hour)
+        || !(0..=59).contains(&minute)
+        || !(0..=59).contains(&second)
+    {
+        return Err(Error::new(
+            "session UTC field has an out-of-range component",
+        ));
+    }
+    let adjusted_year = year - i64::from(month <= 2);
+    let era = adjusted_year.div_euclid(400);
+    let year_of_era = adjusted_year - era * 400;
+    let shifted_month = month + if month > 2 { -3 } else { 9 };
+    let day_of_year = (153 * shifted_month + 2) / 5 + day - 1;
+    let day_of_era = year_of_era * 365 + year_of_era / 4 - year_of_era / 100 + day_of_year;
+    let unix_days = era * 146_097 + day_of_era - 719_468;
+    if unix_days < 0 {
+        return Err(Error::new("session UTC field predates the Unix epoch"));
+    }
+    u64::try_from(unix_days)
+        .ok()
+        .and_then(|days| days.checked_mul(86_400))
+        .and_then(|base| base.checked_add(u64::try_from(hour * 3_600 + minute * 60 + second).ok()?))
+        .ok_or_else(|| Error::new("session UTC field overflows Unix seconds"))
 }
 
 pub fn sign_cookie_value(value: &str, secret: &str) -> Result<String> {

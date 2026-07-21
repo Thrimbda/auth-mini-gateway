@@ -8,7 +8,9 @@ use crate::control::{ConnectionPolicy, ControlBody, LoadTarget};
 use crate::json;
 use crate::rng::{fisher_yates, SplitMix64};
 use crate::schedule::{generate_rounds, validate_williams_balance, williams_rows};
-use crate::schema::{all_cells, Arm, Cell, EvidenceClass, RoundPlan, Workload};
+use crate::schema::{
+    all_cells, Arm, Cell, DesignLock, EvidenceClass, RoundPlan, Workload, CAMPAIGN_PLAN_SCHEMA,
+};
 use crate::seal::sha256_hex;
 use crate::topology::{ArmTopology, Protocol};
 use crate::{Error, Result};
@@ -339,6 +341,13 @@ pub struct EstablishmentArm {
 }
 
 pub fn calibration_plan(seed: u64) -> Result<CalibrationExecutionPlan> {
+    calibration_plan_with_offset(seed, 0)
+}
+
+pub fn calibration_plan_with_offset(
+    seed: u64,
+    first_ordinal: u64,
+) -> Result<CalibrationExecutionPlan> {
     let rows = williams_rows();
     validate_williams_balance(&rows)?;
     let mut rng = SplitMix64::new(seed);
@@ -349,7 +358,7 @@ pub fn calibration_plan(seed: u64) -> Result<CalibrationExecutionPlan> {
     let mut arms = Vec::with_capacity(750);
     let mut establishment = Vec::with_capacity(75);
     let mut seen = std::collections::BTreeSet::new();
-    let mut ordinal = 0_u64;
+    let mut ordinal = first_ordinal;
     for row in row_order {
         for cell in &cells {
             for arm in rows[usize::from(row)] {
@@ -419,6 +428,179 @@ pub fn calibration_plan(seed: u64) -> Result<CalibrationExecutionPlan> {
 pub struct DirectMapping {
     pub arm: Arm,
     pub protocols: Vec<Protocol>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct CampaignDirectKey {
+    pub cell: Cell,
+    pub protocol: Protocol,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct CampaignPlan {
+    pub schema: String,
+    pub run_id: String,
+    pub calibration_id: String,
+    pub design_lock_sha256: String,
+    pub n: u32,
+    pub direct_order: Vec<CampaignDirectKey>,
+    pub arms: Vec<PlannedArm>,
+    pub direct_arms: u64,
+    pub authoritative_arms: u64,
+    pub hash_sha256: String,
+}
+
+impl CampaignPlan {
+    pub fn validate(&self, design: &DesignLock) -> Result<()> {
+        if self.schema != CAMPAIGN_PLAN_SCHEMA
+            || self.calibration_id != design.calibration_id
+            || self.n != design.selected_n
+        {
+            return Err(Error::new(
+                "campaign plan identity/N differs from design lock",
+            ));
+        }
+        crate::schema::validate_identifier("campaign plan run ID", &self.run_id)?;
+        crate::schema::validate_non_placeholder_sha256(
+            "campaign plan design lock",
+            &self.design_lock_sha256,
+        )?;
+        validate_direct_order(&self.direct_order)?;
+        let regenerated = campaign_plan(
+            &self.run_id,
+            design,
+            &self.design_lock_sha256,
+            &self.direct_order,
+        )?;
+        if self != &regenerated {
+            return Err(Error::new(
+                "campaign plan does not regenerate from design/direct order",
+            ));
+        }
+        Ok(())
+    }
+}
+
+pub fn campaign_plan(
+    run_id: &str,
+    design: &DesignLock,
+    design_lock_sha256: &str,
+    direct_order: &[CampaignDirectKey],
+) -> Result<CampaignPlan> {
+    design.validate()?;
+    crate::schema::validate_identifier("campaign plan run ID", run_id)?;
+    crate::schema::validate_non_placeholder_sha256(
+        "campaign plan design lock",
+        design_lock_sha256,
+    )?;
+    validate_direct_order(direct_order)?;
+    let mut arms = Vec::with_capacity(
+        usize::try_from(78_u64 * u64::from(design.selected_n))
+            .map_err(|_| Error::new("campaign plan capacity overflow"))?,
+    );
+    let mut ordinal = 0_u64;
+    for epoch in 1..=design.selected_n / 10 {
+        for key in direct_order {
+            let planned = PlannedArm {
+                ordinal,
+                evidence_class: EvidenceClass::D,
+                cell: key.cell,
+                arm: None,
+                direct_protocol: Some(key.protocol),
+                round: Some(epoch),
+                row: None,
+                target: None,
+                lane_quotas: Vec::new(),
+                fresh_process_set: true,
+            };
+            planned.validate()?;
+            arms.push(planned);
+            ordinal += 1;
+        }
+        let first_round = (epoch - 1) * 10;
+        for round in &design.rounds[usize::try_from(first_round).unwrap_or(usize::MAX)
+            ..usize::try_from(first_round + 10).unwrap_or(usize::MAX)]
+        {
+            for cell in &round.cells {
+                for treatment in &round.arm_order {
+                    let planned = PlannedArm {
+                        ordinal,
+                        evidence_class: EvidenceClass::A,
+                        cell: *cell,
+                        arm: Some(*treatment),
+                        direct_protocol: None,
+                        round: Some(round.round),
+                        row: Some(round.row),
+                        target: None,
+                        lane_quotas: Vec::new(),
+                        fresh_process_set: true,
+                    };
+                    planned.validate()?;
+                    arms.push(planned);
+                    ordinal += 1;
+                }
+            }
+        }
+    }
+    let direct_arms = 3_u64
+        .checked_mul(u64::from(design.selected_n))
+        .ok_or_else(|| Error::new("campaign direct count overflow"))?;
+    let authoritative_arms = 75_u64
+        .checked_mul(u64::from(design.selected_n))
+        .ok_or_else(|| Error::new("campaign authoritative count overflow"))?;
+    if arms.len() as u64 != direct_arms + authoritative_arms
+        || arms
+            .iter()
+            .filter(|arm| arm.evidence_class == EvidenceClass::D)
+            .count() as u64
+            != direct_arms
+        || arms
+            .iter()
+            .filter(|arm| arm.evidence_class == EvidenceClass::A)
+            .count() as u64
+            != authoritative_arms
+    {
+        return Err(Error::new(
+            "campaign plan inventory is not exactly 3N D plus 75N A",
+        ));
+    }
+    let mut plan = CampaignPlan {
+        schema: CAMPAIGN_PLAN_SCHEMA.to_owned(),
+        run_id: run_id.to_owned(),
+        calibration_id: design.calibration_id.clone(),
+        design_lock_sha256: design_lock_sha256.to_owned(),
+        n: design.selected_n,
+        direct_order: direct_order.to_vec(),
+        arms,
+        direct_arms,
+        authoritative_arms,
+        hash_sha256: String::new(),
+    };
+    plan.hash_sha256 = hash_without_field(&plan)?;
+    Ok(plan)
+}
+
+fn validate_direct_order(direct_order: &[CampaignDirectKey]) -> Result<()> {
+    let expected = all_cells()
+        .into_iter()
+        .flat_map(|cell| {
+            [Protocol::H1, Protocol::H2]
+                .into_iter()
+                .map(move |protocol| CampaignDirectKey { cell, protocol })
+        })
+        .collect::<std::collections::BTreeSet<_>>();
+    let actual = direct_order
+        .iter()
+        .copied()
+        .collect::<std::collections::BTreeSet<_>>();
+    if direct_order.len() != 30 || actual.len() != 30 || actual != expected {
+        return Err(Error::new(
+            "campaign direct order is not the exact 30-key panel",
+        ));
+    }
+    Ok(())
 }
 
 #[must_use]
@@ -549,6 +731,34 @@ impl CloneHashField for CampaignDryRun {
             self.runtime_projection.clone(),
             self.authoritative_gateway_arms,
             self.authoritative_direct_arms,
+        )
+    }
+}
+
+impl CloneHashField for CampaignPlan {
+    type Output = (
+        String,
+        String,
+        String,
+        String,
+        u32,
+        Vec<CampaignDirectKey>,
+        Vec<PlannedArm>,
+        u64,
+        u64,
+    );
+
+    fn without_hash(&self) -> Self::Output {
+        (
+            self.schema.clone(),
+            self.run_id.clone(),
+            self.calibration_id.clone(),
+            self.design_lock_sha256.clone(),
+            self.n,
+            self.direct_order.clone(),
+            self.arms.clone(),
+            self.direct_arms,
+            self.authoritative_arms,
         )
     }
 }

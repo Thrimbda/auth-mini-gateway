@@ -45,6 +45,7 @@ fn run() -> Result<()> {
         }
         "smoke" => {
             require_only(&options, &["candidate"])?;
+            auth_mini_http2_regression::harness::require_exact_committed_harness(&repository)?;
             let candidate = options
                 .get("candidate")
                 .map(String::as_str)
@@ -133,22 +134,124 @@ fn run() -> Result<()> {
             print_json(&auth_mini_http2_regression::process_plan::scout_plan(seed)?)?;
         }
         "calibrate" => {
-            require_only(&options, &["dry-run", "seed"])?;
-            require_true(&options, "dry-run")?;
+            require_only(&options, &["candidate", "dry-run", "seed"])?;
             let seed = parse_u64_option(&options, "seed", 0xca1b_u64)?;
-            print_json(&auth_mini_http2_regression::process_plan::calibration_plan(
-                seed,
-            )?)?;
+            if options.contains_key("dry-run") {
+                require_true(&options, "dry-run")?;
+                print_json(&auth_mini_http2_regression::process_plan::calibration_plan(
+                    seed,
+                )?)?;
+            } else {
+                let candidate = required(&options, "candidate")?;
+                auth_mini_http2_regression::linux::set_affinity(
+                    std::process::id(),
+                    auth_mini_http2_regression::linux::CONTROL_CPUS,
+                )?;
+                let runtime = tokio::runtime::Builder::new_multi_thread()
+                    .worker_threads(2)
+                    .enable_all()
+                    .build()
+                    .map_err(|error| Error::new(format!("create calibration runtime: {error}")))?;
+                let outcome =
+                    runtime.block_on(auth_mini_http2_regression::orchestrator::run_calibration(
+                        &repository,
+                        candidate,
+                        seed,
+                    ))?;
+                let terminal = outcome.terminal_state;
+                print_json(&outcome)?;
+                require_pass_terminal(terminal)?;
+            }
         }
         "campaign" => {
-            require_only(&options, &["dry-run", "seed", "n"])?;
-            require_true(&options, "dry-run")?;
-            let seed = parse_u64_option(&options, "seed", 0xc0a1_u64)?;
-            let n = u32::try_from(parse_u64_option(&options, "n", 30)?)
-                .map_err(|_| Error::new("--n exceeds u32"))?;
-            print_json(&auth_mini_http2_regression::process_plan::campaign_dry_run(
-                seed, n,
-            )?)?;
+            if options.contains_key("dry-run") {
+                require_only(&options, &["dry-run", "seed", "n"])?;
+                require_true(&options, "dry-run")?;
+                let seed = parse_u64_option(&options, "seed", 0xc0a1_u64)?;
+                let n = u32::try_from(parse_u64_option(&options, "n", 30)?)
+                    .map_err(|_| Error::new("--n exceeds u32"))?;
+                print_json(&auth_mini_http2_regression::process_plan::campaign_dry_run(
+                    seed, n,
+                )?)?;
+            } else {
+                require_only(&options, &["candidate", "calibration"])?;
+                let candidate = required(&options, "candidate")?;
+                let calibration = required(&options, "calibration")?;
+                auth_mini_http2_regression::linux::set_affinity(
+                    std::process::id(),
+                    auth_mini_http2_regression::linux::CONTROL_CPUS,
+                )?;
+                let runtime = tokio::runtime::Builder::new_multi_thread()
+                    .worker_threads(2)
+                    .enable_all()
+                    .build()
+                    .map_err(|error| Error::new(format!("create campaign runtime: {error}")))?;
+                let outcome =
+                    runtime.block_on(auth_mini_http2_regression::orchestrator::run_campaign(
+                        &repository,
+                        candidate,
+                        calibration,
+                    ))?;
+                let terminal = outcome.terminal_state;
+                print_json(&outcome)?;
+                require_pass_terminal(terminal)?;
+            }
+        }
+        "run" => {
+            require_only(&options, &["candidate", "seed"])?;
+            let candidate = required(&options, "candidate")?;
+            let seed = parse_u64_option(&options, "seed", 0xca1b_u64)?;
+            auth_mini_http2_regression::linux::set_affinity(
+                std::process::id(),
+                auth_mini_http2_regression::linux::CONTROL_CPUS,
+            )?;
+            let runtime = tokio::runtime::Builder::new_multi_thread()
+                .worker_threads(2)
+                .enable_all()
+                .build()
+                .map_err(|error| Error::new(format!("create end-to-end runtime: {error}")))?;
+            let calibration =
+                runtime.block_on(auth_mini_http2_regression::orchestrator::run_calibration(
+                    &repository,
+                    candidate,
+                    seed,
+                ))?;
+            if calibration.terminal_state != TerminalState::Pass {
+                print_json(&RunOutput {
+                    calibration: calibration.clone(),
+                    campaign: None,
+                })?;
+                require_pass_terminal(calibration.terminal_state)?;
+            }
+            let campaign =
+                runtime.block_on(auth_mini_http2_regression::orchestrator::run_campaign(
+                    &repository,
+                    candidate,
+                    &calibration.calibration_id,
+                ))?;
+            let terminal = campaign.terminal_state;
+            print_json(&RunOutput {
+                calibration,
+                campaign: Some(campaign),
+            })?;
+            require_pass_terminal(terminal)?;
+        }
+        "delivery-ready" => {
+            require_only(&options, &["commit"])?;
+            let receipt = auth_mini_http2_regression::delivery::delivery_ready(
+                &repository,
+                required(&options, "commit")?,
+            )?;
+            print_json(&receipt)?;
+        }
+        "delivery-retained" => {
+            require_only(&options, &["base", "merge"])?;
+            let receipt = auth_mini_http2_regression::delivery::delivery_retained(
+                &repository,
+                required(&options, "base")?,
+                required(&options, "merge")?,
+            )?;
+            print_json(&receipt)?;
         }
         "role" => {
             require_only(
@@ -428,6 +531,12 @@ struct SmokeOutput {
     artifact_root: String,
 }
 
+#[derive(Serialize)]
+struct RunOutput {
+    calibration: auth_mini_http2_regression::calibration_coordinator::CalibrationOutcome,
+    campaign: Option<auth_mini_http2_regression::campaign_coordinator::CampaignOutcome>,
+}
+
 fn usage() -> &'static str {
-    "usage: auth-mini-http2-regression <self-test|preflight|build|smoke|diagnose-b11-c1-upload|direct-upload-probe|scout|calibrate|campaign|analyze|verify|bundle|verify-bundle> [--name value ...]"
+    "usage: auth-mini-http2-regression <self-test|preflight|build|smoke|diagnose-b11-c1-upload|direct-upload-probe|scout|calibrate|campaign|run|analyze|verify|bundle|verify-bundle|delivery-ready|delivery-retained> [--name value ...]"
 }

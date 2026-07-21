@@ -9,8 +9,15 @@ pub const ARCHIVE_SCHEMA: &str = "amg-http2-perf-canonical-ustar/v1";
 pub const ARM_SCHEMA: &str = "amg-http2-perf/arm/v1";
 pub const ANALYSIS_SCHEMA: &str = "amg-http2-perf/analysis/v1";
 pub const INTENT_SCHEMA: &str = "amg-http2-perf/intent/v1";
+pub const COORDINATED_INTENT_SCHEMA: &str = "amg-http2-perf/intent/v2";
 pub const DESIGN_LOCK_SCHEMA: &str = "amg-http2-perf/design-lock/v1";
+pub const CALIBRATION_PLAN_SCHEMA: &str = "amg-http2-perf/calibration-plan/v1";
 pub const CALIBRATION_MANIFEST_SCHEMA: &str = "amg-http2-perf/calibration-manifest/v1";
+pub const CAMPAIGN_BINDING_SCHEMA: &str = "amg-http2-perf/campaign-binding/v1";
+pub const CAMPAIGN_MANIFEST_SCHEMA: &str = "amg-http2-perf/campaign-manifest/v1";
+pub const CAMPAIGN_PLAN_SCHEMA: &str = "amg-http2-perf/campaign-plan/v1";
+pub const ACCEPTED_SIGNATURE_SCHEMA: &str = "amg-http2-perf/accepted-signature/v1";
+pub const AUTHORITATIVE_PARAMETERS_SCHEMA: &str = "amg-http2-perf/authoritative-parameters/v1";
 pub const ZSTD_PROGRAM_SCHEMA: &str = "amg-http2-perf/zstd-program/v1";
 pub const RAW_LIMIT_SCHEMA: &str = "amg-http2-perf/raw-limits/v1";
 pub const MACHINE_SCHEMA: &str = "amg-http2-perf/machine/v1";
@@ -512,6 +519,436 @@ pub struct RawLimits {
     pub canonical_buffer_bytes: u64,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ExternalInputManifest {
+    pub schema: String,
+    pub build_set_sha256: String,
+    pub baseline_commit: String,
+    pub candidate_commit: String,
+    pub read_only_surfaces: Vec<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ClockBoundaryManifest {
+    pub schema: String,
+    pub realtime_provenance: Vec<String>,
+    pub monotonic_destinations: Vec<String>,
+    pub boottime_destinations: Vec<String>,
+    pub prohibited_realtime_destinations: Vec<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct BenchmarkConfigManifest {
+    pub schema: String,
+    pub fixed_values: BTreeMap<String, String>,
+    pub arm_local_values: Vec<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct CorpusManifest {
+    pub schema: String,
+    pub seed_sha256: String,
+    pub corpus_sha256: String,
+    pub corpus_bytes: u64,
+    pub chunk_bytes: u64,
+    pub chunk_count: u64,
+    pub sse_events: u64,
+    pub sse_data_bytes: u64,
+    pub payload_domain: String,
+    pub websocket_mask_domain: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ConnectionPolicyEntry {
+    pub protocol: RawProtocol,
+    pub workload: Workload,
+    pub policy: String,
+    pub operation_boundary: String,
+    pub reconciliation: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ConnectionPolicyManifest {
+    pub schema: String,
+    pub entries: Vec<ConnectionPolicyEntry>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct TrustBoundaryManifest {
+    pub schema: String,
+    pub external_inputs: ExternalInputManifest,
+    pub clocks: ClockBoundaryManifest,
+    pub config: BenchmarkConfigManifest,
+    pub corpus: CorpusManifest,
+    pub connection_policies: ConnectionPolicyManifest,
+}
+
+impl TrustBoundaryManifest {
+    pub fn coordinated(
+        build_set_sha256: String,
+        baseline_commit: String,
+        candidate_commit: String,
+    ) -> Result<Self> {
+        let mut fixed_values = BTreeMap::new();
+        for (name, value) in [
+            ("HOST", "127.0.0.1"),
+            ("GATEWAY_PUBLIC_BASE_URL", "http://public.example"),
+            ("COOKIE_SECURE", "false"),
+            ("COOKIE_SAME_SITE", "lax"),
+            ("SESSION_TTL_SECONDS", "604800"),
+            ("SESSION_ABSOLUTE_TTL_SECONDS", "2592000"),
+            ("SESSION_TOUCH_INTERVAL_SECONDS", "604800"),
+            ("REFRESH_SKEW_SECONDS", "60"),
+            ("ALLOW_USER_IDS", "bench-user"),
+            ("TRUSTED_PROXY_CIDRS", ""),
+            ("GATEWAY_MAX_DOWNSTREAM_CONNECTIONS", "256"),
+            ("GATEWAY_MAX_ACTIVE_UPSTREAMS", "128"),
+            ("GATEWAY_MAX_BLOCKING_RESOLVERS", "8"),
+            ("NO_COLOR", "1"),
+        ] {
+            fixed_values.insert(name.to_owned(), value.to_owned());
+        }
+        let corpus = crate::topology::Corpus::fixed();
+        let mut entries = Vec::new();
+        for protocol in [RawProtocol::H1, RawProtocol::H2] {
+            for workload in Workload::ALL {
+                let (policy, operation_boundary, reconciliation) =
+                    match (protocol, workload) {
+                        (RawProtocol::H1, Workload::Upload1Mib) => (
+                            "fresh-h1-per-operation",
+                            "connect-through-close-eof",
+                            "connections=starts=requests=responses=close=eos=eof; reuse=retry=reconnect=0",
+                        ),
+                        (RawProtocol::H1, Workload::WebSocket) => (
+                            "h1-upgrade-tunnels",
+                            "pre-established-ping-pong",
+                            "connections=concurrency; one tunnel per connection",
+                        ),
+                        (RawProtocol::H1, _) => (
+                            "persistent-h1",
+                            "request-through-response-eos",
+                            "connections=concurrency; one outstanding operation per lane",
+                        ),
+                        (RawProtocol::H2, Workload::WebSocket) => (
+                            "h2-extended-connect-streams",
+                            "pre-established-ping-pong",
+                            "connections=1; tunnels=concurrency; odd unique stream ids",
+                        ),
+                        (RawProtocol::H2, _) => (
+                            "persistent-h2",
+                            "request-through-response-eos",
+                            "connections=1; streams=starts; odd unique stream ids",
+                        ),
+                    };
+                entries.push(ConnectionPolicyEntry {
+                    protocol,
+                    workload,
+                    policy: policy.to_owned(),
+                    operation_boundary: operation_boundary.to_owned(),
+                    reconciliation: reconciliation.to_owned(),
+                });
+            }
+        }
+        let manifest = Self {
+            schema: "amg-http2-perf/trust-boundary/v1".to_owned(),
+            external_inputs: ExternalInputManifest {
+                schema: "amg-http2-perf/external-inputs/v1".to_owned(),
+                build_set_sha256,
+                baseline_commit,
+                candidate_commit,
+                read_only_surfaces: vec![
+                    "git-object-database".to_owned(),
+                    "git-executable".to_owned(),
+                    "rust-cargo-toolchain".to_owned(),
+                    "dynamic-loader-runtime-libraries".to_owned(),
+                    "dependency-cache-artifacts".to_owned(),
+                    "/dev/null".to_owned(),
+                    "/proc-read-only".to_owned(),
+                    "/sys-read-only".to_owned(),
+                    "literal-loopback-sockets".to_owned(),
+                    "getrandom".to_owned(),
+                ],
+            },
+            clocks: ClockBoundaryManifest {
+                schema: "amg-http2-perf/clock-boundary/v1".to_owned(),
+                realtime_provenance: vec![
+                    "untouched-archived-gateway-production-semantics".to_owned(),
+                    "orchestrator-sampler-utc-metadata".to_owned(),
+                ],
+                monotonic_destinations: vec![
+                    "operation-latency".to_owned(),
+                    "performance-count-throughput-windows".to_owned(),
+                    "cpu-window-boundaries".to_owned(),
+                    "warmup-settle-freeze-drain".to_owned(),
+                    "operation-phase-deadlines".to_owned(),
+                ],
+                boottime_destinations: vec![
+                    "campaign-elapsed".to_owned(),
+                    "resource-budget-gates".to_owned(),
+                    "realtime-sample-brackets".to_owned(),
+                ],
+                prohibited_realtime_destinations: vec![
+                    "latency-duration-throughput-cpu-window".to_owned(),
+                    "deadline-ordering-schedule-seed-statistics".to_owned(),
+                    "campaign-resource-accounting".to_owned(),
+                    "fixture-load-control-dependencies".to_owned(),
+                ],
+            },
+            config: BenchmarkConfigManifest {
+                schema: "amg-http2-perf/config/v1".to_owned(),
+                fixed_values,
+                arm_local_values: vec![
+                    "PORT=reserved-literal-loopback".to_owned(),
+                    "AUTH_MINI_ISSUER=arm-tripwire-literal-loopback".to_owned(),
+                    "AUTH_MINI_PUBLIC_BASE_URL=arm-tripwire-literal-loopback".to_owned(),
+                    "GATEWAY_DB=restricted-arm-runtime-path".to_owned(),
+                    "UPSTREAM_URL=arm-fixture-literal-loopback".to_owned(),
+                    "UPSTREAM_PROTOCOL=sealed-treatment-protocol".to_owned(),
+                    "TMPDIR=restricted-arm-runtime-path".to_owned(),
+                ],
+            },
+            corpus: CorpusManifest {
+                schema: crate::topology::CORPUS_SCHEMA.to_owned(),
+                seed_sha256: crate::seal::sha256_hex(&crate::topology::FIXED_CORPUS_SEED),
+                corpus_sha256: corpus.sha256(),
+                corpus_bytes: crate::topology::CORPUS_BYTES as u64,
+                chunk_bytes: crate::topology::CHUNK_BYTES as u64,
+                chunk_count: crate::topology::CHUNK_COUNT as u64,
+                sse_events: crate::topology::SSE_EVENTS as u64,
+                sse_data_bytes: crate::topology::SSE_DATA_BYTES as u64,
+                payload_domain: "amg-http2-perf/v1/payload".to_owned(),
+                websocket_mask_domain: "amg-http2-perf/v1/ws-mask".to_owned(),
+            },
+            connection_policies: ConnectionPolicyManifest {
+                schema: "amg-http2-perf/connection-policies/v1".to_owned(),
+                entries,
+            },
+        };
+        manifest.validate()?;
+        Ok(manifest)
+    }
+
+    pub fn validate(&self) -> Result<()> {
+        if self.schema != "amg-http2-perf/trust-boundary/v1"
+            || self.external_inputs.schema != "amg-http2-perf/external-inputs/v1"
+            || self.clocks.schema != "amg-http2-perf/clock-boundary/v1"
+            || self.config.schema != "amg-http2-perf/config/v1"
+            || self.corpus.schema != crate::topology::CORPUS_SCHEMA
+            || self.connection_policies.schema != "amg-http2-perf/connection-policies/v1"
+            || self.connection_policies.entries.len() != 10
+        {
+            return Err(Error::new(
+                "unsupported or incomplete trust-boundary manifest",
+            ));
+        }
+        validate_non_placeholder_sha256(
+            "trust-boundary build set",
+            &self.external_inputs.build_set_sha256,
+        )?;
+        validate_commit(
+            "trust-boundary baseline",
+            &self.external_inputs.baseline_commit,
+        )?;
+        validate_commit(
+            "trust-boundary candidate",
+            &self.external_inputs.candidate_commit,
+        )?;
+        validate_non_placeholder_sha256("corpus seed", &self.corpus.seed_sha256)?;
+        validate_non_placeholder_sha256("corpus bytes", &self.corpus.corpus_sha256)?;
+        let regenerated = Self::coordinated_unchecked(
+            self.external_inputs.build_set_sha256.clone(),
+            self.external_inputs.baseline_commit.clone(),
+            self.external_inputs.candidate_commit.clone(),
+        );
+        if self != &regenerated {
+            return Err(Error::new(
+                "trust-boundary manifest differs from the approved policy",
+            ));
+        }
+        Ok(())
+    }
+
+    fn coordinated_unchecked(
+        build_set_sha256: String,
+        baseline_commit: String,
+        candidate_commit: String,
+    ) -> Self {
+        // Construction is infallible for the fixed constants; avoid recursive validation.
+        let mut fixed_values = BTreeMap::new();
+        for (name, value) in [
+            ("HOST", "127.0.0.1"),
+            ("GATEWAY_PUBLIC_BASE_URL", "http://public.example"),
+            ("COOKIE_SECURE", "false"),
+            ("COOKIE_SAME_SITE", "lax"),
+            ("SESSION_TTL_SECONDS", "604800"),
+            ("SESSION_ABSOLUTE_TTL_SECONDS", "2592000"),
+            ("SESSION_TOUCH_INTERVAL_SECONDS", "604800"),
+            ("REFRESH_SKEW_SECONDS", "60"),
+            ("ALLOW_USER_IDS", "bench-user"),
+            ("TRUSTED_PROXY_CIDRS", ""),
+            ("GATEWAY_MAX_DOWNSTREAM_CONNECTIONS", "256"),
+            ("GATEWAY_MAX_ACTIVE_UPSTREAMS", "128"),
+            ("GATEWAY_MAX_BLOCKING_RESOLVERS", "8"),
+            ("NO_COLOR", "1"),
+        ] {
+            fixed_values.insert(name.to_owned(), value.to_owned());
+        }
+        let corpus = crate::topology::Corpus::fixed();
+        let mut entries = Vec::new();
+        for protocol in [RawProtocol::H1, RawProtocol::H2] {
+            for workload in Workload::ALL {
+                let (policy, operation_boundary, reconciliation) =
+                    match (protocol, workload) {
+                        (RawProtocol::H1, Workload::Upload1Mib) => (
+                            "fresh-h1-per-operation",
+                            "connect-through-close-eof",
+                            "connections=starts=requests=responses=close=eos=eof; reuse=retry=reconnect=0",
+                        ),
+                        (RawProtocol::H1, Workload::WebSocket) => (
+                            "h1-upgrade-tunnels",
+                            "pre-established-ping-pong",
+                            "connections=concurrency; one tunnel per connection",
+                        ),
+                        (RawProtocol::H1, _) => (
+                            "persistent-h1",
+                            "request-through-response-eos",
+                            "connections=concurrency; one outstanding operation per lane",
+                        ),
+                        (RawProtocol::H2, Workload::WebSocket) => (
+                            "h2-extended-connect-streams",
+                            "pre-established-ping-pong",
+                            "connections=1; tunnels=concurrency; odd unique stream ids",
+                        ),
+                        (RawProtocol::H2, _) => (
+                            "persistent-h2",
+                            "request-through-response-eos",
+                            "connections=1; streams=starts; odd unique stream ids",
+                        ),
+                    };
+                entries.push(ConnectionPolicyEntry {
+                    protocol,
+                    workload,
+                    policy: policy.to_owned(),
+                    operation_boundary: operation_boundary.to_owned(),
+                    reconciliation: reconciliation.to_owned(),
+                });
+            }
+        }
+        Self {
+            schema: "amg-http2-perf/trust-boundary/v1".to_owned(),
+            external_inputs: ExternalInputManifest {
+                schema: "amg-http2-perf/external-inputs/v1".to_owned(),
+                build_set_sha256,
+                baseline_commit,
+                candidate_commit,
+                read_only_surfaces: vec![
+                    "git-object-database".to_owned(),
+                    "git-executable".to_owned(),
+                    "rust-cargo-toolchain".to_owned(),
+                    "dynamic-loader-runtime-libraries".to_owned(),
+                    "dependency-cache-artifacts".to_owned(),
+                    "/dev/null".to_owned(),
+                    "/proc-read-only".to_owned(),
+                    "/sys-read-only".to_owned(),
+                    "literal-loopback-sockets".to_owned(),
+                    "getrandom".to_owned(),
+                ],
+            },
+            clocks: ClockBoundaryManifest {
+                schema: "amg-http2-perf/clock-boundary/v1".to_owned(),
+                realtime_provenance: vec![
+                    "untouched-archived-gateway-production-semantics".to_owned(),
+                    "orchestrator-sampler-utc-metadata".to_owned(),
+                ],
+                monotonic_destinations: vec![
+                    "operation-latency".to_owned(),
+                    "performance-count-throughput-windows".to_owned(),
+                    "cpu-window-boundaries".to_owned(),
+                    "warmup-settle-freeze-drain".to_owned(),
+                    "operation-phase-deadlines".to_owned(),
+                ],
+                boottime_destinations: vec![
+                    "campaign-elapsed".to_owned(),
+                    "resource-budget-gates".to_owned(),
+                    "realtime-sample-brackets".to_owned(),
+                ],
+                prohibited_realtime_destinations: vec![
+                    "latency-duration-throughput-cpu-window".to_owned(),
+                    "deadline-ordering-schedule-seed-statistics".to_owned(),
+                    "campaign-resource-accounting".to_owned(),
+                    "fixture-load-control-dependencies".to_owned(),
+                ],
+            },
+            config: BenchmarkConfigManifest {
+                schema: "amg-http2-perf/config/v1".to_owned(),
+                fixed_values,
+                arm_local_values: vec![
+                    "PORT=reserved-literal-loopback".to_owned(),
+                    "AUTH_MINI_ISSUER=arm-tripwire-literal-loopback".to_owned(),
+                    "AUTH_MINI_PUBLIC_BASE_URL=arm-tripwire-literal-loopback".to_owned(),
+                    "GATEWAY_DB=restricted-arm-runtime-path".to_owned(),
+                    "UPSTREAM_URL=arm-fixture-literal-loopback".to_owned(),
+                    "UPSTREAM_PROTOCOL=sealed-treatment-protocol".to_owned(),
+                    "TMPDIR=restricted-arm-runtime-path".to_owned(),
+                ],
+            },
+            corpus: CorpusManifest {
+                schema: crate::topology::CORPUS_SCHEMA.to_owned(),
+                seed_sha256: crate::seal::sha256_hex(&crate::topology::FIXED_CORPUS_SEED),
+                corpus_sha256: corpus.sha256(),
+                corpus_bytes: crate::topology::CORPUS_BYTES as u64,
+                chunk_bytes: crate::topology::CHUNK_BYTES as u64,
+                chunk_count: crate::topology::CHUNK_COUNT as u64,
+                sse_events: crate::topology::SSE_EVENTS as u64,
+                sse_data_bytes: crate::topology::SSE_DATA_BYTES as u64,
+                payload_domain: "amg-http2-perf/v1/payload".to_owned(),
+                websocket_mask_domain: "amg-http2-perf/v1/ws-mask".to_owned(),
+            },
+            connection_policies: ConnectionPolicyManifest {
+                schema: "amg-http2-perf/connection-policies/v1".to_owned(),
+                entries,
+            },
+        }
+    }
+
+    pub fn sha256(&self) -> Result<String> {
+        Ok(crate::seal::sha256_hex(&crate::json::canonical_bytes(
+            self,
+        )?))
+    }
+
+    pub fn clock_sha256(&self) -> Result<String> {
+        Ok(crate::seal::sha256_hex(&crate::json::canonical_bytes(
+            &self.clocks,
+        )?))
+    }
+
+    pub fn config_sha256(&self) -> Result<String> {
+        Ok(crate::seal::sha256_hex(&crate::json::canonical_bytes(
+            &self.config,
+        )?))
+    }
+
+    pub fn corpus_sha256(&self) -> Result<String> {
+        Ok(crate::seal::sha256_hex(&crate::json::canonical_bytes(
+            &self.corpus,
+        )?))
+    }
+
+    pub fn connection_policy_sha256(&self) -> Result<String> {
+        Ok(crate::seal::sha256_hex(&crate::json::canonical_bytes(
+            &self.connection_policies,
+        )?))
+    }
+}
+
 impl RawLimits {
     #[must_use]
     pub fn fixed() -> Self {
@@ -545,11 +982,43 @@ pub struct Intent {
     pub producer_executable_sha256: String,
     pub zstd: ZstdParameterProgram,
     pub raw_limits: RawLimits,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub trust_boundary: Option<TrustBoundaryManifest>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub harness_provenance: Option<HarnessProvenance>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct HarnessProvenance {
+    pub commit: String,
+    pub tree_object: String,
+    pub source_archive_sha256: String,
+    pub cargo_lock_sha256: String,
+}
+
+impl HarnessProvenance {
+    pub fn validate(&self) -> Result<()> {
+        validate_commit("harness provenance commit", &self.commit)?;
+        if self.tree_object.len() != 40
+            || !self
+                .tree_object
+                .bytes()
+                .all(|byte| byte.is_ascii_hexdigit())
+        {
+            return Err(Error::new("harness provenance tree object is invalid"));
+        }
+        validate_non_placeholder_sha256("harness source archive", &self.source_archive_sha256)?;
+        validate_non_placeholder_sha256("harness Cargo.lock", &self.cargo_lock_sha256)
+    }
 }
 
 impl Intent {
     pub fn validate(&self) -> Result<()> {
-        if self.schema != INTENT_SCHEMA {
+        if !matches!(
+            self.schema.as_str(),
+            INTENT_SCHEMA | COORDINATED_INTENT_SCHEMA
+        ) {
             return Err(Error::new("unsupported intent schema"));
         }
         validate_identifier("evidence_id", &self.evidence_id)?;
@@ -566,7 +1035,32 @@ impl Intent {
             &self.producer_executable_sha256,
         )?;
         self.zstd.validate()?;
-        self.raw_limits.validate()
+        self.raw_limits.validate()?;
+        if let Some(provenance) = &self.harness_provenance {
+            provenance.validate()?;
+        }
+        match (&*self.schema, &self.trust_boundary) {
+            (INTENT_SCHEMA, None) => Ok(()),
+            (COORDINATED_INTENT_SCHEMA, Some(manifest)) => {
+                if self.harness_provenance.is_none() {
+                    return Err(Error::new(
+                        "coordinated intent lacks exact harness provenance",
+                    ));
+                }
+                manifest.validate()?;
+                if manifest.external_inputs.baseline_commit != self.baseline_commit
+                    || manifest.external_inputs.candidate_commit != self.candidate_commit
+                {
+                    return Err(Error::new(
+                        "intent trust-boundary commits differ from the intent",
+                    ));
+                }
+                Ok(())
+            }
+            _ => Err(Error::new(
+                "intent schema and trust-boundary manifest do not match",
+            )),
+        }
     }
 }
 
@@ -612,12 +1106,29 @@ impl RoundPlan {
 #[serde(deny_unknown_fields)]
 pub struct DesignLock {
     pub schema: String,
+    pub calibration_id: String,
+    pub candidate_commit: String,
     pub intent_sha256: String,
+    pub machine_sha256: String,
+    pub build_set_sha256: String,
+    pub topology_smoke_sha256: String,
     pub calibration_plan_sha256: String,
+    pub authoritative_parameters_sha256: String,
+    pub calibration_manifest_sha256: String,
+    pub projection_sha256: String,
+    pub calibration_seal_root_sha256: String,
+    pub calibration_bundle_index_sha256: String,
     pub selected_n: u32,
     pub schedule_seed: u64,
     pub rounds: Vec<RoundPlan>,
     pub comparisons: Vec<ComparisonSpec>,
+    pub authoritative_durations: Vec<crate::calibration::CellDurations>,
+    pub treatment_signatures: Vec<SignatureBinding>,
+    pub direct_signatures: Vec<SignatureBinding>,
+    pub direct_mappings: Vec<crate::process_plan::DirectMapping>,
+    pub runtime_projection: crate::calibration::RuntimeProjection,
+    pub tracked_projection: crate::storage::TrackedProjection,
+    pub calibration_frequency_p05_khz: u64,
 }
 
 impl DesignLock {
@@ -625,8 +1136,34 @@ impl DesignLock {
         if self.schema != DESIGN_LOCK_SCHEMA {
             return Err(Error::new("unsupported design-lock schema"));
         }
-        validate_non_placeholder_sha256("intent_sha256", &self.intent_sha256)?;
-        validate_non_placeholder_sha256("calibration_plan_sha256", &self.calibration_plan_sha256)?;
+        validate_identifier("design-lock calibration_id", &self.calibration_id)?;
+        validate_commit("design-lock candidate_commit", &self.candidate_commit)?;
+        for (name, hash) in [
+            ("intent_sha256", &self.intent_sha256),
+            ("machine_sha256", &self.machine_sha256),
+            ("build_set_sha256", &self.build_set_sha256),
+            ("topology_smoke_sha256", &self.topology_smoke_sha256),
+            ("calibration_plan_sha256", &self.calibration_plan_sha256),
+            (
+                "authoritative_parameters_sha256",
+                &self.authoritative_parameters_sha256,
+            ),
+            (
+                "calibration_manifest_sha256",
+                &self.calibration_manifest_sha256,
+            ),
+            ("projection_sha256", &self.projection_sha256),
+            (
+                "calibration_seal_root_sha256",
+                &self.calibration_seal_root_sha256,
+            ),
+            (
+                "calibration_bundle_index_sha256",
+                &self.calibration_bundle_index_sha256,
+            ),
+        ] {
+            validate_non_placeholder_sha256(name, hash)?;
+        }
         if !matches!(self.selected_n, 30 | 50) {
             return Err(Error::new(
                 "design-lock N must be runtime-admissible 30 or 50; N=70/100 stop before a design lock",
@@ -655,8 +1192,69 @@ impl DesignLock {
                 "design-lock hard comparison matrix is not canonical",
             ));
         }
+        validate_cell_durations(&self.authoritative_durations)?;
+        validate_signature_bindings(&self.treatment_signatures, 75, false)?;
+        validate_signature_bindings(&self.direct_signatures, 30, true)?;
+        if self.direct_mappings != crate::process_plan::direct_mappings() {
+            return Err(Error::new("design-lock direct mappings are not canonical"));
+        }
+        if self.runtime_projection.n != self.selected_n || !self.runtime_projection.admissible {
+            return Err(Error::new(
+                "design-lock runtime projection does not admit the selected N",
+            ));
+        }
+        if !self.tracked_projection.admissible {
+            return Err(Error::new(
+                "design-lock tracked projection does not admit the continuation",
+            ));
+        }
+        if self.calibration_frequency_p05_khz < 4_000_000 {
+            return Err(Error::new(
+                "design-lock calibration frequency p05 is below the approved floor",
+            ));
+        }
         Ok(())
     }
+}
+
+fn validate_cell_durations(values: &[crate::calibration::CellDurations]) -> Result<()> {
+    if values.len() != 15 {
+        return Err(Error::new("design-lock duration inventory is not 15 cells"));
+    }
+    let mut cells = BTreeSet::new();
+    for value in values {
+        value.cell.validate()?;
+        value.durations.validate()?;
+        if !cells.insert(value.cell) {
+            return Err(Error::new("design-lock duration cell is duplicated"));
+        }
+    }
+    if cells != all_cells().into_iter().collect() {
+        return Err(Error::new("design-lock duration cell set is incomplete"));
+    }
+    Ok(())
+}
+
+fn validate_signature_bindings(
+    values: &[SignatureBinding],
+    expected: usize,
+    direct: bool,
+) -> Result<()> {
+    if values.len() != expected {
+        return Err(Error::new(
+            "design-lock accepted-signature inventory differs",
+        ));
+    }
+    let mut keys = BTreeSet::new();
+    for value in values {
+        value.validate()?;
+        if value.direct_protocol.is_some() != direct || !keys.insert(value.key()) {
+            return Err(Error::new(
+                "design-lock accepted-signature key is duplicated or misclassified",
+            ));
+        }
+    }
+    Ok(())
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
@@ -688,22 +1286,180 @@ pub struct CalibrationRecord {
     pub process_identity: String,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct SignatureBinding {
+    pub cell: Cell,
+    pub arm: Option<Arm>,
+    pub direct_protocol: Option<RawProtocol>,
+    pub record_path: String,
+    pub record_sha256: String,
+    pub signature_sha256: String,
+}
+
+impl SignatureBinding {
+    pub fn validate(&self) -> Result<()> {
+        self.cell.validate()?;
+        if self.arm.is_some() == self.direct_protocol.is_some() {
+            return Err(Error::new("accepted-signature binding key is ambiguous"));
+        }
+        crate::seal::validate_relative_path(&self.record_path)?;
+        validate_non_placeholder_sha256("accepted-signature record", &self.record_sha256)?;
+        validate_non_placeholder_sha256("accepted thread signature", &self.signature_sha256)
+    }
+
+    fn key(&self) -> (Cell, Option<Arm>, Option<RawProtocol>) {
+        (self.cell, self.arm, self.direct_protocol)
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct AcceptedSignatureRecord {
+    pub schema: String,
+    pub calibration_id: String,
+    pub calibration_plan_sha256: String,
+    pub cell: Cell,
+    pub arm: Option<Arm>,
+    pub direct_protocol: Option<RawProtocol>,
+    pub establishment_class: EvidenceClass,
+    pub establishment_ordinal: u64,
+    pub source_observation_id: String,
+    pub signature_sha256: String,
+}
+
+impl AcceptedSignatureRecord {
+    pub fn validate(&self) -> Result<()> {
+        if self.schema != ACCEPTED_SIGNATURE_SCHEMA {
+            return Err(Error::new("unsupported accepted-signature schema"));
+        }
+        validate_identifier("signature calibration_id", &self.calibration_id)?;
+        validate_non_placeholder_sha256(
+            "signature calibration plan",
+            &self.calibration_plan_sha256,
+        )?;
+        self.cell.validate()?;
+        validate_identifier("signature source observation", &self.source_observation_id)?;
+        validate_non_placeholder_sha256("accepted thread signature", &self.signature_sha256)?;
+        match self.establishment_class {
+            EvidenceClass::C if self.arm.is_some() && self.direct_protocol.is_none() => Ok(()),
+            EvidenceClass::D if self.arm.is_none() && self.direct_protocol.is_some() => Ok(()),
+            _ => Err(Error::new(
+                "accepted signature was not established by a C or D key",
+            )),
+        }
+    }
+
+    pub fn binding(&self, path: String, record_sha256: String) -> Result<SignatureBinding> {
+        self.validate()?;
+        let binding = SignatureBinding {
+            cell: self.cell,
+            arm: self.arm,
+            direct_protocol: self.direct_protocol,
+            record_path: path,
+            record_sha256,
+            signature_sha256: self.signature_sha256.clone(),
+        };
+        binding.validate()?;
+        Ok(binding)
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct CalibrationManifest {
     pub schema: String,
     pub calibration_id: String,
+    pub intent_sha256: String,
+    pub machine_sha256: String,
+    pub build_set_sha256: String,
+    pub topology_smoke_sha256: String,
+    pub calibration_plan_sha256: Option<String>,
+    pub authoritative_parameters_sha256: Option<String>,
+    pub execution_state_sha256: String,
+    pub projection_sha256: String,
+    pub arm_bindings: Vec<CalibrationArmBinding>,
+    pub signature_bindings: Vec<SignatureBinding>,
+    pub selected_n: Option<u32>,
+    pub terminal_state: TerminalState,
+    pub terminal_reasons: Vec<String>,
     pub records: Vec<CalibrationRecord>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct CalibrationArmBinding {
+    pub ordinal: u64,
+    pub class: EvidenceClass,
+    pub path: String,
+    pub raw_sha256: String,
+}
+
+impl CalibrationArmBinding {
+    pub fn validate(&self) -> Result<()> {
+        crate::seal::validate_relative_path(&self.path)?;
+        validate_non_placeholder_sha256("calibration arm raw", &self.raw_sha256)
+    }
 }
 
 impl CalibrationManifest {
     pub fn validate(&self) -> Result<()> {
-        if self.schema != CALIBRATION_MANIFEST_SCHEMA || self.records.is_empty() {
-            return Err(Error::new("unsupported or empty calibration manifest"));
+        if self.schema != CALIBRATION_MANIFEST_SCHEMA {
+            return Err(Error::new("unsupported calibration manifest"));
         }
         validate_identifier("calibration_id", &self.calibration_id)?;
+        for hash in [
+            &self.intent_sha256,
+            &self.machine_sha256,
+            &self.build_set_sha256,
+            &self.topology_smoke_sha256,
+            &self.execution_state_sha256,
+            &self.projection_sha256,
+        ] {
+            validate_non_placeholder_sha256("calibration manifest hash", hash)?;
+        }
+        for hash in [
+            self.calibration_plan_sha256.as_ref(),
+            self.authoritative_parameters_sha256.as_ref(),
+        ]
+        .into_iter()
+        .flatten()
+        {
+            validate_non_placeholder_sha256("optional calibration manifest hash", hash)?;
+        }
+        if self
+            .selected_n
+            .is_some_and(|n| !matches!(n, 30 | 50 | 70 | 100))
+            || self.terminal_reasons.iter().any(String::is_empty)
+            || (self.terminal_state == TerminalState::Pass && !self.terminal_reasons.is_empty())
+            || (self.records.is_empty() && self.terminal_state != TerminalState::Blocked)
+        {
+            return Err(Error::new("calibration manifest terminal data is invalid"));
+        }
+        for (expected_ordinal, binding) in (0_u64..).zip(&self.arm_bindings) {
+            binding.validate()?;
+            if binding.ordinal != expected_ordinal {
+                return Err(Error::new(
+                    "calibration manifest arm bindings are not a contiguous prefix",
+                ));
+            }
+        }
+        if self.records.len() != self.arm_bindings.len() {
+            return Err(Error::new(
+                "calibration manifest records and raw bindings differ in length",
+            ));
+        }
+        let mut signature_keys = BTreeSet::new();
+        for signature in &self.signature_bindings {
+            signature.validate()?;
+            if !signature_keys.insert(signature.key()) {
+                return Err(Error::new(
+                    "calibration manifest signature binding is duplicated",
+                ));
+            }
+        }
         let mut identities = BTreeSet::new();
-        for record in &self.records {
+        for (record, binding) in self.records.iter().zip(&self.arm_bindings) {
             record.validate()?;
             if record.calibration_id != self.calibration_id {
                 return Err(Error::new(
@@ -720,6 +1476,257 @@ impl CalibrationManifest {
             if !identities.insert(key) {
                 return Err(Error::new("duplicate calibration manifest record"));
             }
+            if record.class != binding.class {
+                return Err(Error::new(
+                    "calibration record class differs from its raw binding",
+                ));
+            }
+        }
+        Ok(())
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct CampaignDirectBaseline {
+    pub cell: Cell,
+    pub protocol: RawProtocol,
+    pub raw_sha256: String,
+    pub deadline_completions: u64,
+    pub elapsed_ns: u64,
+    pub signature_sha256: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct CalibrationFrequencyObservation {
+    pub ordinal: u64,
+    pub raw_sha256: String,
+    pub median_frequency_khz: u64,
+}
+
+impl CalibrationFrequencyObservation {
+    pub fn validate(&self) -> Result<()> {
+        validate_non_placeholder_sha256("calibration frequency raw", &self.raw_sha256)?;
+        if self.median_frequency_khz < 4_000_000 {
+            return Err(Error::new(
+                "calibration frequency observation is below the absolute floor",
+            ));
+        }
+        Ok(())
+    }
+}
+
+impl CampaignDirectBaseline {
+    pub fn validate(&self) -> Result<()> {
+        self.cell.validate()?;
+        validate_non_placeholder_sha256("campaign D0 raw", &self.raw_sha256)?;
+        validate_non_placeholder_sha256("campaign D0 signature", &self.signature_sha256)?;
+        if self.deadline_completions == 0 || self.elapsed_ns == 0 {
+            return Err(Error::new("campaign D0 baseline has a zero rate input"));
+        }
+        Ok(())
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct CampaignCalibrationBinding {
+    pub schema: String,
+    pub calibration_id: String,
+    pub calibration_intent: crate::calibration::FileHashBinding,
+    pub calibration_machine: crate::calibration::FileHashBinding,
+    pub calibration_build_set: crate::calibration::FileHashBinding,
+    pub calibration_plan: crate::calibration::FileHashBinding,
+    pub authoritative_parameters: crate::calibration::FileHashBinding,
+    pub calibration_manifest: crate::calibration::FileHashBinding,
+    pub calibration_projection: crate::calibration::FileHashBinding,
+    pub calibration_seal_root_sha256: String,
+    pub calibration_bundle_index: crate::calibration::FileHashBinding,
+    pub calibration_verification: crate::calibration::FileHashBinding,
+    pub compression_profile: crate::calibration::FileHashBinding,
+    pub continuation_projection: crate::calibration::FileHashBinding,
+    pub campaign_boottime_origin_ns: u64,
+    pub calibration_frequency_observations: Vec<CalibrationFrequencyObservation>,
+    pub direct_baselines: Vec<CampaignDirectBaseline>,
+}
+
+impl CampaignCalibrationBinding {
+    pub fn validate(&self, design: &DesignLock) -> Result<()> {
+        if self.schema != CAMPAIGN_BINDING_SCHEMA || self.calibration_id != design.calibration_id {
+            return Err(Error::new(
+                "campaign calibration binding identity is invalid",
+            ));
+        }
+        validate_identifier("campaign calibration ID", &self.calibration_id)?;
+        for binding in [
+            &self.calibration_intent,
+            &self.calibration_machine,
+            &self.calibration_build_set,
+            &self.calibration_plan,
+            &self.authoritative_parameters,
+            &self.calibration_manifest,
+            &self.calibration_projection,
+            &self.calibration_bundle_index,
+            &self.calibration_verification,
+            &self.compression_profile,
+            &self.continuation_projection,
+        ] {
+            binding.validate()?;
+        }
+        validate_non_placeholder_sha256(
+            "campaign calibration seal",
+            &self.calibration_seal_root_sha256,
+        )?;
+        if self.calibration_intent.sha256 != design.intent_sha256
+            || self.calibration_machine.sha256 != design.machine_sha256
+            || self.calibration_build_set.sha256 != design.build_set_sha256
+            || self.calibration_plan.sha256 != design.calibration_plan_sha256
+            || self.authoritative_parameters.sha256 != design.authoritative_parameters_sha256
+            || self.calibration_manifest.sha256 != design.calibration_manifest_sha256
+            || self.continuation_projection.sha256 != design.projection_sha256
+            || self.calibration_seal_root_sha256 != design.calibration_seal_root_sha256
+            || self.calibration_bundle_index.sha256 != design.calibration_bundle_index_sha256
+            || self.campaign_boottime_origin_ns == 0
+        {
+            return Err(Error::new(
+                "campaign calibration binding differs from the design lock",
+            ));
+        }
+        if self.calibration_frequency_observations.len() != 750 {
+            return Err(Error::new(
+                "campaign binding lacks exactly 750 class-C frequency observations",
+            ));
+        }
+        let mut frequency_ordinals = BTreeSet::new();
+        let mut frequencies = Vec::with_capacity(750);
+        for observation in &self.calibration_frequency_observations {
+            observation.validate()?;
+            if !frequency_ordinals.insert(observation.ordinal) {
+                return Err(Error::new(
+                    "campaign binding duplicates a class-C frequency ordinal",
+                ));
+            }
+            frequencies.push(observation.median_frequency_khz);
+        }
+        frequencies.sort_unstable();
+        let rank = frequencies
+            .len()
+            .checked_mul(5)
+            .and_then(|value| value.checked_add(99))
+            .ok_or_else(|| Error::new("campaign frequency percentile rank overflow"))?
+            / 100;
+        if frequencies.get(rank.saturating_sub(1)).copied()
+            != Some(design.calibration_frequency_p05_khz)
+        {
+            return Err(Error::new(
+                "campaign binding class-C frequency p05 differs from design lock",
+            ));
+        }
+        let mut keys = BTreeSet::new();
+        for baseline in &self.direct_baselines {
+            baseline.validate()?;
+            if !keys.insert((baseline.cell, baseline.protocol)) {
+                return Err(Error::new("campaign D0 baseline key is duplicated"));
+            }
+        }
+        let expected = all_cells()
+            .into_iter()
+            .flat_map(|cell| {
+                [RawProtocol::H1, RawProtocol::H2]
+                    .into_iter()
+                    .map(move |protocol| (cell, protocol))
+            })
+            .collect::<BTreeSet<_>>();
+        if keys != expected {
+            return Err(Error::new(
+                "campaign D0 baseline inventory is not exactly 30",
+            ));
+        }
+        Ok(())
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct CampaignManifest {
+    pub schema: String,
+    pub run_id: String,
+    pub intent_sha256: String,
+    pub design_lock_sha256: String,
+    pub calibration_binding_sha256: String,
+    pub campaign_plan_sha256: String,
+    pub schedule_sha256: String,
+    pub machine_sha256: String,
+    pub build_set_sha256: String,
+    pub execution_state_sha256: String,
+    pub projection_sha256: String,
+    pub planned_arms: u64,
+    pub completed_arms: u64,
+    pub arm_bindings: Vec<CalibrationArmBinding>,
+    pub pair_bindings: Vec<crate::schedule::PairIdentity>,
+    pub terminal_state: TerminalState,
+    pub terminal_reasons: Vec<String>,
+}
+
+impl CampaignManifest {
+    pub fn validate(&self, n: u32) -> Result<()> {
+        if self.schema != CAMPAIGN_MANIFEST_SCHEMA || !matches!(n, 30 | 50) {
+            return Err(Error::new("campaign manifest schema/N is invalid"));
+        }
+        validate_identifier("campaign manifest run ID", &self.run_id)?;
+        for hash in [
+            &self.intent_sha256,
+            &self.design_lock_sha256,
+            &self.calibration_binding_sha256,
+            &self.campaign_plan_sha256,
+            &self.schedule_sha256,
+            &self.machine_sha256,
+            &self.build_set_sha256,
+            &self.execution_state_sha256,
+            &self.projection_sha256,
+        ] {
+            validate_non_placeholder_sha256("campaign manifest hash", hash)?;
+        }
+        let expected = 78_u64
+            .checked_mul(u64::from(n))
+            .ok_or_else(|| Error::new("campaign manifest arm count overflow"))?;
+        if self.planned_arms != expected
+            || self.completed_arms > self.planned_arms
+            || self.arm_bindings.len() as u64 != self.completed_arms
+            || self.terminal_reasons.iter().any(String::is_empty)
+            || (self.terminal_state == TerminalState::Pass
+                && (!self.terminal_reasons.is_empty() || self.completed_arms != expected))
+        {
+            return Err(Error::new(
+                "campaign manifest terminal inventory is invalid",
+            ));
+        }
+        for (ordinal, binding) in (0_u64..).zip(&self.arm_bindings) {
+            binding.validate()?;
+            if binding.ordinal != ordinal
+                || !matches!(binding.class, EvidenceClass::A | EvidenceClass::D)
+            {
+                return Err(Error::new(
+                    "campaign manifest arm bindings are not an exact A/D prefix",
+                ));
+            }
+        }
+        let mut pair_keys = BTreeSet::new();
+        for pair in &self.pair_bindings {
+            pair.validate()?;
+            if !pair_keys.insert((pair.comparison_id.clone(), pair.round)) {
+                return Err(Error::new("campaign manifest pair identity is duplicated"));
+            }
+        }
+        let expected_pairs = 45_usize
+            .checked_mul(usize::try_from(n).map_err(|_| Error::new("campaign N overflow"))?)
+            .ok_or_else(|| Error::new("campaign pair count overflow"))?;
+        if self.terminal_state == TerminalState::Pass && self.pair_bindings.len() != expected_pairs
+        {
+            return Err(Error::new(
+                "passing campaign manifest lacks the complete pair inventory",
+            ));
         }
         Ok(())
     }
@@ -1206,6 +2213,8 @@ mod tests {
                 .expect("test executable hash"),
             zstd: ZstdParameterProgram::fixed(),
             raw_limits: RawLimits::fixed(),
+            trust_boundary: None,
+            harness_provenance: None,
         };
         let bytes = json::canonical_bytes(&fixture).expect("canonical fixture");
         let intent: Intent = json::from_slice_strict(&bytes).expect("strict shape");
@@ -1263,14 +2272,89 @@ mod tests {
 
     #[test]
     fn design_lock_and_authoritative_records_reject_drifted_domain_data() {
+        let durations = all_cells()
+            .into_iter()
+            .map(|cell| crate::calibration::CellDurations {
+                cell,
+                durations: crate::calibration::FrozenDurations {
+                    warmup_seconds: 3,
+                    measure_seconds: 5,
+                },
+            })
+            .collect::<Vec<_>>();
+        let treatment_signatures = all_cells()
+            .into_iter()
+            .flat_map(|cell| {
+                Arm::ALL.into_iter().map(move |arm| SignatureBinding {
+                    cell,
+                    arm: Some(arm),
+                    direct_protocol: None,
+                    record_path: format!("signatures/{}/{}.json", cell.id(), arm.code()),
+                    record_sha256: "21".repeat(32),
+                    signature_sha256: "22".repeat(32),
+                })
+            })
+            .collect::<Vec<_>>();
+        let direct_signatures = all_cells()
+            .into_iter()
+            .flat_map(|cell| {
+                [RawProtocol::H1, RawProtocol::H2]
+                    .into_iter()
+                    .map(move |protocol| SignatureBinding {
+                        cell,
+                        arm: None,
+                        direct_protocol: Some(protocol),
+                        record_path: format!(
+                            "signatures/{}/{}.json",
+                            cell.id(),
+                            match protocol {
+                                RawProtocol::H1 => "h1",
+                                RawProtocol::H2 => "h2",
+                            }
+                        ),
+                        record_sha256: "23".repeat(32),
+                        signature_sha256: "24".repeat(32),
+                    })
+            })
+            .collect::<Vec<_>>();
         let mut design = DesignLock {
             schema: DESIGN_LOCK_SCHEMA.to_owned(),
+            calibration_id: "calibration-fixture".to_owned(),
+            candidate_commit: INITIAL_CANDIDATE_COMMIT.to_owned(),
             intent_sha256: "01".repeat(32),
+            machine_sha256: "02".repeat(32),
+            build_set_sha256: "03".repeat(32),
+            topology_smoke_sha256: "04".repeat(32),
             calibration_plan_sha256: "11".repeat(32),
+            authoritative_parameters_sha256: "12".repeat(32),
+            calibration_manifest_sha256: "13".repeat(32),
+            projection_sha256: "14".repeat(32),
+            calibration_seal_root_sha256: "15".repeat(32),
+            calibration_bundle_index_sha256: "16".repeat(32),
             selected_n: 30,
             schedule_seed: 9,
             rounds: schedule::generate_rounds(9, 30).expect("rounds"),
             comparisons: hard_comparisons(),
+            authoritative_durations: durations.clone(),
+            treatment_signatures,
+            direct_signatures,
+            direct_mappings: crate::process_plan::direct_mappings(),
+            runtime_projection: crate::calibration::project_runtime(
+                30,
+                crate::calibration::PRE_FREEZE_FLOOR_NS,
+                0,
+                &durations,
+            )
+            .expect("runtime projection"),
+            tracked_projection: crate::storage::tracked_projection(
+                0,
+                0,
+                &[],
+                &[],
+                5 * crate::storage::MIB,
+            )
+            .expect("tracked projection"),
+            calibration_frequency_p05_khz: 4_000_000,
         };
         assert!(design.validate().is_ok());
         design.rounds[0].cells[0] = design.rounds[0].cells[1];

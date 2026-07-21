@@ -1,8 +1,10 @@
+use crate::control::ProtocolDateObservation;
 use crate::json;
 use crate::schema::{
     validate_sha256, Arm, ArmMetrics, EvidenceClass, RawArmMetadata, RawProtocol, Workload,
     TASK_CAP_BYTES,
 };
+use crate::session::{ready_predicates_at, ReadySessionEvidence};
 use crate::{Error, Result};
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
@@ -21,6 +23,14 @@ const RECORD_SCHEMA: u16 = 1;
 const RECORD_HEADER_BYTES: usize = 32;
 const OPERATION_BASE_PAYLOAD_BYTES: usize = 192;
 const OPERATION_LANE_RECORD_BYTES: usize = 24;
+
+const fn is_zero(value: &u64) -> bool {
+    *value == 0
+}
+
+const fn is_false(value: &bool) -> bool {
+    !*value
+}
 
 pub const COMMON_ARM_MEMBERS: [&str; 8] = [
     "metadata.json",
@@ -96,16 +106,122 @@ pub struct QuietEvidence {
     pub swap_out_delta: u64,
     pub steal_ticks_delta: u64,
     pub external_time_clean: bool,
+    #[serde(default, skip_serializing_if = "is_zero")]
+    pub search_start_ns: u64,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub orchestrator_threads: Vec<QuietOrchestratorThread>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub candidates: Vec<QuietCandidateEvidence>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct QuietOrchestratorThread {
+    pub pid: u32,
+    pub tid: u32,
+    pub start_time_ticks: u64,
+    pub comm: String,
+    pub assigned_cpu: u16,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct QuietCpuEvidence {
+    pub cpu: u16,
+    pub scheduled_ticks: u64,
+    pub capacity_ticks: u64,
+    pub orchestrator_ticks_subtracted: u64,
+    pub external_ticks: u64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct QuietCandidateEvidence {
+    pub start_ns: u64,
+    pub end_ns: u64,
+    pub cpu_psi_some_us: u64,
+    pub memory_psi_full_us: u64,
+    pub io_psi_full_us: u64,
+    pub swap_in_delta: u64,
+    pub swap_out_delta: u64,
+    pub steal_ticks_delta: u64,
+    pub cpus: Vec<QuietCpuEvidence>,
+    pub orchestrator_inventory_stable: bool,
+    pub accepted: bool,
 }
 
 impl QuietEvidence {
     pub fn validate(&self) -> Result<()> {
-        if self.schema != "amg-http2-perf/quiet/v1"
-            || self.clock != "CLOCK_MONOTONIC"
+        if !matches!(
+            self.schema.as_str(),
+            "amg-http2-perf/quiet/v1" | "amg-http2-perf/quiet/v2"
+        ) || self.clock != "CLOCK_MONOTONIC"
             || self.end_ns.checked_sub(self.start_ns) != Some(10_000_000_000)
             || self.q_extra_ns > 120_000_000_000
         {
             return Err(Error::new("invalid exact Q_obs boundary"));
+        }
+        if self.schema == "amg-http2-perf/quiet/v1" {
+            if self.search_start_ns != 0
+                || !self.orchestrator_threads.is_empty()
+                || !self.candidates.is_empty()
+            {
+                return Err(Error::new("v1 quiet evidence contains v2 fields"));
+            }
+            return Ok(());
+        }
+        if self.search_start_ns == 0
+            || self.orchestrator_threads.is_empty()
+            || self.candidates.is_empty()
+        {
+            return Err(Error::new(
+                "v2 quiet evidence lacks search/inventory/candidates",
+            ));
+        }
+        let mut identities = BTreeSet::new();
+        for thread in &self.orchestrator_threads {
+            if thread.pid == 0
+                || thread.tid == 0
+                || thread.start_time_ticks == 0
+                || thread.comm.is_empty()
+                || !crate::linux::CONTROL_CPUS.contains(&thread.assigned_cpu)
+                || !identities.insert((thread.pid, thread.tid, thread.start_time_ticks))
+            {
+                return Err(Error::new("quiet orchestrator inventory is malformed"));
+            }
+        }
+        let mut previous_end = self.search_start_ns;
+        for (index, candidate) in self.candidates.iter().enumerate() {
+            if candidate.start_ns < previous_end
+                || candidate.end_ns.checked_sub(candidate.start_ns) != Some(10_000_000_000)
+                || candidate.accepted != candidate.recomputed_clean()
+                || (index + 1 != self.candidates.len() && candidate.accepted)
+            {
+                return Err(Error::new(
+                    "quiet candidate boundary or independent decision is invalid",
+                ));
+            }
+            previous_end = candidate.end_ns;
+        }
+        let accepted = self
+            .candidates
+            .last()
+            .ok_or_else(|| Error::new("quiet candidate inventory is empty"))?;
+        if !accepted.accepted
+            || self.start_ns != accepted.start_ns
+            || self.end_ns != accepted.end_ns
+            || self.q_extra_ns != accepted.start_ns.saturating_sub(self.search_start_ns)
+            || self.cpu_psi_some_us != accepted.cpu_psi_some_us
+            || self.memory_psi_full_us != accepted.memory_psi_full_us
+            || self.io_psi_full_us != accepted.io_psi_full_us
+            || self.swap_in_delta != accepted.swap_in_delta
+            || self.swap_out_delta != accepted.swap_out_delta
+            || self.steal_ticks_delta != accepted.steal_ticks_delta
+            || self.external_time_clean != quiet_external_time_clean(&accepted.cpus)
+        {
+            return Err(Error::new(
+                "final quiet observation differs from retained candidate search",
+            ));
         }
         Ok(())
     }
@@ -120,6 +236,84 @@ impl QuietEvidence {
             && self.steal_ticks_delta == 0
             && self.external_time_clean
     }
+}
+
+impl QuietCandidateEvidence {
+    #[must_use]
+    pub fn recomputed_clean(&self) -> bool {
+        self.end_ns.checked_sub(self.start_ns) == Some(10_000_000_000)
+            && self.orchestrator_inventory_stable
+            && self.cpu_psi_some_us <= 50_000
+            && self.memory_psi_full_us == 0
+            && self.io_psi_full_us == 0
+            && self.swap_in_delta == 0
+            && self.swap_out_delta == 0
+            && self.steal_ticks_delta == 0
+            && quiet_external_time_clean(&self.cpus)
+    }
+
+    #[must_use]
+    pub fn external_time_clean(&self) -> bool {
+        quiet_external_time_clean(&self.cpus)
+    }
+}
+
+fn quiet_external_time_clean(cpus: &[QuietCpuEvidence]) -> bool {
+    if cpus.len() != 32 {
+        return false;
+    }
+    let mut by_cpu = BTreeMap::new();
+    for row in cpus {
+        if row.capacity_ticks == 0
+            || row.scheduled_ticks > row.capacity_ticks
+            || row.orchestrator_ticks_subtracted > row.scheduled_ticks
+            || row.external_ticks
+                != row
+                    .scheduled_ticks
+                    .saturating_sub(row.orchestrator_ticks_subtracted)
+            || (row.orchestrator_ticks_subtracted != 0
+                && !crate::linux::CONTROL_CPUS.contains(&row.cpu))
+            || u128::from(row.external_ticks) * 100 > u128::from(row.capacity_ticks)
+            || by_cpu.insert(row.cpu, row).is_some()
+        {
+            return false;
+        }
+    }
+    for first in 0_u16..16 {
+        let (Some(left), Some(right)) = (by_cpu.get(&first), by_cpu.get(&(first + 16))) else {
+            return false;
+        };
+        let Some(external) = left.external_ticks.checked_add(right.external_ticks) else {
+            return false;
+        };
+        let Some(capacity) = left.capacity_ticks.checked_add(right.capacity_ticks) else {
+            return false;
+        };
+        if u128::from(external) * 200 > u128::from(capacity) {
+            return false;
+        }
+    }
+    for role_cpus in [
+        crate::linux::GATEWAY_CPUS,
+        crate::linux::FIXTURE_CPUS,
+        crate::linux::LOAD_CPUS,
+        crate::linux::CONTROL_CPUS,
+    ] {
+        let totals = role_cpus.iter().try_fold((0_u64, 0_u64), |totals, cpu| {
+            let row = by_cpu.get(cpu)?;
+            Some((
+                totals.0.checked_add(row.external_ticks)?,
+                totals.1.checked_add(row.capacity_ticks)?,
+            ))
+        });
+        let Some((external, capacity)) = totals else {
+            return false;
+        };
+        if u128::from(external) * 400 > u128::from(capacity) {
+            return false;
+        }
+    }
+    true
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -205,7 +399,13 @@ impl ThreadLifecycleEvidence {
             || self.deaths_after_freeze != 0
             || self.migrations_after_freeze != 0
         {
-            return Err(Error::new("invalid thread lifecycle/freeze evidence"));
+            return Err(Error::new(format!(
+                "invalid thread lifecycle/freeze evidence: poll={} births={} deaths={} migrations={}",
+                self.lifecycle_poll_max_ns,
+                self.births_after_freeze,
+                self.deaths_after_freeze,
+                self.migrations_after_freeze
+            )));
         }
         let mut previous_end = None;
         for stage in &self.stages {
@@ -269,32 +469,182 @@ pub struct SessionClockEvidence {
     pub comparable: bool,
     pub discontinuities: u64,
     pub samples: Vec<ClockSample>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ready_session: Option<ReadySessionEvidence>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub clock_manifest_sha256: Option<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub protocol_dates: Vec<ProtocolDateObservation>,
 }
 
 impl SessionClockEvidence {
     pub fn validate(&self) -> Result<()> {
-        if self.schema != "amg-http2-perf/session-clock/v1" {
+        if !matches!(
+            self.schema.as_str(),
+            "amg-http2-perf/session-clock/v1" | "amg-http2-perf/session-clock/v2"
+        ) {
             return Err(Error::new("unsupported session clock schema"));
         }
+        if self.schema == "amg-http2-perf/session-clock/v1" {
+            if self.ready_session.is_some()
+                || self.clock_manifest_sha256.is_some()
+                || !self.protocol_dates.is_empty()
+            {
+                return Err(Error::new("v1 session clock contains v2 fields"));
+            }
+            if self.direct {
+                if !self.samples.is_empty() || !self.comparable || self.discontinuities != 0 {
+                    return Err(Error::new("direct session clock record is not fixed N/A"));
+                }
+                return Ok(());
+            }
+            if self.samples.is_empty()
+                || self.samples.iter().any(|sample| {
+                    sample.boottime_before_ns > sample.boottime_after_ns
+                        || !sample.ready
+                        || !sample.active
+                        || sample.refresh_due
+                        || sample.touch_due
+                })
+            {
+                return Err(Error::new("invalid ready-session clock continuity samples"));
+            }
+            return Ok(());
+        }
+        let clock_manifest = self
+            .clock_manifest_sha256
+            .as_ref()
+            .ok_or_else(|| Error::new("v2 session clock lacks its clock manifest root"))?;
+        validate_sha256("clock boundary manifest", clock_manifest)?;
+        if placeholder_hash(clock_manifest) {
+            return Err(Error::new("clock boundary manifest is a placeholder"));
+        }
         if self.direct {
-            if !self.samples.is_empty() || !self.comparable || self.discontinuities != 0 {
+            if !self.samples.is_empty()
+                || !self.comparable
+                || self.discontinuities != 0
+                || self.ready_session.is_some()
+                || !self.protocol_dates.is_empty()
+            {
                 return Err(Error::new("direct session clock record is not fixed N/A"));
             }
             return Ok(());
         }
-        if self.samples.is_empty()
-            || self.samples.iter().any(|sample| {
-                sample.boottime_before_ns > sample.boottime_after_ns
-                    || !sample.ready
-                    || !sample.active
-                    || sample.refresh_due
-                    || sample.touch_due
-            })
-        {
-            return Err(Error::new("invalid ready-session clock continuity samples"));
+        let ready_session = self
+            .ready_session
+            .as_ref()
+            .ok_or_else(|| Error::new("v2 gateway session clock lacks ready-session evidence"))?;
+        if self.samples.is_empty() || self.protocol_dates.is_empty() {
+            return Err(Error::new(
+                "v2 gateway session clock lacks clock or HTTP Date observations",
+            ));
+        }
+        for sample in &self.samples {
+            if sample.boottime_before_ns > sample.boottime_after_ns {
+                return Err(Error::new("session clock BOOTTIME bracket is inverted"));
+            }
+            let derived = ready_predicates_at(ready_session, sample.realtime_ns)?;
+            if sample.ready != derived.ready
+                || sample.active != derived.active
+                || sample.refresh_due != derived.access_refresh_due
+                || sample.touch_due != derived.touch_due
+            {
+                return Err(Error::new(
+                    "retained session predicate bits differ from independent derivation",
+                ));
+            }
+        }
+        let derived_discontinuities = realtime_discontinuities(&self.samples)?;
+        if self.discontinuities != derived_discontinuities {
+            return Err(Error::new(
+                "retained REALTIME discontinuity count differs from bracketed samples",
+            ));
+        }
+        for date in &self.protocol_dates {
+            if date.value.is_empty()
+                || date.value.len() > 64
+                || date.boottime_before_ns > date.boottime_after_ns
+                || crate::load::parse_http_date_seconds(&date.value)? != date.unix_seconds
+            {
+                return Err(Error::new("invalid BOOTTIME-bracketed HTTP Date evidence"));
+            }
+        }
+        let derived_comparable = self.derived_comparable()?;
+        if self.comparable != derived_comparable {
+            return Err(Error::new(
+                "retained session comparability differs from independent derivation",
+            ));
         }
         Ok(())
     }
+
+    pub fn derived_comparable(&self) -> Result<bool> {
+        if self.direct {
+            return Ok(self.schema == "amg-http2-perf/session-clock/v2"
+                && self.samples.is_empty()
+                && self.protocol_dates.is_empty());
+        }
+        let Some(ready_session) = &self.ready_session else {
+            return Ok(false);
+        };
+        if self.samples.is_empty() || self.protocol_dates.is_empty() {
+            return Ok(false);
+        }
+        let predicates_clean = self.samples.iter().try_fold(true, |clean, sample| {
+            let derived = ready_predicates_at(ready_session, sample.realtime_ns)?;
+            Ok::<bool, Error>(
+                clean
+                    && derived.ready
+                    && derived.active
+                    && !derived.access_refresh_due
+                    && !derived.touch_due,
+            )
+        })?;
+        let minimum_realtime = self
+            .samples
+            .iter()
+            .map(|sample| sample.realtime_ns / 1_000_000_000)
+            .min()
+            .unwrap_or(0)
+            .saturating_sub(1);
+        let maximum_realtime = self
+            .samples
+            .iter()
+            .map(|sample| sample.realtime_ns / 1_000_000_000)
+            .max()
+            .unwrap_or(0)
+            .saturating_add(1);
+        let dates_comparable = self.protocol_dates.iter().all(|date| {
+            (minimum_realtime..=maximum_realtime).contains(&date.unix_seconds)
+                && date.boottime_before_ns <= date.boottime_after_ns
+        });
+        Ok(predicates_clean && realtime_discontinuities(&self.samples)? == 0 && dates_comparable)
+    }
+}
+
+fn realtime_discontinuities(samples: &[ClockSample]) -> Result<u64> {
+    samples.windows(2).try_fold(0_u64, |count, pair| {
+        let previous_boot = pair[0]
+            .boottime_before_ns
+            .checked_add(pair[0].boottime_after_ns)
+            .ok_or_else(|| Error::new("previous BOOTTIME midpoint overflow"))?
+            / 2;
+        let current_boot = pair[1]
+            .boottime_before_ns
+            .checked_add(pair[1].boottime_after_ns)
+            .ok_or_else(|| Error::new("current BOOTTIME midpoint overflow"))?
+            / 2;
+        let boot_delta = current_boot
+            .checked_sub(previous_boot)
+            .ok_or_else(|| Error::new("BOOTTIME continuity moved backwards"))?;
+        let discontinuous = pair[1]
+            .realtime_ns
+            .checked_sub(pair[0].realtime_ns)
+            .is_none_or(|delta| delta.abs_diff(boot_delta) > 100_000_000);
+        count
+            .checked_add(u64::from(discontinuous))
+            .ok_or_else(|| Error::new("REALTIME discontinuity count overflow"))
+    })
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -324,6 +674,39 @@ pub struct RoleUtilizationEvidence {
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
+pub struct RuntimeResidualEvidence {
+    pub role: String,
+    pub phase: String,
+    pub start_ns: u64,
+    pub end_ns: u64,
+    pub process_runtime_lower_ticks: u64,
+    pub process_runtime_upper_ticks: u64,
+    pub known_tid_runtime_lower_ticks: u64,
+    pub known_tid_runtime_upper_ticks: u64,
+    pub u_role_lower_ticks: u64,
+    pub u_role_upper_ticks: u64,
+    pub signed_residual_lower_ticks: i64,
+    pub signed_residual_upper_ticks: i64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct NoiseScopeDecisionEvidence {
+    pub attribution_phase: String,
+    pub interval_kind: String,
+    pub scope: String,
+    pub role: String,
+    pub cpus: Vec<u16>,
+    pub start_ns: u64,
+    pub end_ns: u64,
+    pub capacity_ticks: u64,
+    pub external_upper_ticks: u64,
+    pub limit_basis_points: u16,
+    pub accepted: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct ResourceEvidence {
     pub schema: String,
     pub gateway_ticks_start: u64,
@@ -345,12 +728,28 @@ pub struct ResourceEvidence {
     pub direct_ceiling_ops: Option<u64>,
     pub gateway_ops: Option<u64>,
     pub calibration_direct_ops: Option<u64>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub frozen_whole_buckets: Vec<CpuBucketEvidence>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub frozen_bracket_buckets: Vec<CpuBucketEvidence>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub dynamic_buckets: Vec<CpuBucketEvidence>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub residuals: Vec<RuntimeResidualEvidence>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub scope_decisions: Vec<NoiseScopeDecisionEvidence>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub producer_blockers: Vec<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub calibration_frequency_p05_khz: Option<u64>,
 }
 
 impl ResourceEvidence {
     pub fn validate(&self, class: EvidenceClass) -> Result<()> {
-        if self.schema != "amg-http2-perf/resources/v1"
-            || self.gateway_ticks_deadline < self.gateway_ticks_start
+        if !matches!(
+            self.schema.as_str(),
+            "amg-http2-perf/resources/v1" | "amg-http2-perf/resources/v2"
+        ) || self.gateway_ticks_deadline < self.gateway_ticks_start
             || self.gateway_ticks_drain < self.gateway_ticks_deadline
             || self.vm_hwm_kib == 0
             || self.buckets.is_empty()
@@ -368,7 +767,6 @@ impl ResourceEvidence {
                 || bucket.tid_runtime_lower > bucket.tid_runtime_upper
                 || bucket.process_runtime_upper < bucket.tid_runtime_lower
                 || bucket.tid_runtime_upper < bucket.process_runtime_lower
-                || bucket.attribution_uncertainty_ticks > 1
                 || bucket.external_upper_ticks > bucket.capacity_ticks
                 || bucket.scheduled_ticks > bucket.capacity_ticks
             {
@@ -377,6 +775,72 @@ impl ResourceEvidence {
         }
         if class != EvidenceClass::D && self.gateway_ticks_drain == self.gateway_ticks_start {
             return Err(Error::new("gateway arm has zero measured gateway ticks"));
+        }
+        if self.schema == "amg-http2-perf/resources/v2" {
+            if self.frozen_whole_buckets.is_empty()
+                || self.frozen_bracket_buckets.is_empty()
+                || self.dynamic_buckets.is_empty()
+                || self.residuals.is_empty()
+                || self.scope_decisions.is_empty()
+                || self.producer_blockers.iter().any(String::is_empty)
+            {
+                return Err(Error::new(
+                    "v2 resource evidence lacks attribution/residual/scope inventory",
+                ));
+            }
+            for bucket in self
+                .frozen_whole_buckets
+                .iter()
+                .chain(&self.frozen_bracket_buckets)
+                .chain(&self.dynamic_buckets)
+            {
+                validate_cpu_bucket(bucket)?;
+            }
+            for residual in &self.residuals {
+                validate_runtime_residual(residual)?;
+            }
+            for scope in &self.scope_decisions {
+                let recomputed = scope.capacity_ticks > 0
+                    && u128::from(scope.external_upper_ticks) * 10_000
+                        <= u128::from(scope.capacity_ticks) * u128::from(scope.limit_basis_points);
+                if scope.cpus.is_empty()
+                    || scope.start_ns >= scope.end_ns
+                    || scope.accepted != recomputed
+                    || !matches!(scope.attribution_phase.as_str(), "dynamic" | "frozen")
+                    || !matches!(scope.interval_kind.as_str(), "whole" | "one-second")
+                    || !matches!(scope.scope.as_str(), "logical" | "sibling-pair" | "role")
+                {
+                    return Err(Error::new(
+                        "resource noise scope differs from independent arithmetic",
+                    ));
+                }
+            }
+            if self.scope_decisions
+                != crate::sampler::recompute_noise_scopes_from_raw(
+                    &self.frozen_whole_buckets,
+                    &self.frozen_bracket_buckets,
+                    &self.dynamic_buckets,
+                )?
+            {
+                return Err(Error::new(
+                    "retained noise scopes differ from raw counter-bucket recomputation",
+                ));
+            }
+            match self.calibration_frequency_p05_khz {
+                Some(reference) if reference >= 4_000_000 => {
+                    if self.frequency_floor_khz != reference.saturating_mul(95) / 100 {
+                        return Err(Error::new(
+                            "authoritative frequency display floor differs from calibration p05",
+                        ));
+                    }
+                }
+                None if self.frequency_floor_khz == 4_000_000 => {}
+                _ => {
+                    return Err(Error::new(
+                        "resource frequency policy is neither calibration-absolute nor authoritative-relative",
+                    ))
+                }
+            }
         }
         Ok(())
     }
@@ -391,8 +855,30 @@ impl ResourceEvidence {
             && self.io_psi_full_us == 0
             && self.tctl_start_millidegrees <= 75_000
             && self.tctl_max_millidegrees < 85_000
-            && self.median_frequency_khz >= self.frequency_floor_khz
+            && self.frequency_clean()
+            && self
+                .frozen_whole_buckets
+                .iter()
+                .chain(&self.frozen_bracket_buckets)
+                .chain(&self.dynamic_buckets)
+                .all(|bucket| bucket.attribution_uncertainty_ticks <= 1)
             && resource_noise_clean(&self.buckets)
+            && (self.schema != "amg-http2-perf/resources/v2"
+                || (self.producer_blockers.is_empty()
+                    && crate::sampler::recompute_noise_scopes_from_raw(
+                        &self.frozen_whole_buckets,
+                        &self.frozen_bracket_buckets,
+                        &self.dynamic_buckets,
+                    )
+                    .is_ok_and(|scopes| scopes == self.scope_decisions)
+                    && self.scope_decisions.iter().all(|scope| {
+                        scope.accepted
+                            && scope.capacity_ticks > 0
+                            && u128::from(scope.external_upper_ticks) * 10_000
+                                <= u128::from(scope.capacity_ticks)
+                                    * u128::from(scope.limit_basis_points)
+                    })
+                    && self.residuals.iter().all(runtime_residual_clean)))
             && self.utilization.iter().all(|role| {
                 role.capacity_ticks > 0
                     && u128::from(role.used_ticks) * 100 <= u128::from(role.capacity_ticks) * 70
@@ -402,6 +888,78 @@ impl ResourceEvidence {
                 self.gateway_ops,
                 self.calibration_direct_ops,
             )
+    }
+
+    fn frequency_clean(&self) -> bool {
+        self.calibration_frequency_p05_khz.map_or_else(
+            || self.median_frequency_khz >= self.frequency_floor_khz,
+            |reference| u128::from(self.median_frequency_khz) * 100 >= u128::from(reference) * 95,
+        )
+    }
+}
+
+fn validate_cpu_bucket(bucket: &CpuBucketEvidence) -> Result<()> {
+    if bucket.role.is_empty()
+        || bucket.start_ns >= bucket.end_ns
+        || bucket.process_runtime_lower > bucket.process_runtime_upper
+        || bucket.tid_runtime_lower > bucket.tid_runtime_upper
+        || bucket.scheduled_ticks > bucket.capacity_ticks
+        || bucket.external_upper_ticks > bucket.capacity_ticks
+    {
+        return Err(Error::new(format!(
+            "invalid retained attribution counter bracket cpu={} role={} start={} end={} capacity={} scheduled={} external={}",
+            bucket.cpu,
+            bucket.role,
+            bucket.start_ns,
+            bucket.end_ns,
+            bucket.capacity_ticks,
+            bucket.scheduled_ticks,
+            bucket.external_upper_ticks
+        )));
+    }
+    Ok(())
+}
+
+fn validate_runtime_residual(residual: &RuntimeResidualEvidence) -> Result<()> {
+    if residual.role.is_empty()
+        || !matches!(residual.phase.as_str(), "dynamic" | "frozen")
+        || residual.start_ns >= residual.end_ns
+        || residual.process_runtime_lower_ticks > residual.process_runtime_upper_ticks
+        || residual.known_tid_runtime_lower_ticks > residual.known_tid_runtime_upper_ticks
+        || residual.u_role_lower_ticks > residual.u_role_upper_ticks
+    {
+        return Err(Error::new("invalid retained process/TID residual bracket"));
+    }
+    let signed_lower = i128::from(residual.process_runtime_lower_ticks)
+        - i128::from(residual.known_tid_runtime_upper_ticks);
+    let signed_upper = i128::from(residual.process_runtime_upper_ticks)
+        - i128::from(residual.known_tid_runtime_lower_ticks);
+    if i64::try_from(signed_lower).ok() != Some(residual.signed_residual_lower_ticks)
+        || i64::try_from(signed_upper).ok() != Some(residual.signed_residual_upper_ticks)
+    {
+        return Err(Error::new(
+            "retained signed residual differs from counter brackets",
+        ));
+    }
+    Ok(())
+}
+
+fn runtime_residual_clean(residual: &RuntimeResidualEvidence) -> bool {
+    if residual.phase == "frozen" {
+        residual.signed_residual_lower_ticks <= 0
+            && residual.signed_residual_upper_ticks >= 0
+            && residual.u_role_lower_ticks == 0
+            && residual.u_role_upper_ticks == 0
+    } else {
+        let known_plus_u_lower = residual
+            .known_tid_runtime_lower_ticks
+            .checked_add(residual.u_role_lower_ticks);
+        let known_plus_u_upper = residual
+            .known_tid_runtime_upper_ticks
+            .checked_add(residual.u_role_upper_ticks);
+        residual.u_role_lower_ticks <= residual.u_role_upper_ticks
+            && known_plus_u_lower.is_some_and(|value| value <= residual.process_runtime_upper_ticks)
+            && known_plus_u_upper.is_some_and(|value| value >= residual.process_runtime_lower_ticks)
     }
 }
 
@@ -596,6 +1154,38 @@ pub struct EndpointEvidence {
     pub tripwire_bytes: u64,
     pub duplicate_operations: u64,
     pub phases: Vec<EndpointPhaseEvidence>,
+    #[serde(default, skip_serializing_if = "is_zero")]
+    pub downstream_protocol_observations: u64,
+    #[serde(default, skip_serializing_if = "is_zero")]
+    pub upstream_protocol_observations: u64,
+    #[serde(default, skip_serializing_if = "is_zero")]
+    pub fixture_identity_observations: u64,
+    #[serde(default, skip_serializing_if = "is_zero")]
+    pub fixture_identity_correct_observations: u64,
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub fixture_identity_correct: bool,
+    #[serde(default, skip_serializing_if = "is_zero")]
+    pub request_header_observations: u64,
+    #[serde(default, skip_serializing_if = "is_zero")]
+    pub request_headers_sanitized_observations: u64,
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub request_headers_sanitized: bool,
+    #[serde(default, skip_serializing_if = "is_zero")]
+    pub response_header_observations: u64,
+    #[serde(default, skip_serializing_if = "is_zero")]
+    pub response_headers_sanitized_observations: u64,
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub response_headers_sanitized: bool,
+    #[serde(default, skip_serializing_if = "is_zero")]
+    pub gateway_date_observations: u64,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub gateway_date_values_sha256: String,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub config_manifest_sha256: String,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub corpus_manifest_sha256: String,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub connection_policy_manifest_sha256: String,
 }
 
 impl EndpointEvidence {
@@ -604,8 +1194,51 @@ impl EndpointEvidence {
         metadata: &RawArmMetadata,
         operation: &OperationSummaryEvidence,
     ) -> Result<()> {
-        if self.schema != "amg-http2-perf/endpoints/v1" || self.phases.len() != 4 {
+        if !matches!(
+            self.schema.as_str(),
+            "amg-http2-perf/endpoints/v1" | "amg-http2-perf/endpoints/v2"
+        ) || self.phases.len() != 4
+        {
             return Err(Error::new("invalid endpoint evidence schema/inventory"));
+        }
+        if self.schema == "amg-http2-perf/endpoints/v2" {
+            for (name, hash) in [
+                ("gateway Date values", &self.gateway_date_values_sha256),
+                ("config manifest", &self.config_manifest_sha256),
+                ("corpus manifest", &self.corpus_manifest_sha256),
+                (
+                    "connection policy manifest",
+                    &self.connection_policy_manifest_sha256,
+                ),
+            ] {
+                validate_sha256(name, hash)?;
+                if placeholder_hash(hash) {
+                    return Err(Error::new(format!("{name} hash is a placeholder")));
+                }
+            }
+            if self.downstream_protocol_observations == 0
+                || self.upstream_protocol_observations == 0
+                || self.fixture_identity_observations == 0
+                || self.fixture_identity_correct_observations > self.fixture_identity_observations
+                || self.request_header_observations == 0
+                || self.request_headers_sanitized_observations > self.request_header_observations
+                || self.response_header_observations == 0
+                || self.response_headers_sanitized_observations > self.response_header_observations
+                || self.fixture_identity_correct
+                    != (self.fixture_identity_correct_observations
+                        == self.fixture_identity_observations)
+                || self.request_headers_sanitized
+                    != (self.request_headers_sanitized_observations
+                        == self.request_header_observations)
+                || self.response_headers_sanitized
+                    != (self.response_headers_sanitized_observations
+                        == self.response_header_observations)
+                || (metadata.class != EvidenceClass::D && self.gateway_date_observations == 0)
+            {
+                return Err(Error::new(
+                    "observed protocol/identity/header/Date evidence is incomplete or forged",
+                ));
+            }
         }
         for hash in [
             &self.load_operation_hash_sha256,
@@ -783,6 +1416,22 @@ impl EndpointEvidence {
                 if measured.transport_eof != operation.started_operations {
                     violations.push("fresh-H1 upload transport EOF is missing".to_owned());
                 }
+            }
+        }
+        if self.schema == "amg-http2-perf/endpoints/v2" {
+            if !self.fixture_identity_correct {
+                violations.push("fixture identity injection was not observed".to_owned());
+            }
+            if !self.request_headers_sanitized {
+                violations.push(
+                    "browser credential/request header sanitation was not observed".to_owned(),
+                );
+            }
+            if !self.response_headers_sanitized {
+                violations.push("response header sanitation was not observed".to_owned());
+            }
+            if metadata.class != EvidenceClass::D && self.gateway_date_observations == 0 {
+                violations.push("gateway HTTP Date observation is missing".to_owned());
             }
         }
         if self.downstream_protocol == RawProtocol::H2 {
@@ -1342,6 +1991,16 @@ pub fn validate_evidence_tree(root: &Path) -> Result<Vec<ParsedArm>> {
     }
 }
 
+/// Validates one raw arm independently while binding a temporary leaf to its
+/// eventual class-specific path.
+pub fn validate_evidence_leaf(leaf: &Path, expected_relative: &Path) -> Result<ParsedArm> {
+    let metadata: RawArmMetadata =
+        json::require_canonical(&read_bounded(&leaf.join("metadata.json"), 65_536)?)?;
+    metadata.validate()?;
+    validate_raw_path(expected_relative, &metadata)?;
+    validate_arm_leaf(leaf, metadata)
+}
+
 pub fn inspect_evidence_tree(root: &Path) -> Result<EvidenceTreeInspection> {
     let mut files = Vec::new();
     collect_regular_files(root, root, &mut files)?;
@@ -1362,14 +2021,7 @@ pub fn inspect_evidence_tree(root: &Path) -> Result<EvidenceTreeInspection> {
         let relative = leaf
             .strip_prefix(root)
             .map_err(|_| Error::new("raw leaf escaped evidence root"))?;
-        let metadata_path = leaf.join("metadata.json");
-        let parsed = (|| {
-            let metadata: RawArmMetadata =
-                json::require_canonical(&read_bounded(&metadata_path, 65_536)?)?;
-            metadata.validate()?;
-            validate_raw_path(relative, &metadata)?;
-            validate_arm_leaf(&leaf, metadata)
-        })();
+        let parsed = validate_evidence_leaf(&leaf, relative);
         match parsed {
             Ok(arm) => inspection.arms.push(arm),
             Err(error) => inspection.blockers.push(format!(
@@ -2270,6 +2922,13 @@ mod tests {
             direct_ceiling_ops: None,
             gateway_ops: None,
             calibration_direct_ops: None,
+            frozen_whole_buckets: Vec::new(),
+            frozen_bracket_buckets: Vec::new(),
+            dynamic_buckets: Vec::new(),
+            residuals: Vec::new(),
+            scope_decisions: Vec::new(),
+            producer_blockers: Vec::new(),
+            calibration_frequency_p05_khz: None,
         };
         assert!(resource.clean());
         resource.tctl_max_millidegrees = 85_000;

@@ -8,7 +8,7 @@ use crate::{Error, Result, ResultContext};
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeSet;
 use std::fs::{self, File, OpenOptions};
-use std::io::{Read, Write};
+use std::io::{Cursor, Read, Write};
 use std::path::{Component, Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -144,7 +144,91 @@ impl BuildManifest {
         self.validate_mode(repository, false)
     }
 
-    fn validate_mode(&self, repository: &Path, require_current_harness: bool) -> Result<PathBuf> {
+    /// Revalidates sealed build provenance without consulting the ignored
+    /// repository-local build cache. This is the verification mode used for
+    /// extracted delivery bundles and clean committed checkouts.
+    pub fn validate_portable_sealed_evidence(&self, repository: &Path) -> Result<()> {
+        self.validate_declared_policy()?;
+        let repository = fs::canonicalize(repository)?;
+        validate_portable_paths(self)?;
+
+        let git_path = find_executable("git")?;
+        let commit = resolve_commit(&git_path, &repository, &self.commit)?;
+        if commit != self.commit {
+            return Err(Error::new("sealed build commit no longer resolves exactly"));
+        }
+        let tree = git_output(
+            &git_path,
+            &repository,
+            &["rev-parse", &format!("{}^{{tree}}", self.commit)],
+        )?;
+        if tree != self.tree {
+            return Err(Error::new("sealed build tree differs from Git object data"));
+        }
+        let archive = git_command(&git_path, &repository)
+            .args(["archive", "--format=tar", &self.commit])
+            .output()
+            .context("rederive exact Git archive for portable verification")?;
+        if !archive.status.success() {
+            return Err(command_failure(
+                "git archive portable verification",
+                &archive,
+            ));
+        }
+        if u64::try_from(archive.stdout.len()).ok() != Some(self.archive_bytes)
+            || sha256_hex(&archive.stdout) != self.archive_sha256
+        {
+            return Err(Error::new(
+                "sealed archive length/hash differs from fresh Git object archive",
+            ));
+        }
+        let source_entries = archive_tree_entries(&archive.stdout)?;
+        if u64::try_from(source_entries.len()).ok() != Some(self.source_entries)
+            || entry_root(&source_entries) != self.source_tree_sha256
+        {
+            return Err(Error::new(
+                "sealed source-tree provenance differs from the exact Git archive",
+            ));
+        }
+        let cargo_toml = archive_member(&archive.stdout, "Cargo.toml")?;
+        let cargo_lock = archive_member(&archive.stdout, "Cargo.lock")?;
+        if sha256_hex(&cargo_toml) != self.cargo_toml_sha256
+            || sha256_hex(&cargo_lock) != self.cargo_lock_sha256
+        {
+            return Err(Error::new(
+                "sealed Cargo source/lock differs from the exact Git archive",
+            ));
+        }
+
+        let external_cargo_home = fs::canonicalize(&self.external_cargo_home)?;
+        if self.external_cargo_home != external_cargo_home.to_string_lossy() {
+            return Err(Error::new("external Cargo cache path is not canonical"));
+        }
+        validate_registry_cache_inputs(&external_cargo_home, &self.registry_cache_inputs)?;
+        if provenance_sha256(&self.external_cargo_home, &self.registry_cache_inputs)?
+            != self.provenance_sha256
+        {
+            return Err(Error::new("sealed dependency provenance identity changed"));
+        }
+
+        let git_identity = command_identity(&git_path, &["--version"])?;
+        let (cargo_path, rustc_path) = direct_toolchain_paths()?;
+        let cargo_identity = command_identity(&cargo_path, &["-vV"])?;
+        let rustc_identity = command_identity(&rustc_path, &["-vV"])?;
+        require_toolchain(&cargo_identity, &rustc_identity)?;
+        if self.git != git_identity || self.cargo != cargo_identity || self.rustc != rustc_identity
+        {
+            return Err(Error::new(
+                "sealed build toolchain executable/version identity changed",
+            ));
+        }
+        if self.cache_address().key_sha256()? != self.cache_key_sha256 {
+            return Err(Error::new("sealed build input address changed"));
+        }
+        Ok(())
+    }
+
+    fn validate_declared_policy(&self) -> Result<()> {
         if self.schema != BUILD_SCHEMA
             || self.cache_schema != BUILD_CACHE_SCHEMA
             || !self.frozen
@@ -170,6 +254,20 @@ impl BuildManifest {
         ] {
             validate_hash(name, value)?;
         }
+        if self.archive_bytes == 0
+            || self.source_entries == 0
+            || self.vendor_entries == 0
+            || self.binary_bytes == 0
+        {
+            return Err(Error::new(
+                "sealed build manifest has an empty required input",
+            ));
+        }
+        Ok(())
+    }
+
+    fn validate_mode(&self, repository: &Path, require_current_harness: bool) -> Result<PathBuf> {
+        self.validate_declared_policy()?;
         let repository = fs::canonicalize(repository)?;
         let execution_root =
             checked_repository_path(&repository, &self.execution_root_relative_path, true)?;
@@ -437,6 +535,141 @@ pub struct BuildSet {
     pub schema: String,
     pub baseline: BuildManifest,
     pub candidate: BuildManifest,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct CleanRebuildReceipt {
+    pub commit: String,
+    pub tree: String,
+    pub archive_sha256: String,
+    pub source_tree_sha256: String,
+    pub vendor_tree_sha256: String,
+    pub cargo_config_sha256: String,
+    pub binary_bytes: u64,
+    pub binary_sha256: String,
+    pub elf_build_id: Option<String>,
+}
+
+/// Rebuilds one sealed gateway in a new repository-local directory without
+/// reading any previously materialized `.perf` build object.
+pub fn verify_clean_scratch_rebuild(
+    manifest: &BuildManifest,
+    repository: &Path,
+    scratch: &Path,
+) -> Result<CleanRebuildReceipt> {
+    manifest.validate_portable_sealed_evidence(repository)?;
+    require_below_repository(scratch, repository)?;
+    if fs::symlink_metadata(scratch).is_ok() {
+        return Err(Error::new(
+            "clean rebuild scratch already exists or is stale",
+        ));
+    }
+    let repository = fs::canonicalize(repository)?;
+    create_private_dir(scratch)?;
+    let scratch = fs::canonicalize(scratch)?;
+    if !scratch.starts_with(&repository) {
+        return Err(Error::new("clean rebuild scratch escaped repository"));
+    }
+    let source = scratch.join("source");
+    let vendor = scratch.join("vendor");
+    let cargo_home = scratch.join("cargo-home");
+    let target = scratch.join("target");
+    let temporary = scratch.join("tmp");
+    for directory in [&source, &vendor, &cargo_home, &target, &temporary] {
+        create_private_dir(directory)?;
+    }
+
+    let git = find_executable("git")?;
+    let archive_path = scratch.join("source.tar");
+    run_git_archive(&git, &repository, &manifest.commit, &archive_path)?;
+    let archive_bytes = fs::read(&archive_path)?;
+    if u64::try_from(archive_bytes.len()).ok() != Some(manifest.archive_bytes)
+        || sha256_hex(&archive_bytes) != manifest.archive_sha256
+    {
+        return Err(Error::new(
+            "clean rebuild Git archive differs from sealed bytes",
+        ));
+    }
+    extract_git_archive(&archive_path, &source)?;
+    let source_entries = tree_entries(&source)?;
+    if u64::try_from(source_entries.len()).ok() != Some(manifest.source_entries)
+        || entry_root(&source_entries) != manifest.source_tree_sha256
+    {
+        return Err(Error::new(
+            "clean rebuild source tree differs from sealed provenance",
+        ));
+    }
+    let cargo_toml = source.join("Cargo.toml");
+    let cargo_lock = source.join("Cargo.lock");
+    if sha256_hex(&fs::read(&cargo_toml)?) != manifest.cargo_toml_sha256
+        || sha256_hex(&fs::read(&cargo_lock)?) != manifest.cargo_lock_sha256
+    {
+        return Err(Error::new("clean rebuild Cargo source/lock differs"));
+    }
+
+    let external_cargo_home = PathBuf::from(&manifest.external_cargo_home);
+    validate_registry_cache_inputs(&external_cargo_home, &manifest.registry_cache_inputs)?;
+    let (cargo, rustc) = direct_toolchain_paths()?;
+    vendor_dependencies(
+        &cargo,
+        &cargo_toml,
+        &vendor,
+        &cargo_home,
+        &external_cargo_home,
+        &temporary,
+        &scratch,
+    )?;
+    validate_registry_cache_inputs(&external_cargo_home, &manifest.registry_cache_inputs)?;
+    let vendor_entries = tree_entries(&vendor)?;
+    if u64::try_from(vendor_entries.len()).ok() != Some(manifest.vendor_entries)
+        || entry_root(&vendor_entries) != manifest.vendor_tree_sha256
+    {
+        return Err(Error::new(
+            "clean rebuild vendor tree differs from sealed provenance",
+        ));
+    }
+    let cargo_config_sha256 = sha256_hex(&fs::read(cargo_home.join("config.toml"))?);
+    if cargo_config_sha256 != manifest.cargo_config_sha256 {
+        return Err(Error::new(
+            "clean rebuild Cargo config differs from sealed provenance",
+        ));
+    }
+    make_tree_read_only(&source)?;
+    make_tree_read_only(&vendor)?;
+    build_release(
+        &cargo,
+        &rustc,
+        &cargo_toml,
+        &cargo_home,
+        &target,
+        &temporary,
+        &scratch,
+    )?;
+    let binary = fs::read(target.join("release/auth-mini-gateway"))?;
+    let binary_bytes = u64::try_from(binary.len())
+        .map_err(|_| Error::new("clean rebuild binary length exceeds u64"))?;
+    let binary_sha256 = sha256_hex(&binary);
+    let build_id = elf_build_id(&binary);
+    if binary_bytes != manifest.binary_bytes
+        || binary_sha256 != manifest.binary_sha256
+        || build_id != manifest.elf_build_id
+    {
+        return Err(Error::new(
+            "clean rebuild binary length/hash/build-id differs from sealed binary",
+        ));
+    }
+    Ok(CleanRebuildReceipt {
+        commit: manifest.commit.clone(),
+        tree: manifest.tree.clone(),
+        archive_sha256: manifest.archive_sha256.clone(),
+        source_tree_sha256: manifest.source_tree_sha256.clone(),
+        vendor_tree_sha256: manifest.vendor_tree_sha256.clone(),
+        cargo_config_sha256,
+        binary_bytes,
+        binary_sha256,
+        elf_build_id: build_id,
+    })
 }
 
 pub fn build_pair(repository: &Path, execution_root: &Path, candidate: &str) -> Result<BuildSet> {
@@ -1310,6 +1543,100 @@ fn validate_archive_path(path: &Path) -> Result<()> {
         if !matches!(component, Component::Normal(_)) {
             return Err(Error::new("unsafe git archive path component"));
         }
+    }
+    Ok(())
+}
+
+fn archive_tree_entries(bytes: &[u8]) -> Result<Vec<TreeEntryHash>> {
+    let mut archive = tar::Archive::new(Cursor::new(bytes));
+    let mut entries = Vec::new();
+    let mut seen = BTreeSet::new();
+    for entry in archive
+        .entries()
+        .context("read portable Git archive entries")?
+    {
+        let mut entry = entry.context("read portable Git archive entry")?;
+        let kind = entry.header().entry_type();
+        if kind.is_pax_global_extensions() || kind.is_pax_local_extensions() || kind.is_dir() {
+            continue;
+        }
+        if !kind.is_file() {
+            return Err(Error::new(
+                "portable Git archive contains an unsupported entry type",
+            ));
+        }
+        let path = entry.path().context("decode portable Git archive path")?;
+        validate_archive_path(&path)?;
+        let path = path
+            .to_str()
+            .ok_or_else(|| Error::new("portable Git archive path is not UTF-8"))?
+            .replace('\\', "/");
+        if !seen.insert(path.clone()) {
+            return Err(Error::new("portable Git archive repeats a file path"));
+        }
+        let mut payload = Vec::new();
+        entry.read_to_end(&mut payload)?;
+        entries.push(TreeEntryHash {
+            path,
+            bytes: u64::try_from(payload.len())
+                .map_err(|_| Error::new("portable archive member length exceeds u64"))?,
+            sha256: sha256_hex(&payload),
+        });
+    }
+    entries.sort_by(|left, right| left.path.as_bytes().cmp(right.path.as_bytes()));
+    Ok(entries)
+}
+
+fn archive_member(bytes: &[u8], requested: &str) -> Result<Vec<u8>> {
+    let mut archive = tar::Archive::new(Cursor::new(bytes));
+    for entry in archive.entries().context("read Git archive member list")? {
+        let mut entry = entry.context("read Git archive member")?;
+        if !entry.header().entry_type().is_file() {
+            continue;
+        }
+        let path = entry.path().context("decode Git archive member path")?;
+        if path == Path::new(requested) {
+            let mut payload = Vec::new();
+            entry.read_to_end(&mut payload)?;
+            return Ok(payload);
+        }
+    }
+    Err(Error::new(format!(
+        "exact Git archive lacks required member {requested}"
+    )))
+}
+
+fn validate_portable_paths(manifest: &BuildManifest) -> Result<()> {
+    for path in [
+        &manifest.execution_root_relative_path,
+        &manifest.object_relative_path,
+        &manifest.cargo_home_relative_path,
+        &manifest.target_relative_path,
+        &manifest.source_relative_path,
+        &manifest.binary_relative_path,
+    ] {
+        let path = Path::new(path);
+        if path.as_os_str().is_empty()
+            || path.is_absolute()
+            || path
+                .components()
+                .any(|component| !matches!(component, Component::Normal(_)))
+        {
+            return Err(Error::new(
+                "sealed build cache path is not safe and relative",
+            ));
+        }
+    }
+    let object = Path::new(&manifest.object_relative_path);
+    if Path::new(&manifest.source_relative_path) != object.join("source")
+        || Path::new(&manifest.cargo_home_relative_path) != object.join("cargo-home")
+        || Path::new(&manifest.target_relative_path) != object.join("target")
+        || Path::new(&manifest.binary_relative_path) != object.join("binary/auth-mini-gateway")
+        || !object.starts_with(Path::new(&manifest.execution_root_relative_path))
+    {
+        return Err(Error::new(
+            "sealed build cache paths do not preserve their declared object layout",
+        ));
     }
     Ok(())
 }

@@ -134,6 +134,7 @@ impl MaterializationEvidence {
 
         let mut previous_after = None;
         let mut unchanged_waves = 0_u16;
+        let mut interleaved_observations = 0_usize;
         for (index, wave) in self.waves.iter().enumerate() {
             let expected_ordinal = u16::try_from(index)
                 .map_err(|_| Error::new("materialization wave ordinal overflow"))?;
@@ -147,10 +148,33 @@ impl MaterializationEvidence {
             }
             wave.before.validate()?;
             wave.after.validate()?;
-            if previous_after
-                .as_ref()
-                .is_some_and(|checkpoint| checkpoint != &wave.before)
-                || wave.before.monotonic_ns > wave.result.window_start_ns
+            if let Some(previous) = previous_after.as_ref() {
+                if previous != &wave.before {
+                    let observation = self
+                        .stability_observations
+                        .get(interleaved_observations)
+                        .ok_or_else(|| {
+                            Error::new(
+                                "materialization wave gap lacks its retained stability observation",
+                            )
+                        })?;
+                    observation.validate()?;
+                    let overall_stable = observation.stable
+                        && checkpoints_match(previous, &observation.initial)
+                        && checkpoints_match(&observation.initial, &observation.final_checkpoint);
+                    if overall_stable
+                        || observation.initial.monotonic_ns < previous.monotonic_ns
+                        || observation.final_checkpoint != wave.before
+                        || observation.end_ns > wave.result.window_start_ns
+                    {
+                        return Err(Error::new(
+                            "materialization wave gap does not reconcile through one unstable observation",
+                        ));
+                    }
+                    interleaved_observations += 1;
+                }
+            }
+            if wave.before.monotonic_ns > wave.result.window_start_ns
                 || wave.result.window_end_ns > wave.after.monotonic_ns
             {
                 return Err(Error::new(
@@ -206,7 +230,8 @@ impl MaterializationEvidence {
                 let final_checkpoint = previous_after
                     .as_ref()
                     .ok_or_else(|| Error::new("stable materialization has no final checkpoint"))?;
-                if unchanged_waves < MIN_UNCHANGED_FULL_WAVES
+                if self.stability_observations.len() != interleaved_observations + 1
+                    || unchanged_waves < MIN_UNCHANGED_FULL_WAVES
                     || self
                         .lane_completions
                         .iter()
@@ -638,6 +663,7 @@ mod tests {
         };
         let result = LoadResult {
             protocol: Protocol::H1,
+            observed_protocol: Some(Protocol::H1),
             operations_started: 2,
             operations_completed: 2,
             operations_completed_by_deadline: 2,
@@ -708,6 +734,7 @@ mod tests {
                 lanes[1] = 1;
                 lanes
             },
+            protocol_dates: Vec::new(),
         };
         assert!(
             validate_full_wave(&result, cell, Protocol::H1, MATERIALIZATION_PHASE_BASE)

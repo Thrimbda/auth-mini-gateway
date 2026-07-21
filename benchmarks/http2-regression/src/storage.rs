@@ -39,6 +39,26 @@ pub struct ComponentBounds {
     pub total: u64,
 }
 
+impl ComponentBounds {
+    pub fn member_lengths(&self) -> Vec<u64> {
+        [
+            self.metadata_json,
+            self.quiet_json,
+            self.thread_map_json,
+            self.thread_lifecycle_bin,
+            self.session_clock_bin,
+            self.resources_bin,
+            self.endpoints_bin,
+            self.operation_summary_bin,
+            self.materialization_json,
+            self.latencies_u64le,
+        ]
+        .into_iter()
+        .filter(|length| *length != 0)
+        .collect()
+    }
+}
+
 pub fn component_bounds(input: &ArmStorageInput) -> Result<ComponentBounds> {
     if input.duration_ns == 0 || !matches!(input.concurrency, 1 | 16 | 64) {
         return Err(Error::new(
@@ -121,6 +141,7 @@ pub fn ustar_bound(member_lengths: &[u64]) -> Result<u64> {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "kebab-case")]
 pub enum ReachableBranch {
+    BeforeSmoke,
     BeforeFirstScout,
     BeforeWilliams,
     BeforeCalibrationDirect,
@@ -139,6 +160,12 @@ pub struct ReachableInventory {
 
 pub fn reachable_inventory(branch: ReachableBranch, n: Option<u32>) -> Result<ReachableInventory> {
     match branch {
+        ReachableBranch::BeforeSmoke => Ok(ReachableInventory {
+            scout: 0,
+            williams: 0,
+            direct: 0,
+            authoritative: 0,
+        }),
         ReachableBranch::BeforeFirstScout => Ok(ReachableInventory {
             scout: 525,
             williams: 0,
@@ -199,6 +226,216 @@ pub struct RawExecutionProjection {
     pub required_free_bytes_exclusive: u64,
     pub observed_free_bytes: u64,
     pub admissible: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ReachedBranchProjection {
+    pub gate_id: String,
+    pub next_ordinal: u64,
+    pub inventory: ReachableInventory,
+    pub completed_member_count: u64,
+    pub archive_member_lengths: Vec<u64>,
+    pub completed_payload_bytes: u64,
+    pub future_arm_payload_bytes: u64,
+    pub future_unit_payload_bytes: u64,
+    pub future_raw_bytes: u64,
+    pub canonical_archive_bound_bytes: u64,
+    pub compressed_bound_bytes: u64,
+    pub extracted_source_bound_bytes: u64,
+    pub raw: RawExecutionProjection,
+    pub tracked_actual_bytes: u64,
+    pub tracked_remaining_maximum_bytes: u64,
+    pub tracked_total_bound_bytes: u64,
+    pub task_cap_bytes: u64,
+    pub tracked_admissible: bool,
+    pub admissible: bool,
+}
+
+impl ReachedBranchProjection {
+    pub fn validate(&self) -> Result<()> {
+        if self.gate_id.is_empty()
+            || self.gate_id.len() > 128
+            || !self
+                .gate_id
+                .bytes()
+                .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_' | b'.'))
+        {
+            return Err(Error::new("reached-branch storage gate ID is invalid"));
+        }
+        let future_raw_bytes = self
+            .future_arm_payload_bytes
+            .checked_add(self.future_unit_payload_bytes)
+            .ok_or_else(|| Error::new("reached-branch future raw total overflow"))?;
+        let extracted_source_bound_bytes = self
+            .completed_payload_bytes
+            .checked_add(future_raw_bytes)
+            .ok_or_else(|| Error::new("reached-branch extracted source total overflow"))?;
+        let tracked_total_bound_bytes = self
+            .tracked_actual_bytes
+            .checked_add(self.tracked_remaining_maximum_bytes)
+            .ok_or_else(|| Error::new("reached-branch tracked total overflow"))?;
+        let completed_member_count = usize::try_from(self.completed_member_count)
+            .map_err(|_| Error::new("completed storage member count exceeds usize"))?;
+        if completed_member_count > self.archive_member_lengths.len() {
+            return Err(Error::new(
+                "completed storage member count exceeds archive members",
+            ));
+        }
+        let (completed_members, future_members) =
+            self.archive_member_lengths.split_at(completed_member_count);
+        let canonical_archive_bound_bytes = ustar_bound(&self.archive_member_lengths)?;
+        let canonical_usize = usize::try_from(canonical_archive_bound_bytes)
+            .map_err(|_| Error::new("canonical archive bound exceeds usize"))?;
+        let compressed_bound_bytes = u64::try_from(zstd_safe::compress_bound(canonical_usize))
+            .map_err(|_| Error::new("Zstandard compression bound exceeds u64"))?;
+        let raw = raw_execution_projection(
+            future_raw_bytes,
+            compressed_bound_bytes,
+            extracted_source_bound_bytes,
+            self.raw.encoder_workspace_bytes,
+            self.raw.observed_free_bytes,
+        )?;
+        if self.future_raw_bytes != future_raw_bytes
+            || checked_sum(completed_members)? != self.completed_payload_bytes
+            || checked_sum(future_members)? != future_raw_bytes
+            || self.canonical_archive_bound_bytes != canonical_archive_bound_bytes
+            || self.compressed_bound_bytes != compressed_bound_bytes
+            || self.extracted_source_bound_bytes != extracted_source_bound_bytes
+            || self.raw != raw
+            || self.tracked_total_bound_bytes != tracked_total_bound_bytes
+            || self.task_cap_bytes != TASK_CAP_BYTES
+            || self.tracked_admissible != (tracked_total_bound_bytes <= TASK_CAP_BYTES)
+            || self.admissible != (self.raw.admissible && self.tracked_admissible)
+        {
+            return Err(Error::new(
+                "reached-branch storage projection arithmetic is inconsistent",
+            ));
+        }
+        Ok(())
+    }
+}
+
+pub struct ReachedBranchInput<'a> {
+    pub gate_id: &'a str,
+    pub next_ordinal: u64,
+    pub inventory: ReachableInventory,
+    pub completed_member_lengths: &'a [u64],
+    pub future_arms: &'a [ArmStorageInput],
+    pub future_unit_member_lengths: &'a [u64],
+    pub encoder_workspace_bytes: u64,
+    pub observed_free_bytes: u64,
+    pub tracked_actual_bytes: u64,
+    pub tracked_remaining_maximum_bytes: u64,
+}
+
+pub fn reached_branch_projection(input: ReachedBranchInput<'_>) -> Result<ReachedBranchProjection> {
+    let ReachedBranchInput {
+        gate_id,
+        next_ordinal,
+        inventory,
+        completed_member_lengths,
+        future_arms,
+        future_unit_member_lengths,
+        encoder_workspace_bytes,
+        observed_free_bytes,
+        tracked_actual_bytes,
+        tracked_remaining_maximum_bytes,
+    } = input;
+    let observed_inventory = ReachableInventory {
+        scout: u64::try_from(
+            future_arms
+                .iter()
+                .filter(|input| input.class == EvidenceClass::S)
+                .count(),
+        )
+        .map_err(|_| Error::new("scout storage inventory exceeds u64"))?,
+        williams: u64::try_from(
+            future_arms
+                .iter()
+                .filter(|input| input.class == EvidenceClass::C)
+                .count(),
+        )
+        .map_err(|_| Error::new("Williams storage inventory exceeds u64"))?,
+        direct: u64::try_from(
+            future_arms
+                .iter()
+                .filter(|input| input.class == EvidenceClass::D)
+                .count(),
+        )
+        .map_err(|_| Error::new("direct storage inventory exceeds u64"))?,
+        authoritative: u64::try_from(
+            future_arms
+                .iter()
+                .filter(|input| input.class == EvidenceClass::A)
+                .count(),
+        )
+        .map_err(|_| Error::new("authoritative storage inventory exceeds u64"))?,
+    };
+    if observed_inventory != inventory {
+        return Err(Error::new(
+            "reached-branch arm inputs differ from the declared inventory",
+        ));
+    }
+    let mut future_member_lengths = future_unit_member_lengths.to_vec();
+    let mut future_arm_payload_bytes = 0_u64;
+    for input in future_arms {
+        let bounds = component_bounds(input)?;
+        future_arm_payload_bytes = future_arm_payload_bytes
+            .checked_add(bounds.total)
+            .ok_or_else(|| Error::new("reached-branch arm payload overflow"))?;
+        future_member_lengths.extend(bounds.member_lengths());
+    }
+    let completed_payload_bytes = checked_sum(completed_member_lengths)?;
+    let future_unit_payload_bytes = checked_sum(future_unit_member_lengths)?;
+    let future_raw_bytes = future_arm_payload_bytes
+        .checked_add(future_unit_payload_bytes)
+        .ok_or_else(|| Error::new("reached-branch future payload overflow"))?;
+    let extracted_source_bound_bytes = completed_payload_bytes
+        .checked_add(future_raw_bytes)
+        .ok_or_else(|| Error::new("reached-branch source payload overflow"))?;
+    let mut archive_members = completed_member_lengths.to_vec();
+    archive_members.extend(future_member_lengths);
+    let canonical_archive_bound_bytes = ustar_bound(&archive_members)?;
+    let canonical_usize = usize::try_from(canonical_archive_bound_bytes)
+        .map_err(|_| Error::new("canonical archive bound exceeds usize"))?;
+    let compressed_bound_bytes = u64::try_from(zstd_safe::compress_bound(canonical_usize))
+        .map_err(|_| Error::new("Zstandard compression bound exceeds u64"))?;
+    let raw = raw_execution_projection(
+        future_raw_bytes,
+        compressed_bound_bytes,
+        extracted_source_bound_bytes,
+        encoder_workspace_bytes,
+        observed_free_bytes,
+    )?;
+    let tracked_total_bound_bytes = tracked_actual_bytes
+        .checked_add(tracked_remaining_maximum_bytes)
+        .ok_or_else(|| Error::new("reached-branch tracked total overflow"))?;
+    let tracked_admissible = tracked_total_bound_bytes <= TASK_CAP_BYTES;
+    let projection = ReachedBranchProjection {
+        gate_id: gate_id.to_owned(),
+        next_ordinal,
+        inventory,
+        completed_member_count: u64::try_from(completed_member_lengths.len())
+            .map_err(|_| Error::new("completed storage member count exceeds u64"))?,
+        archive_member_lengths: archive_members,
+        completed_payload_bytes,
+        future_arm_payload_bytes,
+        future_unit_payload_bytes,
+        future_raw_bytes,
+        canonical_archive_bound_bytes,
+        compressed_bound_bytes,
+        extracted_source_bound_bytes,
+        admissible: raw.admissible && tracked_admissible,
+        raw,
+        tracked_actual_bytes,
+        tracked_remaining_maximum_bytes,
+        tracked_total_bound_bytes,
+        task_cap_bytes: TASK_CAP_BYTES,
+        tracked_admissible,
+    };
+    projection.validate()?;
+    Ok(projection)
 }
 
 pub fn raw_execution_projection(
@@ -633,6 +870,15 @@ mod tests {
     #[test]
     fn reachable_branches_never_cartesian_reserve() {
         assert_eq!(
+            reachable_inventory(ReachableBranch::BeforeSmoke, None).expect("smoke"),
+            ReachableInventory {
+                scout: 0,
+                williams: 0,
+                direct: 0,
+                authoritative: 0,
+            }
+        );
+        assert_eq!(
             reachable_inventory(ReachableBranch::BeforeFirstScout, None).expect("scout"),
             ReachableInventory {
                 scout: 525,
@@ -759,5 +1005,118 @@ mod tests {
         underpredicted.root_sha256 =
             compression_profile_root(&underpredicted.witnesses).expect("mutated root");
         assert!(projected_component_bytes(&underpredicted.witnesses[0], 20).is_err());
+    }
+
+    #[test]
+    fn every_reached_branch_projects_raw_archive_recompression_reserve_and_cap() {
+        for (ordinal, (branch, n)) in [
+            (ReachableBranch::BeforeSmoke, None),
+            (ReachableBranch::BeforeFirstScout, None),
+            (ReachableBranch::BeforeWilliams, None),
+            (ReachableBranch::BeforeCalibrationDirect, Some(30)),
+            (ReachableBranch::AuthoritativeContinuation, Some(50)),
+            (ReachableBranch::Terminal, None),
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let inventory = reachable_inventory(branch, n).expect("inventory");
+            let mut arms = Vec::new();
+            for (class, count) in [
+                (EvidenceClass::S, inventory.scout),
+                (EvidenceClass::C, inventory.williams),
+                (EvidenceClass::D, inventory.direct),
+                (EvidenceClass::A, inventory.authoritative),
+            ] {
+                for _ in 0..count {
+                    arms.push(ArmStorageInput {
+                        class,
+                        gateway: class != EvidenceClass::D,
+                        duration_ns: 5_000_000_000,
+                        tid_slots: 4,
+                        lifecycle_events: 4,
+                        connection_records: 137,
+                        latency_records: if class.has_latencies() { 5_000 } else { 0 },
+                        concurrency: 1,
+                    });
+                }
+            }
+            let gate_id = format!("gate-{ordinal}");
+            let projection = reached_branch_projection(ReachedBranchInput {
+                gate_id: &gate_id,
+                next_ordinal: 0,
+                inventory,
+                completed_member_lengths: &[17, 31],
+                future_arms: &arms,
+                future_unit_member_lengths: &[MIB, MIB],
+                encoder_workspace_bytes: 8 * MIB,
+                observed_free_bytes: u64::MAX,
+                tracked_actual_bytes: 1,
+                tracked_remaining_maximum_bytes: 5 * MIB,
+            })
+            .expect("reached branch projection");
+            assert!(projection.admissible);
+            assert_eq!(
+                projection.raw.canonical_buffer_bytes, MIB,
+                "canonical reconstruction buffer"
+            );
+            assert_eq!(projection.raw.chunk_compare_buffers_bytes, 2 * CHUNK_BYTES);
+            assert_eq!(projection.raw.fixed_free_reserve_bytes, 20 * GIB);
+            assert!(projection.canonical_archive_bound_bytes >= projection.future_raw_bytes);
+            assert!(projection.compressed_bound_bytes > 0);
+            assert!(
+                u64::try_from(
+                    crate::json::canonical_bytes(&projection)
+                        .expect("projection JSON")
+                        .len()
+                )
+                .expect("projection JSON length")
+                    <= crate::schema::JSON_MAX_BYTES
+            );
+        }
+
+        let terminal = reachable_inventory(ReachableBranch::Terminal, None).expect("terminal");
+        let projected = reached_branch_projection(ReachedBranchInput {
+            gate_id: "terminal-cap",
+            next_ordinal: 0,
+            inventory: terminal,
+            completed_member_lengths: &[1],
+            future_arms: &[],
+            future_unit_member_lengths: &[1],
+            encoder_workspace_bytes: 1,
+            observed_free_bytes: u64::MAX,
+            tracked_actual_bytes: TASK_CAP_BYTES,
+            tracked_remaining_maximum_bytes: 1,
+        })
+        .expect("tracked over-cap projection");
+        assert!(!projected.tracked_admissible);
+        assert!(!projected.admissible);
+        let exact_free = reached_branch_projection(ReachedBranchInput {
+            gate_id: "terminal-free",
+            next_ordinal: 0,
+            inventory: terminal,
+            completed_member_lengths: &[1],
+            future_arms: &[],
+            future_unit_member_lengths: &[1],
+            encoder_workspace_bytes: 1,
+            observed_free_bytes: u64::MAX,
+            tracked_actual_bytes: 0,
+            tracked_remaining_maximum_bytes: 0,
+        })
+        .expect("free projection");
+        let blocked = reached_branch_projection(ReachedBranchInput {
+            gate_id: "terminal-free",
+            next_ordinal: 0,
+            inventory: terminal,
+            completed_member_lengths: &[1],
+            future_arms: &[],
+            future_unit_member_lengths: &[1],
+            encoder_workspace_bytes: 1,
+            observed_free_bytes: exact_free.raw.required_free_bytes_exclusive,
+            tracked_actual_bytes: 0,
+            tracked_remaining_maximum_bytes: 0,
+        })
+        .expect("strict free gate");
+        assert!(!blocked.raw.admissible);
     }
 }

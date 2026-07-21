@@ -83,6 +83,8 @@ fn intent(id: &str, kind: EvidenceKind) -> Intent {
         producer_executable_sha256: codec::current_executable_sha256().expect("executable hash"),
         zstd: auth_mini_http2_regression::schema::ZstdParameterProgram::fixed(),
         raw_limits: RawLimits::fixed(),
+        trust_boundary: None,
+        harness_provenance: None,
     }
 }
 
@@ -104,8 +106,13 @@ fn create_source(root: &Path, class: EvidenceClass) {
         .unwrap_or(0);
     let projection = ProjectionEvidence {
         schema: PROJECTION_SCHEMA.to_owned(),
+        revision: 0,
+        predecessor: None,
+        source_arm_root_sha256: None,
+        completed_arms: 0,
         runtime_projected_ns: 1,
         runtime_actual_ns: 1,
+        q_extra_ns: 0,
         raw_projected_bytes: 1_000_000,
         raw_actual_bytes: 0,
         tracked_projected_bytes: actual_tracked,
@@ -113,6 +120,7 @@ fn create_source(root: &Path, class: EvidenceClass) {
         endpoint_bound_bytes: 512 + 160 * 137 + 512,
         conn_live: 137,
         concurrency: 1,
+        storage_admission: None,
     };
     json::write_new_canonical(&root.join("projection.json"), &projection).expect("projection");
     json::write_new_canonical(&root.join("delivery-projection.json"), &projection)
@@ -141,6 +149,12 @@ fn create_source(root: &Path, class: EvidenceClass) {
             completed_arms: 1,
             complete: false,
             crash_detail: None,
+            campaign_boottime_start_ns: None,
+            campaign_boottime_end_ns: None,
+            machine_sha256: None,
+            build_set_sha256: None,
+            journal_root_sha256: None,
+            partially_started_ordinal: None,
         },
     )
     .expect("execution state");
@@ -241,6 +255,9 @@ fn create_source(root: &Path, class: EvidenceClass) {
             swap_out_delta: 0,
             steal_ticks_delta: 0,
             external_time_clean: true,
+            search_start_ns: 0,
+            orchestrator_threads: Vec::new(),
+            candidates: Vec::new(),
         },
     )
     .expect("quiet");
@@ -305,6 +322,9 @@ fn create_source(root: &Path, class: EvidenceClass) {
                 refresh_due: false,
                 touch_due: false,
             }],
+            ready_session: None,
+            clock_manifest_sha256: None,
+            protocol_dates: Vec::new(),
         },
     )
     .expect("session clock");
@@ -350,6 +370,13 @@ fn create_source(root: &Path, class: EvidenceClass) {
             direct_ceiling_ops: None,
             gateway_ops: Some(drained),
             calibration_direct_ops: None,
+            frozen_whole_buckets: Vec::new(),
+            frozen_bracket_buckets: Vec::new(),
+            dynamic_buckets: Vec::new(),
+            residuals: Vec::new(),
+            scope_decisions: Vec::new(),
+            producer_blockers: Vec::new(),
+            calibration_frequency_p05_khz: None,
         },
     )
     .expect("resources");
@@ -457,6 +484,22 @@ fn create_source(root: &Path, class: EvidenceClass) {
             tripwire_bytes: 0,
             duplicate_operations: 0,
             phases,
+            downstream_protocol_observations: 0,
+            upstream_protocol_observations: 0,
+            fixture_identity_observations: 0,
+            fixture_identity_correct_observations: 0,
+            fixture_identity_correct: false,
+            request_header_observations: 0,
+            request_headers_sanitized_observations: 0,
+            request_headers_sanitized: false,
+            response_header_observations: 0,
+            response_headers_sanitized_observations: 0,
+            response_headers_sanitized: false,
+            gateway_date_observations: 0,
+            gateway_date_values_sha256: String::new(),
+            config_manifest_sha256: String::new(),
+            corpus_manifest_sha256: String::new(),
+            connection_policy_manifest_sha256: String::new(),
         },
     )
     .expect("endpoints");
@@ -941,7 +984,7 @@ fn real_spawned_roles_complete_one_b11_c1_get_control_cycle() {
         .expect("real spawned role cycle");
     assert_eq!(outcome.proof_operations, 1);
     assert_eq!(outcome.measured_operations, 1);
-    assert_eq!(outcome.fixture_operations, 2);
+    assert!(outcome.fixture_operations >= 4);
     assert!(evidence.join("sampler-freeze.bin").is_file());
     assert!(evidence.join("sampler-final.bin").is_file());
 }

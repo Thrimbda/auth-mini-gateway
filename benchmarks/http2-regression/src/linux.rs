@@ -764,110 +764,198 @@ pub fn preflight(repository: &Path, observation: Duration) -> Result<HostPreflig
 }
 
 pub fn observe_quiet_exact() -> Result<crate::raw::QuietEvidence> {
-    let start_ns = clock_ns(ClockKind::Monotonic)?;
-    let end_ns = start_ns
-        .checked_add(10_000_000_000)
-        .ok_or_else(|| Error::new("Q_obs deadline overflow"))?;
-    let pressure_before = pressure_totals()?;
-    let swap_before = swap_counters()?;
-    let cpu_before = read_per_cpu_ticks()?;
+    let pid = std::process::id();
+    let frozen = quiet_thread_snapshot(pid)?;
+    let orchestrator_threads = frozen
+        .values()
+        .map(|stat| {
+            let assigned_cpu = u16::try_from(stat.processor)
+                .map_err(|_| Error::new("orchestrator thread CPU does not fit u16"))?;
+            Ok(crate::raw::QuietOrchestratorThread {
+                pid,
+                tid: stat.pid,
+                start_time_ticks: stat.start_time_ticks,
+                comm: stat.comm.clone(),
+                assigned_cpu,
+            })
+        })
+        .collect::<Result<Vec<_>>>()?;
+    if orchestrator_threads.is_empty()
+        || orchestrator_threads
+            .iter()
+            .any(|thread| !CONTROL_CPUS.contains(&thread.assigned_cpu))
+    {
+        return Err(Error::new(
+            "persistent orchestrator threads are not confined to control CPUs",
+        ));
+    }
+    let search_start_ns = clock_ns(ClockKind::Monotonic)?;
+    let mut candidates = Vec::new();
     loop {
-        let now = clock_ns(ClockKind::Monotonic)?;
-        if now >= end_ns {
-            break;
+        let start_ns = clock_ns(ClockKind::Monotonic)?;
+        if start_ns.saturating_sub(search_start_ns) > 120_000_000_000 {
+            return Err(Error::new(
+                "Q_obs did not find a clean interval within 120 seconds of Q_extra",
+            ));
         }
-        std::thread::sleep(Duration::from_nanos((end_ns - now).min(5_000_000)));
-    }
-    let pressure_after = pressure_totals()?;
-    let swap_after = swap_counters()?;
-    let cpu_after = read_per_cpu_ticks()?;
-    let mut steal_delta = 0_u64;
-    let mut external_time_clean = true;
-    let mut cpu_deltas = BTreeMap::new();
-    for (cpu, before) in &cpu_before {
-        let after = cpu_after
-            .get(cpu)
-            .ok_or_else(|| Error::new("Q_obs per-CPU row disappeared"))?;
-        let scheduled = after
-            .scheduled()?
-            .checked_sub(before.scheduled()?)
-            .ok_or_else(|| Error::new("Q_obs scheduled ticks decreased"))?;
-        let capacity = after
-            .capacity()?
-            .checked_sub(before.capacity()?)
-            .ok_or_else(|| Error::new("Q_obs capacity ticks decreased"))?;
-        steal_delta = steal_delta
-            .checked_add(
-                after
-                    .steal
-                    .checked_sub(before.steal)
-                    .ok_or_else(|| Error::new("Q_obs steal ticks decreased"))?,
-            )
-            .ok_or_else(|| Error::new("Q_obs steal delta overflow"))?;
-        // No fresh benchmark role exists in Q_obs.  Charging all scheduled
-        // ticks as external is conservative; the persistent orchestrator is
-        // not hidden by an inferred subtraction.
-        if capacity == 0 || u128::from(scheduled) * 100 > u128::from(capacity) {
-            external_time_clean = false;
+        let end_ns = start_ns
+            .checked_add(10_000_000_000)
+            .ok_or_else(|| Error::new("Q_obs deadline overflow"))?;
+        let pressure_before = pressure_totals()?;
+        let swap_before = swap_counters()?;
+        let cpu_before = read_per_cpu_ticks()?;
+        let threads_before = quiet_thread_snapshot(pid)?;
+        loop {
+            let now = clock_ns(ClockKind::Monotonic)?;
+            if now >= end_ns {
+                break;
+            }
+            std::thread::sleep(Duration::from_nanos((end_ns - now).min(5_000_000)));
         }
-        cpu_deltas.insert(*cpu, (scheduled, capacity));
-    }
-    for first in 0_u16..16 {
-        let Some((left_external, left_capacity)) = cpu_deltas.get(&first) else {
-            external_time_clean = false;
-            continue;
+        let pressure_after = pressure_totals()?;
+        let swap_after = swap_counters()?;
+        let cpu_after = read_per_cpu_ticks()?;
+        let threads_after = quiet_thread_snapshot(pid)?;
+        let mut inventory_stable =
+            threads_before.keys().eq(frozen.keys()) && threads_after.keys().eq(frozen.keys());
+        let mut subtracted = BTreeMap::<u16, u64>::new();
+        for (tid, expected) in &frozen {
+            let (Some(before), Some(after)) = (threads_before.get(tid), threads_after.get(tid))
+            else {
+                inventory_stable = false;
+                continue;
+            };
+            if before.start_time_ticks != expected.start_time_ticks
+                || after.start_time_ticks != expected.start_time_ticks
+                || before.comm != expected.comm
+                || after.comm != expected.comm
+                || before.processor != expected.processor
+                || after.processor != expected.processor
+            {
+                inventory_stable = false;
+                continue;
+            }
+            let cpu = u16::try_from(expected.processor)
+                .map_err(|_| Error::new("orchestrator thread CPU does not fit u16"))?;
+            let delta = after
+                .user_ticks
+                .checked_add(after.system_ticks)
+                .and_then(|value| {
+                    before
+                        .user_ticks
+                        .checked_add(before.system_ticks)
+                        .and_then(|start| value.checked_sub(start))
+                })
+                .ok_or_else(|| Error::new("orchestrator thread ticks decreased"))?;
+            *subtracted.entry(cpu).or_default() = subtracted
+                .get(&cpu)
+                .copied()
+                .unwrap_or_default()
+                .checked_add(delta)
+                .ok_or_else(|| Error::new("orchestrator subtraction overflow"))?;
+        }
+        let mut steal_ticks_delta = 0_u64;
+        let mut cpus = Vec::with_capacity(cpu_before.len());
+        for (cpu, before) in &cpu_before {
+            let after = cpu_after
+                .get(cpu)
+                .ok_or_else(|| Error::new("Q_obs per-CPU row disappeared"))?;
+            let scheduled_ticks = after
+                .scheduled()?
+                .checked_sub(before.scheduled()?)
+                .ok_or_else(|| Error::new("Q_obs scheduled ticks decreased"))?;
+            let capacity_ticks = after
+                .capacity()?
+                .checked_sub(before.capacity()?)
+                .ok_or_else(|| Error::new("Q_obs capacity ticks decreased"))?;
+            steal_ticks_delta = steal_ticks_delta
+                .checked_add(
+                    after
+                        .steal
+                        .checked_sub(before.steal)
+                        .ok_or_else(|| Error::new("Q_obs steal ticks decreased"))?,
+                )
+                .ok_or_else(|| Error::new("Q_obs steal delta overflow"))?;
+            let requested_subtraction = subtracted.get(cpu).copied().unwrap_or_default();
+            if requested_subtraction > scheduled_ticks {
+                inventory_stable = false;
+            }
+            let orchestrator_ticks_subtracted = requested_subtraction.min(scheduled_ticks);
+            cpus.push(crate::raw::QuietCpuEvidence {
+                cpu: *cpu,
+                scheduled_ticks,
+                capacity_ticks,
+                orchestrator_ticks_subtracted,
+                external_ticks: scheduled_ticks - orchestrator_ticks_subtracted,
+            });
+        }
+        let mut candidate = crate::raw::QuietCandidateEvidence {
+            start_ns,
+            end_ns,
+            cpu_psi_some_us: pressure_after
+                .cpu_some_us
+                .checked_sub(pressure_before.cpu_some_us)
+                .ok_or_else(|| Error::new("Q_obs CPU PSI decreased"))?,
+            memory_psi_full_us: pressure_after
+                .memory_full_us
+                .checked_sub(pressure_before.memory_full_us)
+                .ok_or_else(|| Error::new("Q_obs memory PSI decreased"))?,
+            io_psi_full_us: pressure_after
+                .io_full_us
+                .checked_sub(pressure_before.io_full_us)
+                .ok_or_else(|| Error::new("Q_obs I/O PSI decreased"))?,
+            swap_in_delta: swap_after
+                .0
+                .checked_sub(swap_before.0)
+                .ok_or_else(|| Error::new("Q_obs swap-in decreased"))?,
+            swap_out_delta: swap_after
+                .1
+                .checked_sub(swap_before.1)
+                .ok_or_else(|| Error::new("Q_obs swap-out decreased"))?,
+            steal_ticks_delta,
+            cpus,
+            orchestrator_inventory_stable: inventory_stable,
+            accepted: false,
         };
-        let Some((right_external, right_capacity)) = cpu_deltas.get(&(first + 16)) else {
-            external_time_clean = false;
-            continue;
-        };
-        let external = left_external.saturating_add(*right_external);
-        let capacity = left_capacity.saturating_add(*right_capacity);
-        if capacity == 0 || u128::from(external) * 200 > u128::from(capacity) {
-            external_time_clean = false;
+        candidate.accepted = candidate.recomputed_clean();
+        let accepted = candidate.accepted;
+        candidates.push(candidate);
+        if accepted {
+            let final_candidate = candidates
+                .last()
+                .ok_or_else(|| Error::new("Q_obs accepted candidate vanished"))?;
+            let evidence = crate::raw::QuietEvidence {
+                schema: "amg-http2-perf/quiet/v2".to_owned(),
+                clock: "CLOCK_MONOTONIC".to_owned(),
+                start_ns: final_candidate.start_ns,
+                end_ns: final_candidate.end_ns,
+                q_extra_ns: final_candidate.start_ns.saturating_sub(search_start_ns),
+                cpu_psi_some_us: final_candidate.cpu_psi_some_us,
+                memory_psi_full_us: final_candidate.memory_psi_full_us,
+                io_psi_full_us: final_candidate.io_psi_full_us,
+                swap_in_delta: final_candidate.swap_in_delta,
+                swap_out_delta: final_candidate.swap_out_delta,
+                steal_ticks_delta: final_candidate.steal_ticks_delta,
+                external_time_clean: final_candidate.external_time_clean(),
+                search_start_ns,
+                orchestrator_threads,
+                candidates,
+            };
+            evidence.validate()?;
+            return Ok(evidence);
         }
     }
-    for cpus in [GATEWAY_CPUS, FIXTURE_CPUS, LOAD_CPUS, CONTROL_CPUS] {
-        let (external, capacity) = cpus.iter().fold((0_u64, 0_u64), |totals, cpu| {
-            let delta = cpu_deltas.get(cpu).copied().unwrap_or((u64::MAX, 0));
-            (
-                totals.0.saturating_add(delta.0),
-                totals.1.saturating_add(delta.1),
-            )
-        });
-        if capacity == 0 || u128::from(external) * 400 > u128::from(capacity) {
-            external_time_clean = false;
+}
+
+fn quiet_thread_snapshot(pid: u32) -> Result<BTreeMap<u32, ProcStat>> {
+    let mut snapshot = BTreeMap::new();
+    for tid in task_ids(pid)? {
+        let stat = read_proc_stat(pid, Some(tid))?;
+        if snapshot.insert(tid, stat).is_some() {
+            return Err(Error::new("duplicate orchestrator TID during Q_obs"));
         }
     }
-    Ok(crate::raw::QuietEvidence {
-        schema: "amg-http2-perf/quiet/v1".to_owned(),
-        clock: "CLOCK_MONOTONIC".to_owned(),
-        start_ns,
-        end_ns,
-        q_extra_ns: 0,
-        cpu_psi_some_us: pressure_after
-            .cpu_some_us
-            .checked_sub(pressure_before.cpu_some_us)
-            .ok_or_else(|| Error::new("Q_obs CPU PSI decreased"))?,
-        memory_psi_full_us: pressure_after
-            .memory_full_us
-            .checked_sub(pressure_before.memory_full_us)
-            .ok_or_else(|| Error::new("Q_obs memory PSI decreased"))?,
-        io_psi_full_us: pressure_after
-            .io_full_us
-            .checked_sub(pressure_before.io_full_us)
-            .ok_or_else(|| Error::new("Q_obs I/O PSI decreased"))?,
-        swap_in_delta: swap_after
-            .0
-            .checked_sub(swap_before.0)
-            .ok_or_else(|| Error::new("Q_obs swap-in decreased"))?,
-        swap_out_delta: swap_after
-            .1
-            .checked_sub(swap_before.1)
-            .ok_or_else(|| Error::new("Q_obs swap-out decreased"))?,
-        steal_ticks_delta: steal_delta,
-        external_time_clean,
-    })
+    Ok(snapshot)
 }
 
 fn check_cpu_policy(

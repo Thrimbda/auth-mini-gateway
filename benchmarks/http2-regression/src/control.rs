@@ -146,6 +146,7 @@ pub enum ControlBody {
         result: LoadResult,
     },
     FixtureSnapshot,
+    FixtureCompactSnapshot,
     FixtureObserved {
         result: FixtureResult,
     },
@@ -429,12 +430,25 @@ pub struct SamplerReport {
     pub realtime_samples: u64,
     pub realtime_discontinuities: u64,
     pub realtime_comparable: bool,
+    #[serde(default, skip_serializing_if = "is_zero")]
+    pub steal_ticks_delta: u64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ProtocolDateObservation {
+    pub value: String,
+    pub unix_seconds: u64,
+    pub boottime_before_ns: u64,
+    pub boottime_after_ns: u64,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct LoadProof {
     pub downstream_protocol: Protocol,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub observed_protocol: Option<Protocol>,
     pub physical_connections: u64,
     pub h2_settings_proved: bool,
     pub extended_connect_proved: bool,
@@ -451,12 +465,18 @@ pub struct LoadProof {
     pub attempts: AttemptEvidence,
     pub lane_quotas: Vec<u64>,
     pub lane_completions: Vec<u64>,
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub response_headers_sanitized: bool,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub protocol_dates: Vec<ProtocolDateObservation>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct LoadResult {
     pub protocol: Protocol,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub observed_protocol: Option<Protocol>,
     pub operations_started: u64,
     pub operations_completed: u64,
     pub operations_completed_by_deadline: u64,
@@ -480,6 +500,8 @@ pub struct LoadResult {
     pub attempts: AttemptEvidence,
     pub lane_quotas: Vec<u64>,
     pub lane_completions: Vec<u64>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub protocol_dates: Vec<ProtocolDateObservation>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -514,9 +536,39 @@ pub struct FixtureResult {
     pub tripwire_bytes: u64,
     pub duplicate_operations: u64,
     pub unknown_requests: u64,
+    pub compacted: bool,
+    pub observation_count: u64,
     pub observations: Vec<EndpointObservation>,
+    pub phase_aggregates: Vec<FixturePhaseAggregate>,
     pub operation_hash_sha256: String,
     pub h2_wire: Vec<H2WireEvidence>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct FixturePhaseAggregate {
+    pub phase: u16,
+    pub operations: u64,
+    pub http_requests: u64,
+    pub request_bytes: u64,
+    pub response_bytes: u64,
+    pub operation_hash_sha256: String,
+    pub protocol_correct: bool,
+    pub payload_correct: bool,
+    pub identity_correct: bool,
+    pub headers_sanitized: bool,
+    pub request_eos: bool,
+    pub response_semantics_correct: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub observed_protocol: Option<Protocol>,
+}
+
+const fn is_zero(value: &u64) -> bool {
+    *value == 0
+}
+
+const fn is_false(value: &bool) -> bool {
+    !*value
 }
 
 pub struct FramedControl {

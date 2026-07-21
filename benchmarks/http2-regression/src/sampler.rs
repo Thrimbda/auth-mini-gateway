@@ -169,6 +169,7 @@ struct SamplerState {
     poll_error: Option<String>,
     last_poll_ns: Option<u64>,
     lifecycle_poll_max_ns: u64,
+    frozen_lifecycle_poll_max_ns: Option<u64>,
     boundaries: Vec<BoundarySnapshot>,
     last_boundary_ns: Option<u64>,
     pressure_start: Option<PressureTotals>,
@@ -608,7 +609,7 @@ impl SamplerState {
             report: report.clone(),
             boundaries: self.boundaries.clone(),
             threads,
-            lifecycle_poll_max_ns: self.lifecycle_poll_max_ns,
+            lifecycle_poll_max_ns: report.lifecycle_poll_max_ns,
             realtime_triplets: self.realtime_triplets.clone(),
         };
         let bytes = crate::json::canonical_bytes(&evidence)?;
@@ -835,6 +836,8 @@ impl SamplerState {
         if self.frozen {
             return Err(Error::new("sampler freeze invoked twice"));
         }
+        self.poll_tick()?;
+        self.frozen_lifecycle_poll_max_ns = Some(self.lifecycle_poll_max_ns);
         if let Some(gateway) = self.gateway_identity() {
             let gateway = gateway.clone();
             validated_signal(&gateway, libc::SIGSTOP)?;
@@ -1097,6 +1100,25 @@ impl SamplerState {
             .map(|pair| pair[1].monotonic_ns.saturating_sub(pair[0].monotonic_ns))
             .max()
             .unwrap_or(0);
+        let steal_ticks_delta =
+            self.boundaries
+                .first()
+                .ok_or_else(|| Error::new("sampler has no initial CPU boundary"))?
+                .cpus
+                .iter()
+                .try_fold(0_u64, |total, (cpu, before)| {
+                    let after = current.cpus.get(cpu).ok_or_else(|| {
+                        Error::new("sampled CPU disappeared before final boundary")
+                    })?;
+                    total
+                        .checked_add(
+                            after
+                                .steal
+                                .checked_sub(before.steal)
+                                .ok_or_else(|| Error::new("sampled steal counter decreased"))?,
+                        )
+                        .ok_or_else(|| Error::new("sampled steal delta overflow"))
+                })?;
         Ok(SamplerReport {
             monotonic_ns: current.monotonic_ns,
             boottime_ns: current.boottime_ns,
@@ -1117,7 +1139,9 @@ impl SamplerState {
             births_after_freeze: self.births_after_freeze,
             deaths_after_freeze: self.deaths_after_freeze,
             migrations_after_freeze: self.migrations_after_freeze,
-            lifecycle_poll_max_ns: self.lifecycle_poll_max_ns,
+            lifecycle_poll_max_ns: self
+                .frozen_lifecycle_poll_max_ns
+                .unwrap_or(self.lifecycle_poll_max_ns),
             post_freeze_change: self.post_freeze_change.clone(),
             tctl_millidegrees: self.tctl_max,
             tctl_start_millidegrees: self.tctl_start,
@@ -1147,6 +1171,7 @@ impl SamplerState {
             realtime_samples: self.realtime_samples,
             realtime_discontinuities: self.realtime_discontinuities,
             realtime_comparable: self.realtime_samples > 0 && self.realtime_discontinuities == 0,
+            steal_ticks_delta,
         })
     }
 }
@@ -1779,6 +1804,74 @@ fn evaluate_noise_scopes(
         add_scope("role", role, cpus, role_limit)?;
     }
     Ok(output)
+}
+
+pub(crate) fn recompute_noise_scopes_from_raw(
+    frozen_whole: &[crate::raw::CpuBucketEvidence],
+    frozen_bracket: &[crate::raw::CpuBucketEvidence],
+    dynamic: &[crate::raw::CpuBucketEvidence],
+) -> Result<Vec<crate::raw::NoiseScopeDecisionEvidence>> {
+    let convert = |values: &[crate::raw::CpuBucketEvidence]| {
+        values
+            .iter()
+            .map(|value| CpuAttribution {
+                cpu: value.cpu,
+                start_ns: value.start_ns,
+                end_ns: value.end_ns,
+                capacity_ticks: value.capacity_ticks,
+                scheduled_ticks: value.scheduled_ticks,
+                role_runtime_lower_ticks: value.process_runtime_lower,
+                role_runtime_upper_ticks: value.process_runtime_upper,
+                attribution_uncertainty_ticks: value.attribution_uncertainty_ticks,
+                external_upper_ticks: value.external_upper_ticks,
+            })
+            .collect::<Vec<_>>()
+    };
+    let frozen_whole = convert(frozen_whole);
+    let frozen_bracket = convert(frozen_bracket);
+    let dynamic = convert(dynamic);
+    let mut scopes = evaluate_noise_scopes(&frozen_whole, true, "frozen", "whole")?;
+    for bucket in one_second_buckets(&frozen_bracket)? {
+        scopes.extend(evaluate_noise_scopes(
+            &bucket,
+            false,
+            "frozen",
+            "one-second",
+        )?);
+    }
+    let dynamic_whole = aggregate_attribution(&dynamic)?;
+    if !dynamic_whole.is_empty() {
+        scopes.extend(evaluate_noise_scopes(
+            &dynamic_whole,
+            true,
+            "dynamic",
+            "whole",
+        )?);
+    }
+    for bucket in one_second_buckets(&dynamic)? {
+        scopes.extend(evaluate_noise_scopes(
+            &bucket,
+            false,
+            "dynamic",
+            "one-second",
+        )?);
+    }
+    Ok(scopes
+        .into_iter()
+        .map(|scope| crate::raw::NoiseScopeDecisionEvidence {
+            attribution_phase: scope.attribution_phase,
+            interval_kind: scope.interval_kind,
+            scope: scope.scope,
+            role: scope.role,
+            cpus: scope.cpus,
+            start_ns: scope.start_ns,
+            end_ns: scope.end_ns,
+            capacity_ticks: scope.capacity_ticks,
+            external_upper_ticks: scope.external_upper_ticks,
+            limit_basis_points: scope.limit_basis_points,
+            accepted: scope.accepted,
+        })
+        .collect())
 }
 
 fn cpu_role(cpu: u16) -> Result<&'static str> {

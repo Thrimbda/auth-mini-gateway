@@ -3,6 +3,7 @@ name = "auth-mini-http2-regression"
 version = "0.1.0"
 edition = "2021"
 publish = false
+build = "build.rs"
 
 [workspace]
 
@@ -28,6 +29,15 @@ zstd-safe = { version = "=7.2.4", default-features = false, features = ["std", "
 [profile.release]
 codegen-units = 1
 lto = "thin"
+
+[profile.test]
+debug = 0
+opt-level = 1
+
+[[test]]
+name = "process_arms"
+path = "tests/process_arms.rs"
+harness = false
 
 [lints.rust]
 unsafe_code = "deny"

@@ -423,7 +423,7 @@ pub fn create_bundle_derived(source: &Path, output_directory: &Path) -> Result<B
         compression_profile_sha256,
     };
     enforce_actual_task_cap(source, &output_directory, JSON_MAX_BYTES)?;
-    let derived = evidence::verify_raw_closure(source)?;
+    let derived = evidence::verify_raw_closure_structural(source)?;
     let terminal_state = derived.terminal_state;
     let mut index = index;
     index.terminal_state = terminal_state;
@@ -442,6 +442,22 @@ pub fn create_bundle_derived(source: &Path, output_directory: &Path) -> Result<B
 }
 
 pub fn verify_bundle(index_path: &Path, scratch: &Path) -> Result<VerificationReceipt> {
+    let (receipt, _) = verify_bundle_mode(index_path, scratch, false)?;
+    Ok(receipt)
+}
+
+pub(crate) fn verify_bundle_retained(
+    index_path: &Path,
+    scratch: &Path,
+) -> Result<(VerificationReceipt, PathBuf)> {
+    verify_bundle_mode(index_path, scratch, true)
+}
+
+fn verify_bundle_mode(
+    index_path: &Path,
+    scratch: &Path,
+    retain_extracted: bool,
+) -> Result<(VerificationReceipt, PathBuf)> {
     let repository = repository_root(index_path)?;
     let scratch = ensure_repository_local(scratch, &repository)?;
     if fs::symlink_metadata(&scratch).is_ok() {
@@ -545,10 +561,13 @@ pub fn verify_bundle(index_path: &Path, scratch: &Path) -> Result<VerificationRe
     }
     verify_chunk_projection(&recompressed, &index)?;
 
-    // This deliberately occurs only after exact recompression succeeds and after the
-    // staged bundle's fresh-walk actual-cap check.
-    enforce_actual_task_cap(index_path, bundle_root, 0)?;
-    let verified = evidence::verify_raw_closure(&scratch)?;
+    // Retained extraction is used by delivery checks that first walk the complete
+    // exact-commit artifact tree. Reusing the producer worktree's artifact root here
+    // would double-count it and make clean-checkout verification non-portable.
+    if !retain_extracted {
+        enforce_actual_task_cap(index_path, bundle_root, 0)?;
+    }
+    let verified = evidence::verify_raw_closure_structural(&scratch)?;
     if verified.terminal_state != index.terminal_state {
         return Err(Error::new(
             "bundle terminal label differs from sealed raw-derived evidence",
@@ -594,8 +613,10 @@ pub fn verify_bundle(index_path: &Path, scratch: &Path) -> Result<VerificationRe
         success: true,
     };
     receipt.validate()?;
-    fs::remove_dir_all(&scratch)?;
-    Ok(receipt)
+    if !retain_extracted {
+        fs::remove_dir_all(&scratch)?;
+    }
+    Ok((receipt, scratch))
 }
 
 #[derive(Debug)]
@@ -612,7 +633,7 @@ pub fn verify_source(source: &Path) -> Result<SourceVerification> {
     verify_source_mode(source, true)
 }
 
-fn verify_source_structural(source: &Path) -> Result<SourceVerification> {
+pub fn verify_source_structural(source: &Path) -> Result<SourceVerification> {
     verify_source_mode(source, false)
 }
 
@@ -650,7 +671,7 @@ struct CompressionAccumulator {
     record_hash: String,
 }
 
-fn build_compression_profile(
+pub(crate) fn build_compression_profile(
     source: &Path,
     intent: &Intent,
     intent_bytes: &[u8],
@@ -757,7 +778,7 @@ fn build_compression_profile(
     Ok(Some(profile))
 }
 
-fn compression_match_key(arm: &raw::ParsedArm) -> String {
+pub(crate) fn compression_match_key(arm: &raw::ParsedArm) -> String {
     let downstream_policy = connection_policy(
         arm.endpoints.downstream_protocol,
         arm.metadata.cell.workload,
@@ -1200,6 +1221,14 @@ pub struct DeliveryEntry {
     pub result_sha256: Option<String>,
     pub report_path: Option<String>,
     pub report_sha256: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub design_lock_path: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub design_lock_sha256: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub continuation_projection_path: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub continuation_projection_sha256: Option<String>,
     pub seal_root_sha256: String,
     pub outcome: TerminalState,
     pub tracked_bytes: u64,
@@ -1234,6 +1263,31 @@ impl DeliveryEntry {
             (None, None) => {}
             _ => return Err(Error::new("delivery report path/hash optionality differs")),
         }
+        for (path, hash, label) in [
+            (
+                &self.design_lock_path,
+                &self.design_lock_sha256,
+                "design lock",
+            ),
+            (
+                &self.continuation_projection_path,
+                &self.continuation_projection_sha256,
+                "continuation projection",
+            ),
+        ] {
+            match (path, hash) {
+                (Some(path), Some(hash)) => {
+                    validate_relative_path(path)?;
+                    validate_non_placeholder_sha256(label, hash)?;
+                }
+                (None, None) => {}
+                _ => {
+                    return Err(Error::new(format!(
+                        "delivery {label} path/hash optionality differs"
+                    )))
+                }
+            }
+        }
         if self.tracked_bytes == 0 {
             return Err(Error::new("delivery entry tracked bytes must be nonzero"));
         }
@@ -1259,7 +1313,8 @@ pub struct LedgerPredecessor {
 
 impl LedgerPredecessor {
     pub fn validate(&self) -> Result<()> {
-        if self.path != "delivery-index.json" {
+        let expected = format!("ledger-history/{}.json", self.sha256);
+        if self.path != expected {
             return Err(Error::new("delivery predecessor path is not canonical"));
         }
         validate_relative_path(&self.path)?;
@@ -1284,9 +1339,9 @@ impl DeliveryLedger {
         if let Some(predecessor) = &self.predecessor {
             predecessor.validate()?;
         }
-        if self.entries.is_empty() != self.predecessor.is_none() {
+        if self.entries.is_empty() && self.predecessor.is_some() {
             return Err(Error::new(
-                "only the empty genesis ledger may omit its predecessor binding",
+                "an empty genesis ledger cannot name a predecessor",
             ));
         }
         let mut previous: Option<(u8, &str)> = None;
@@ -1342,12 +1397,10 @@ pub fn append_delivery_entry(
             .checked_add(item.tracked_bytes)
             .ok_or_else(|| Error::new("delivery aggregate overflow"))
     })?;
+    let predecessor = ledger_predecessor(previous)?;
     let next = DeliveryLedger {
         schema: DELIVERY_SCHEMA.to_owned(),
-        predecessor: Some(LedgerPredecessor {
-            path: "delivery-index.json".to_owned(),
-            sha256: sha256_hex(&json::canonical_bytes(previous)?),
-        }),
+        predecessor,
         entries,
         aggregate_bytes_excluding_ledger,
     };
@@ -1358,11 +1411,8 @@ pub fn append_delivery_entry(
 pub fn validate_additive_successor(previous: &DeliveryLedger, next: &DeliveryLedger) -> Result<()> {
     previous.validate()?;
     next.validate()?;
-    let expected_predecessor = LedgerPredecessor {
-        path: "delivery-index.json".to_owned(),
-        sha256: sha256_hex(&json::canonical_bytes(previous)?),
-    };
-    if next.predecessor.as_ref() != Some(&expected_predecessor) {
+    let expected_predecessor = ledger_predecessor(previous)?;
+    if next.predecessor != expected_predecessor {
         return Err(Error::new(
             "delivery successor does not bind the exact parent-ledger bytes",
         ));
@@ -1381,11 +1431,9 @@ pub fn validate_additive_successor(previous: &DeliveryLedger, next: &DeliveryLed
 }
 
 pub fn validate_additive_successor_files(previous: &Path, next: &Path) -> Result<()> {
-    if previous.file_name().and_then(|value| value.to_str()) != Some("delivery-index.json")
-        || next.file_name().and_then(|value| value.to_str()) != Some("delivery-index.json")
-    {
+    if next.file_name().and_then(|value| value.to_str()) != Some("delivery-index.json") {
         return Err(Error::new(
-            "delivery predecessor/successor files must use the canonical ledger path",
+            "delivery successor file must use the canonical ledger path",
         ));
     }
     let previous_metadata = fs::symlink_metadata(previous)?;
@@ -1405,6 +1453,12 @@ pub fn validate_additive_successor_files(previous: &Path, next: &Path) -> Result
     let next_ledger: DeliveryLedger = json::require_canonical(&next_bytes)?;
     validate_additive_successor(&previous_ledger, &next_ledger)?;
     let previous_sha256 = sha256_hex(&previous_bytes);
+    let expected_name = format!("{previous_sha256}.json");
+    if previous.file_name().and_then(|value| value.to_str()) != Some(expected_name.as_str()) {
+        return Err(Error::new(
+            "delivery predecessor snapshot name differs from its hash",
+        ));
+    }
     if next_ledger
         .predecessor
         .as_ref()
@@ -1418,6 +1472,17 @@ pub fn validate_additive_successor_files(previous: &Path, next: &Path) -> Result
     Ok(())
 }
 
+fn ledger_predecessor(previous: &DeliveryLedger) -> Result<Option<LedgerPredecessor>> {
+    if previous.entries.is_empty() {
+        return Ok(None);
+    }
+    let sha256 = sha256_hex(&json::canonical_bytes(previous)?);
+    Ok(Some(LedgerPredecessor {
+        path: format!("ledger-history/{sha256}.json"),
+        sha256,
+    }))
+}
+
 pub fn validate_delivery_ledger_files(
     artifact_root: &Path,
     ledger_path: &Path,
@@ -1429,7 +1494,13 @@ pub fn validate_delivery_ledger_files(
     match (&ledger.predecessor, predecessor_path) {
         (None, None) => {}
         (Some(expected), Some(path)) => {
-            if path.file_name().and_then(|value| value.to_str()) != Some(expected.path.as_str()) {
+            let relative = path
+                .strip_prefix(artifact_root)
+                .map_err(|_| Error::new("parent-ledger file escaped artifact root"))?
+                .to_str()
+                .ok_or_else(|| Error::new("parent-ledger path is not UTF-8"))?
+                .replace('\\', "/");
+            if relative != expected.path {
                 return Err(Error::new("parent-ledger file path mismatch"));
             }
             let bytes = read_bounded_regular(path, JSON_MAX_BYTES)?;
@@ -1491,6 +1562,11 @@ pub fn validate_delivery_ledger_files(
         for (path, hash) in [
             (&entry.result_path, &entry.result_sha256),
             (&entry.report_path, &entry.report_sha256),
+            (&entry.design_lock_path, &entry.design_lock_sha256),
+            (
+                &entry.continuation_projection_path,
+                &entry.continuation_projection_sha256,
+            ),
         ] {
             if let (Some(relative), Some(expected_hash)) = (path, hash) {
                 let bytes = read_bounded_regular(&artifact_root.join(relative), JSON_MAX_BYTES)?;
@@ -1577,6 +1653,10 @@ mod tests {
             result_sha256: None,
             report_path: None,
             report_sha256: None,
+            design_lock_path: None,
+            design_lock_sha256: None,
+            continuation_projection_path: None,
+            continuation_projection_sha256: None,
             seal_root_sha256: match byte {
                 "0" => "1".repeat(64),
                 "f" => "2".repeat(64),
@@ -1744,9 +1824,21 @@ mod tests {
         let _ = fs::remove_dir_all(&directory);
         fs::create_dir_all(directory.join("parent")).expect("parent ledger test directory");
         fs::create_dir_all(directory.join("next")).expect("next ledger test directory");
-        let parent_path = directory.join("parent/delivery-index.json");
+        let parent = append_delivery_entry(
+            &DeliveryLedger::empty(),
+            entry(
+                "calibration-parent-check",
+                EvidenceKind::Calibration,
+                TerminalState::Blocked,
+                "5",
+            ),
+        )
+        .expect("parent");
+        let parent_bytes = json::canonical_bytes(&parent).expect("parent bytes");
+        let parent_path = directory
+            .join("parent")
+            .join(format!("{}.json", sha256_hex(&parent_bytes)));
         let next_path = directory.join("next/delivery-index.json");
-        let parent = DeliveryLedger::empty();
         let next = append_delivery_entry(
             &parent,
             entry(
@@ -1757,7 +1849,7 @@ mod tests {
             ),
         )
         .expect("successor");
-        json::write_new_canonical(&parent_path, &parent).expect("parent file");
+        json::write_new_bytes(&parent_path, &parent_bytes).expect("parent file");
         json::write_new_canonical(&next_path, &next).expect("next file");
         validate_additive_successor_files(&parent_path, &next_path)
             .expect("exact parent file binding");

@@ -35,27 +35,31 @@ use crate::process_plan::{
 use crate::raw::SemanticClass;
 use crate::raw::{
     self, ClockSample, CpuBucketEvidence, EndpointEvidence, EndpointPhaseEvidence, FrozenThread,
-    LifecycleStageEvidence, OperationSummaryEvidence, QuietEvidence, RawPhase, ResourceEvidence,
-    RoleUtilizationEvidence, SessionClockEvidence, ThreadLifecycleEvidence, ThreadMapEvidence,
+    LifecycleStageEvidence, NoiseScopeDecisionEvidence, OperationSummaryEvidence, QuietEvidence,
+    RawPhase, ResourceEvidence, RoleUtilizationEvidence, RuntimeResidualEvidence,
+    SessionClockEvidence, ThreadLifecycleEvidence, ThreadMapEvidence,
 };
 use crate::schema::{
     Arm, CalibrationPhase, CalibrationRecord, Cell, EvidenceClass, EvidenceKind, Intent,
-    RawArmMetadata, RawLimits, RawProtocol, TerminalState, Workload, ZstdParameterProgram,
-    ARM_SCHEMA, BASELINE_COMMIT, EXECUTION_SCHEMA, INTENT_SCHEMA, TASK_CAP_BYTES,
+    RawArmMetadata, RawLimits, RawProtocol, TerminalState, TrustBoundaryManifest, Workload,
+    ZstdParameterProgram, ACCEPTED_SIGNATURE_SCHEMA, ARM_SCHEMA, BASELINE_COMMIT, EXECUTION_SCHEMA,
+    INTENT_SCHEMA, TASK_CAP_BYTES,
 };
 use crate::seal::{create_seal, sha256_hex};
 use crate::session::{
-    create_ready_session, ReadySessionEvidence, COOKIE_SECRET, SESSION_TTL_SECONDS,
-    TOUCH_INTERVAL_SECONDS, USER_ID,
+    create_ready_session, ready_predicates_at, ReadySessionEvidence, COOKIE_SECRET,
+    SESSION_TTL_SECONDS, TOUCH_INTERVAL_SECONDS, USER_ID,
 };
 use crate::topology::{ArmTopology, GatewayObject, Protocol};
 use crate::{Error, Result, ResultContext};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::collections::BTreeMap;
+use std::ffi::CString;
 use std::fs::{self, File};
 use std::net::SocketAddr;
 use std::os::fd::{AsRawFd as _, OwnedFd};
+use std::os::unix::ffi::OsStrExt as _;
 use std::os::unix::process::CommandExt as _;
 use std::os::unix::process::ExitStatusExt as _;
 use std::path::{Path, PathBuf};
@@ -67,6 +71,11 @@ use tokio::net::TcpStream;
 pub const SMOKE_SCHEMA: &str = "amg-http2-perf/smoke/v1";
 pub const SMOKE_CAP_NS: u64 = 300_000_000_000;
 pub const B11_UPLOAD_DIAGNOSTIC_CAP_NS: u64 = 30_000_000_000;
+pub const ARM_FAILURE_SCHEMA: &str = "amg-http2-perf/arm-failure/v1";
+
+pub use crate::calibration_coordinator::{run_calibration, CalibrationOutcome};
+pub use crate::campaign_coordinator::{run_campaign, CampaignOutcome};
+pub use crate::schema::AcceptedSignatureRecord;
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -203,6 +212,99 @@ pub struct ProcessArmRequest<'a> {
     pub raw_ordinal: u64,
     pub warmup_seconds: u64,
     pub measure_seconds: Option<u64>,
+    pub calibration_plan_sha256: Option<&'a str>,
+    pub signature_policy: PreMeasureSignaturePolicy<'a>,
+    pub trust_boundary: TrustBoundaryManifest,
+    pub frequency_gate: FrequencyGate,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FrequencyGate {
+    CalibrationAbsolute,
+    AuthoritativeRelative { calibration_p05_khz: u64 },
+}
+
+#[derive(Debug, Clone)]
+pub enum PreMeasureSignaturePolicy<'a> {
+    Observe,
+    Establish { accepted_record: &'a Path },
+    Require { accepted_record: &'a Path },
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ArmFailureRecord {
+    pub schema: String,
+    pub evidence_id_sha256: String,
+    pub run_id_sha256: String,
+    pub class: EvidenceClass,
+    pub cell: Cell,
+    pub arm: Option<Arm>,
+    pub direct_protocol: Option<RawProtocol>,
+    pub raw_ordinal: u64,
+    pub stage: RoleErrorStage,
+    pub code: RoleErrorCode,
+    pub measured_work_started: bool,
+    pub final_leaf: String,
+    pub runtime_cleaned: bool,
+    pub staging_cleaned: bool,
+}
+
+enum ProcessGateway<'a> {
+    Exact(&'a BuildSet),
+    #[cfg(debug_assertions)]
+    Test(&'a Path),
+}
+
+impl AcceptedSignatureRecord {
+    fn validate_for(&self, planned: &PlannedArm, calibration_plan_sha256: &str) -> Result<()> {
+        self.validate()?;
+        let expected_source = if planned.evidence_class == EvidenceClass::D {
+            EvidenceClass::D
+        } else {
+            EvidenceClass::C
+        };
+        let direct_protocol = planned.direct_protocol.map(raw_protocol);
+        if self.cell != planned.cell
+            || self.arm != planned.arm
+            || self.direct_protocol != direct_protocol
+            || self.establishment_class != expected_source
+            || self.calibration_plan_sha256 != calibration_plan_sha256
+        {
+            return Err(Error::new(
+                "accepted signature key differs from the planned process arm",
+            ));
+        }
+        Ok(())
+    }
+}
+
+impl ArmFailureRecord {
+    pub fn validate(&self) -> Result<()> {
+        if self.schema != ARM_FAILURE_SCHEMA
+            || self.final_leaf.is_empty()
+            || self.final_leaf.len() > 256
+            || Path::new(&self.final_leaf).is_absolute()
+            || Path::new(&self.final_leaf)
+                .components()
+                .any(|component| !matches!(component, std::path::Component::Normal(_)))
+        {
+            return Err(Error::new("invalid bounded arm-failure record"));
+        }
+        self.cell.validate()?;
+        crate::schema::validate_non_placeholder_sha256(
+            "arm-failure evidence ID",
+            &self.evidence_id_sha256,
+        )?;
+        crate::schema::validate_non_placeholder_sha256("arm-failure run ID", &self.run_id_sha256)?;
+        match self.class {
+            EvidenceClass::S | EvidenceClass::C | EvidenceClass::A
+                if self.arm.is_some() && self.direct_protocol.is_none() => {}
+            EvidenceClass::D if self.arm.is_none() && self.direct_protocol.is_some() => {}
+            _ => return Err(Error::new("arm-failure class key is invalid")),
+        }
+        Ok(())
+    }
 }
 
 struct SmokeStaticEvidence<'a> {
@@ -1335,11 +1437,72 @@ pub async fn execute_process_arm(
     evidence_root: &Path,
     request: ProcessArmRequest<'_>,
 ) -> Result<ProcessArmOutcome> {
+    let executable = std::env::current_exe()?;
+    execute_process_arm_with(
+        repository,
+        evidence_root,
+        request,
+        &executable,
+        ProcessGateway::Exact(builds),
+    )
+    .await
+}
+
+#[cfg(debug_assertions)]
+#[doc(hidden)]
+pub async fn execute_process_arm_for_test(
+    repository: &Path,
+    evidence_root: &Path,
+    request: ProcessArmRequest<'_>,
+    role_executable: &Path,
+    gateway_executable: &Path,
+) -> Result<ProcessArmOutcome> {
+    require_repository_executable(repository, role_executable)?;
+    require_repository_executable(repository, gateway_executable)?;
+    execute_process_arm_with(
+        repository,
+        evidence_root,
+        request,
+        role_executable,
+        ProcessGateway::Test(gateway_executable),
+    )
+    .await
+}
+
+async fn execute_process_arm_with(
+    repository: &Path,
+    evidence_root: &Path,
+    request: ProcessArmRequest<'_>,
+    role_executable: &Path,
+    gateway: ProcessGateway<'_>,
+) -> Result<ProcessArmOutcome> {
+    require_repository_directory(repository, evidence_root)?;
     request.planned.validate()?;
+    if request.raw_ordinal != request.planned.ordinal {
+        return Err(Error::new(
+            "process arm raw ordinal differs from its frozen plan ordinal",
+        ));
+    }
+    validate_signature_policy(&request.signature_policy, request.planned.evidence_class)?;
+    match request.planned.evidence_class {
+        EvidenceClass::S if request.calibration_plan_sha256.is_none() => {}
+        EvidenceClass::C | EvidenceClass::D | EvidenceClass::A
+            if request.calibration_plan_sha256.is_some() =>
+        {
+            crate::schema::validate_non_placeholder_sha256(
+                "process-arm calibration plan",
+                request.calibration_plan_sha256.unwrap_or_default(),
+            )?;
+        }
+        _ => {
+            return Err(Error::new(
+                "process arm calibration-plan binding differs from its class",
+            ))
+        }
+    }
     if !(3..=10).contains(&request.warmup_seconds) {
         return Err(Error::new("process arm warmup must be 3..=10 seconds"));
     }
-    let primitive = execution_primitive(request.planned, request.measure_seconds)?;
     let leaf = raw_leaf_path(evidence_root, request.planned)?;
     if leaf.exists() {
         return Err(Error::new(format!(
@@ -1347,20 +1510,123 @@ pub async fn execute_process_arm(
             leaf.display()
         )));
     }
+    let expected_relative = leaf
+        .strip_prefix(evidence_root)
+        .map_err(|_| Error::new("process arm leaf escaped its evidence root"))?
+        .to_path_buf();
+    let staging_leaf = process_arm_staging_path(evidence_root, request.planned);
     let runtime_root = evidence_root.join(format!(
         ".arm-runtime-{:06}-{}",
         request.raw_ordinal,
         request.planned.cell.id()
     ));
-    if runtime_root.exists() {
-        return Err(Error::new("process arm runtime namespace already exists"));
+    if runtime_root.exists() || staging_leaf.exists() {
+        return Err(Error::new(
+            "process arm runtime or staging namespace already exists",
+        ));
     }
 
+    let mut stage = RoleErrorStage::Startup;
+    let mut measured_work_started = false;
+    let result = execute_process_arm_inner(
+        repository,
+        &leaf,
+        &expected_relative,
+        &staging_leaf,
+        &runtime_root,
+        request.clone(),
+        role_executable,
+        &gateway,
+        &mut stage,
+        &mut measured_work_started,
+    )
+    .await;
+
+    match result {
+        Ok(outcome) => {
+            if let Err(error) = cleanup_arm_path(&runtime_root) {
+                let error = error
+                    .with_role_diagnostic(RoleErrorStage::Finalize, RoleErrorCode::RuntimeCleanup);
+                let staging_cleaned = cleanup_arm_path(&staging_leaf).is_ok();
+                retain_arm_failure(
+                    repository,
+                    evidence_root,
+                    &expected_relative,
+                    &request,
+                    &error,
+                    stage,
+                    measured_work_started,
+                    !runtime_root.exists(),
+                    staging_cleaned && !staging_leaf.exists(),
+                )?;
+                return Err(error);
+            }
+            if let Err(error) = rename_directory_noreplace(&staging_leaf, &leaf) {
+                let error = error
+                    .with_role_diagnostic(RoleErrorStage::Finalize, RoleErrorCode::AtomicPublish);
+                let staging_cleaned = cleanup_arm_path(&staging_leaf).is_ok();
+                retain_arm_failure(
+                    repository,
+                    evidence_root,
+                    &expected_relative,
+                    &request,
+                    &error,
+                    stage,
+                    measured_work_started,
+                    true,
+                    staging_cleaned && !staging_leaf.exists(),
+                )?;
+                return Err(error);
+            }
+            Ok(outcome)
+        }
+        Err(error) => {
+            let staging_cleaned = cleanup_arm_path(&staging_leaf).is_ok();
+            let runtime_cleaned = cleanup_arm_path(&runtime_root).is_ok();
+            retain_arm_failure(
+                repository,
+                evidence_root,
+                &expected_relative,
+                &request,
+                &error,
+                stage,
+                measured_work_started,
+                runtime_cleaned && !runtime_root.exists(),
+                staging_cleaned && !staging_leaf.exists(),
+            )?;
+            Err(error)
+        }
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn execute_process_arm_inner(
+    repository: &Path,
+    leaf: &Path,
+    expected_relative: &Path,
+    staging_leaf: &Path,
+    runtime_root: &Path,
+    request: ProcessArmRequest<'_>,
+    role_executable: &Path,
+    gateway: &ProcessGateway<'_>,
+    stage: &mut RoleErrorStage,
+    measured_work_started: &mut bool,
+) -> Result<ProcessArmOutcome> {
+    let primitive = execution_primitive(request.planned, request.measure_seconds)?;
+
+    #[cfg(debug_assertions)]
+    let quiet = if matches!(gateway, &ProcessGateway::Test(_)) {
+        test_quiet_evidence()?
+    } else {
+        crate::linux::observe_quiet_exact()?
+    };
+    #[cfg(not(debug_assertions))]
     let quiet = crate::linux::observe_quiet_exact()?;
     quiet.validate()?;
+    *stage = RoleErrorStage::Prepare;
     let setup_start_ns = quiet.end_ns;
-    fs::create_dir_all(&runtime_root)?;
-    set_mode(&runtime_root, 0o700)?;
+    fs::create_dir_all(runtime_root)?;
+    set_mode(runtime_root, 0o700)?;
     let sampler_root = runtime_root.join("sampler");
     fs::create_dir(&sampler_root)?;
     set_mode(&sampler_root, 0o700)?;
@@ -1380,26 +1646,26 @@ pub async fn execute_process_arm(
         block: request.raw_ordinal,
         orchestrator: process_identity(std::process::id())?,
     };
-    let executable = std::env::current_exe()?;
-    let executable_sha256 = sha256_hex(&fs::read(&executable)?);
+    let role_executable_sha256 = sha256_hex(&fs::read(role_executable)?);
+    let orchestrator_executable_sha256 = sha256_hex(&fs::read(std::env::current_exe()?)?);
     let mut fixture = spawn_role(
-        &executable,
+        role_executable,
         repository,
         Role::Fixture,
         FIXTURE_CPUS,
         &context,
     )?;
-    let mut load = spawn_role(&executable, repository, Role::Load, LOAD_CPUS, &context)?;
+    let mut load = spawn_role(role_executable, repository, Role::Load, LOAD_CPUS, &context)?;
     let mut sampler = spawn_role(
-        &executable,
+        role_executable,
         repository,
         Role::Sampler,
         CONTROL_CPUS,
         &context,
     )?;
-    fixture.set_evidence_root(&runtime_root);
-    load.set_evidence_root(&runtime_root);
-    sampler.set_evidence_root(&runtime_root);
+    fixture.set_evidence_root(runtime_root);
+    load.set_evidence_root(runtime_root);
+    sampler.set_evidence_root(runtime_root);
     authenticate_role(&mut fixture).await?;
     authenticate_role(&mut load).await?;
     authenticate_role(&mut sampler).await?;
@@ -1427,11 +1693,8 @@ pub async fn execute_process_arm(
             .arm
             .ok_or_else(|| Error::new("gateway process arm has no treatment"))?;
         let topology = ArmTopology::for_arm(planned_arm);
-        let build = match topology.gateway {
-            GatewayObject::Baseline => &builds.baseline,
-            GatewayObject::Candidate => &builds.candidate,
-        };
-        let binary = build.validate_binary_reuse(repository)?;
+        let (binary, binary_sha256) =
+            process_gateway_binary(repository, gateway, topology.gateway)?;
         let session = create_ready_session(&runtime_root.join("gateway.sqlite"))?;
         let address = reserve_loopback_address().await?;
         let child = spawn_gateway(
@@ -1443,45 +1706,46 @@ pub async fn execute_process_arm(
             tripwire_address,
             primitive.fixture_protocol,
             &session.database_path,
-            &runtime_root,
+            runtime_root,
         )?;
         wait_gateway_owned(address, &child.identity).await?;
         ready_session = Some(session);
-        gateway_child = Some((child, build.binary_sha256.clone()));
+        gateway_child = Some((child, binary_sha256));
         Some(address)
     } else {
         None
     };
     let setup_end_ns = clock_ns(ClockKind::Monotonic)?;
     if setup_end_ns.saturating_sub(setup_start_ns) > 2_000_000_000 {
-        return Err(Error::new(
-            "process arm setup/readiness exceeded two seconds",
-        ));
+        return Err(Error::new(format!(
+            "process arm setup/readiness exceeded two seconds: {}ns",
+            setup_end_ns.saturating_sub(setup_start_ns)
+        )));
     }
 
     let mut observed_processes = vec![
         observed(
             Role::Orchestrator,
             process_identity(std::process::id())?,
-            &executable_sha256,
+            &orchestrator_executable_sha256,
             CONTROL_CPUS,
         ),
         observed(
             Role::Fixture,
             fixture.identity().clone(),
-            &executable_sha256,
+            &role_executable_sha256,
             FIXTURE_CPUS,
         ),
         observed(
             Role::Load,
             load.identity().clone(),
-            &executable_sha256,
+            &role_executable_sha256,
             LOAD_CPUS,
         ),
         observed(
             Role::Sampler,
             sampler.identity().clone(),
-            &executable_sha256,
+            &role_executable_sha256,
             CONTROL_CPUS,
         ),
     ];
@@ -1504,6 +1768,7 @@ pub async fn execute_process_arm(
     })
     .await?;
 
+    *stage = RoleErrorStage::Proof;
     let pre_auth_tids =
         if cell.workload == Workload::WebSocket && primitive.target == LoadTarget::Gateway {
             sampler.send(ControlBody::Inventory).await?;
@@ -1543,6 +1808,7 @@ pub async fn execute_process_arm(
         ));
     }
 
+    *stage = RoleErrorStage::Materialize;
     let mut websocket_retirement = None;
     if cell.workload == Workload::WebSocket {
         let retirement_start = clock_ns(ClockKind::Monotonic)?;
@@ -1590,23 +1856,7 @@ pub async fn execute_process_arm(
         u64::from(cell.concurrency),
         false,
     )?;
-    let ordinary_materialization =
-        if cell.workload != Workload::WebSocket && primitive.target == LoadTarget::Gateway {
-            Some(
-                run_ordinary_materialization(
-                    &mut load,
-                    &mut sampler,
-                    cell,
-                    primitive.load_protocol,
-                    Some(materialized.clone()),
-                    PROCESS_STABILITY_CAP_NS,
-                    &runtime_root.join("materialization.json"),
-                )
-                .await?,
-            )
-        } else {
-            None
-        };
+    let ordinary_materialization: Option<MaterializationEvidence> = None;
     let measured_operation_ceiling = match primitive.measurement {
         ControlBody::MeasureCount { operations, .. } => operations,
         ControlBody::MeasureDuration { .. } => 2_000_000,
@@ -1616,13 +1866,13 @@ pub async fn execute_process_arm(
         prepare_operation_corpus(&mut load, 3, measured_operation_ceiling).await?;
     }
 
+    *stage = RoleErrorStage::Freeze;
     let freeze_start_ns = clock_ns(ClockKind::Monotonic)?;
     sampler.send(ControlBody::Freeze).await?;
     let frozen = expect_frozen(&mut sampler).await?;
     ensure_post_freeze_unchanged(&frozen, None)?;
-    if let Some(materialization) = &ordinary_materialization {
-        ensure_materialization_matches_freeze(materialization, &frozen)?;
-    }
+    let thread_map = process_thread_map(&frozen)?;
+    apply_signature_policy(repository, &request, &thread_map)?;
     sampler.send(ControlBody::Release).await?;
     let release_ns = match sampler.receive().await? {
         ControlBody::Released { monotonic_ns } => monotonic_ns,
@@ -1632,6 +1882,8 @@ pub async fn execute_process_arm(
         return Err(Error::new("process arm freeze exceeded one second"));
     }
 
+    *stage = RoleErrorStage::Measure;
+    *measured_work_started = true;
     load.send(primitive.measurement.clone()).await?;
     let measured = expect_measured(&mut load).await?;
     if measured.window_start_ns.saturating_sub(release_ns) > MEASURE_HANDOFF_CAP_NS {
@@ -1649,7 +1901,7 @@ pub async fn execute_process_arm(
     sampler.send(ControlBody::FinalSample).await?;
     let sampled = expect_sampled(&mut sampler).await?;
     ensure_post_freeze_unchanged(&sampled, Some(&frozen))?;
-    fixture.send(ControlBody::FixtureSnapshot).await?;
+    fixture.send(ControlBody::FixtureCompactSnapshot).await?;
     let fixture_result = expect_fixture(&mut fixture).await?;
     validate_process_fixture(
         &fixture_result,
@@ -1679,16 +1931,25 @@ pub async fn execute_process_arm(
 
     let sampler_evidence =
         crate::sampler::read_persistent(&sampler_root.join("sampler-final.bin"))?;
-    let quality_blockers = sampler_quality_blockers(&sampler_evidence.report);
+    let quality_blockers =
+        sampler_quality_blockers_for(&sampler_evidence.report, request.frequency_gate);
+    *stage = RoleErrorStage::Finalize;
     fs::create_dir_all(
         leaf.parent()
             .ok_or_else(|| Error::new("raw leaf has no parent"))?,
     )?;
-    fs::create_dir(&leaf)?;
-    set_mode(&leaf, 0o700)?;
+    fs::create_dir_all(
+        staging_leaf
+            .parent()
+            .ok_or_else(|| Error::new("raw staging leaf has no parent"))?,
+    )?;
+    fs::create_dir(staging_leaf)?;
+    set_mode(staging_leaf, 0o700)?;
     let outcome = write_process_raw_arm(
         repository,
-        &leaf,
+        staging_leaf,
+        leaf,
+        expected_relative,
         request,
         &quiet,
         &proof,
@@ -1696,6 +1957,8 @@ pub async fn execute_process_arm(
         ordinary_materialization.as_ref(),
         &measured,
         &fixture_result,
+        ready_session.as_ref().map(|session| &session.evidence),
+        &thread_map,
         &frozen,
         &sampled,
         &sampler_evidence,
@@ -1711,8 +1974,493 @@ pub async fn execute_process_arm(
         exit_end_ns,
         &quality_blockers,
     )?;
-    fs::remove_dir_all(&runtime_root)?;
     Ok(outcome)
+}
+
+#[cfg(debug_assertions)]
+fn test_quiet_evidence() -> Result<QuietEvidence> {
+    let end_ns = clock_ns(ClockKind::Monotonic)?;
+    let start_ns = end_ns
+        .checked_sub(10_000_000_000)
+        .ok_or_else(|| Error::new("test Q_obs requires ten seconds of monotonic uptime"))?;
+    Ok(QuietEvidence {
+        schema: "amg-http2-perf/quiet/v1".to_owned(),
+        clock: "CLOCK_MONOTONIC".to_owned(),
+        start_ns,
+        end_ns,
+        q_extra_ns: 0,
+        cpu_psi_some_us: 0,
+        memory_psi_full_us: 0,
+        io_psi_full_us: 0,
+        swap_in_delta: 0,
+        swap_out_delta: 0,
+        steal_ticks_delta: 0,
+        external_time_clean: true,
+        search_start_ns: 0,
+        orchestrator_threads: Vec::new(),
+        candidates: Vec::new(),
+    })
+}
+
+fn validate_signature_policy(
+    policy: &PreMeasureSignaturePolicy<'_>,
+    class: EvidenceClass,
+) -> Result<()> {
+    let valid = matches!(
+        (class, policy),
+        (EvidenceClass::S, PreMeasureSignaturePolicy::Observe)
+            | (
+                EvidenceClass::C | EvidenceClass::D,
+                PreMeasureSignaturePolicy::Establish { .. }
+            )
+            | (
+                EvidenceClass::C | EvidenceClass::D | EvidenceClass::A,
+                PreMeasureSignaturePolicy::Require { .. }
+            )
+    );
+    if valid {
+        Ok(())
+    } else {
+        Err(Error::new(
+            "process arm signature policy does not match its evidence class",
+        ))
+    }
+}
+
+fn process_observation_id(request: &ProcessArmRequest<'_>) -> String {
+    format!(
+        "{}-{}-{:06}",
+        request.run_id,
+        request.planned.cell.id(),
+        request.raw_ordinal
+    )
+}
+
+fn process_thread_map(frozen: &SamplerReport) -> Result<ThreadMapEvidence> {
+    let mut frozen_threads = Vec::new();
+    let mut signature_hasher = Sha256::new();
+    signature_hasher.update(b"amg-http2-perf/all-role-thread-signature/v1\0");
+    for inventory in &frozen.inventories {
+        signature_hasher.update(inventory.role.label().as_bytes());
+        signature_hasher.update(inventory.semantic_signature_sha256.as_bytes());
+        for thread in &inventory.threads {
+            frozen_threads.push(FrozenThread {
+                role: inventory.role.label().to_owned(),
+                pid: thread.pid,
+                tid: thread.tid,
+                start_time_ticks: thread.start_time_ticks,
+                comm: thread.comm.clone(),
+                assigned_cpu: thread.assigned_cpu,
+                allowed_cpu: thread.assigned_cpu,
+                observed_last_cpu: thread.assigned_cpu,
+            });
+        }
+    }
+    frozen_threads.sort_by_key(|thread| {
+        (
+            thread.role.clone(),
+            thread.comm.clone(),
+            thread.start_time_ticks,
+            thread.tid,
+        )
+    });
+    let thread_map = ThreadMapEvidence {
+        schema: "amg-http2-perf/thread-map/v1".to_owned(),
+        signature_sha256: format!("{:x}", signature_hasher.finalize()),
+        threads: frozen_threads,
+    };
+    thread_map.validate()?;
+    Ok(thread_map)
+}
+
+fn apply_signature_policy(
+    repository: &Path,
+    request: &ProcessArmRequest<'_>,
+    thread_map: &ThreadMapEvidence,
+) -> Result<()> {
+    match &request.signature_policy {
+        PreMeasureSignaturePolicy::Observe => Ok(()),
+        PreMeasureSignaturePolicy::Establish { accepted_record } => {
+            let accepted_record = repository_output_path(repository, accepted_record, false)?;
+            let parent = accepted_record
+                .parent()
+                .ok_or_else(|| Error::new("accepted signature path has no parent"))?;
+            fs::create_dir_all(parent)?;
+            repository_output_path(repository, &accepted_record, false)?;
+            let record = AcceptedSignatureRecord {
+                schema: ACCEPTED_SIGNATURE_SCHEMA.to_owned(),
+                calibration_id: request.evidence_id.to_owned(),
+                calibration_plan_sha256: request
+                    .calibration_plan_sha256
+                    .ok_or_else(|| Error::new("signature establishment lacks calibration plan"))?
+                    .to_owned(),
+                cell: request.planned.cell,
+                arm: request.planned.arm,
+                direct_protocol: request.planned.direct_protocol.map(raw_protocol),
+                establishment_class: request.planned.evidence_class,
+                establishment_ordinal: request.raw_ordinal,
+                source_observation_id: process_observation_id(request),
+                signature_sha256: thread_map.signature_sha256.clone(),
+            };
+            record.validate()?;
+            json::write_new_canonical(&accepted_record, &record).map_err(|error| {
+                error.with_role_diagnostic(
+                    RoleErrorStage::Freeze,
+                    RoleErrorCode::SignatureRecordInvalid,
+                )
+            })?;
+            Ok(())
+        }
+        PreMeasureSignaturePolicy::Require { accepted_record } => {
+            let accepted_record = repository_output_path(repository, accepted_record, true)?;
+            let metadata = fs::symlink_metadata(&accepted_record)?;
+            if !metadata.file_type().is_file() || metadata.len() == 0 || metadata.len() > 65_536 {
+                return Err(
+                    Error::new("accepted signature record is not a bounded file")
+                        .with_role_diagnostic(
+                            RoleErrorStage::Freeze,
+                            RoleErrorCode::SignatureRecordInvalid,
+                        ),
+                );
+            }
+            let record: AcceptedSignatureRecord =
+                json::require_canonical(&fs::read(&accepted_record)?).map_err(|error| {
+                    error.with_role_diagnostic(
+                        RoleErrorStage::Freeze,
+                        RoleErrorCode::SignatureRecordInvalid,
+                    )
+                })?;
+            record
+                .validate_for(
+                    request.planned,
+                    request.calibration_plan_sha256.ok_or_else(|| {
+                        Error::new("signature requirement lacks calibration plan")
+                    })?,
+                )
+                .map_err(|error| {
+                    error.with_role_diagnostic(
+                        RoleErrorStage::Freeze,
+                        RoleErrorCode::SignatureRecordInvalid,
+                    )
+                })?;
+            if record.signature_sha256 != thread_map.signature_sha256 {
+                return Err(Error::new(
+                    "post-materialization signature differs from the accepted exact signature",
+                )
+                .with_role_diagnostic(RoleErrorStage::Freeze, RoleErrorCode::SignatureMismatch));
+            }
+            Ok(())
+        }
+    }
+}
+
+fn process_gateway_binary(
+    repository: &Path,
+    gateway: &ProcessGateway<'_>,
+    object: GatewayObject,
+) -> Result<(PathBuf, String)> {
+    match gateway {
+        ProcessGateway::Exact(builds) => {
+            let build = match object {
+                GatewayObject::Baseline => &builds.baseline,
+                GatewayObject::Candidate => &builds.candidate,
+            };
+            Ok((
+                build.validate_binary_reuse(repository)?,
+                build.binary_sha256.clone(),
+            ))
+        }
+        #[cfg(debug_assertions)]
+        ProcessGateway::Test(binary) => {
+            Ok(((*binary).to_path_buf(), sha256_hex(&fs::read(binary)?)))
+        }
+    }
+}
+
+#[cfg(debug_assertions)]
+fn require_repository_executable(repository: &Path, executable: &Path) -> Result<()> {
+    use std::os::unix::fs::PermissionsExt as _;
+
+    let repository = fs::canonicalize(repository)?;
+    let executable = fs::canonicalize(executable)?;
+    let metadata = fs::symlink_metadata(&executable)?;
+    if !executable.starts_with(&repository)
+        || !metadata.file_type().is_file()
+        || metadata.permissions().mode() & 0o111 == 0
+    {
+        return Err(Error::new(
+            "test process-arm executable is not an executable repository file",
+        ));
+    }
+    Ok(())
+}
+
+fn repository_output_path(repository: &Path, path: &Path, must_exist: bool) -> Result<PathBuf> {
+    let repository = fs::canonicalize(repository)?;
+    let path = if path.is_absolute() {
+        path.to_path_buf()
+    } else {
+        repository.join(path)
+    };
+    if path
+        .components()
+        .any(|component| matches!(component, std::path::Component::ParentDir))
+    {
+        return Err(Error::new(
+            "repository output path contains parent traversal",
+        ));
+    }
+    let checked = if must_exist {
+        fs::canonicalize(&path)?
+    } else {
+        let parent = path
+            .parent()
+            .ok_or_else(|| Error::new("repository output path has no parent"))?;
+        if parent.exists() {
+            let canonical_parent = fs::canonicalize(parent)?;
+            canonical_parent.join(
+                path.file_name()
+                    .ok_or_else(|| Error::new("repository output path has no file name"))?,
+            )
+        } else {
+            path.clone()
+        }
+    };
+    if !checked.starts_with(&repository) {
+        return Err(Error::new("repository output path escaped the repository"));
+    }
+    Ok(checked)
+}
+
+fn require_repository_directory(repository: &Path, path: &Path) -> Result<()> {
+    let repository = fs::canonicalize(repository)?;
+    let path = fs::canonicalize(path)?;
+    let metadata = fs::symlink_metadata(&path)?;
+    if !path.starts_with(&repository) || !metadata.file_type().is_dir() {
+        return Err(Error::new(
+            "process arm evidence root is not a repository-local directory",
+        ));
+    }
+    Ok(())
+}
+
+fn process_arm_staging_path(root: &Path, planned: &PlannedArm) -> PathBuf {
+    root.join(".arm-staging").join(format!(
+        "{}-{:06}-{}-{}",
+        evidence_class_label(planned.evidence_class),
+        planned.ordinal,
+        planned.cell.id(),
+        planned
+            .arm
+            .map(Arm::code)
+            .or_else(|| planned.direct_protocol.map(Protocol::label))
+            .unwrap_or("unknown")
+    ))
+}
+
+fn evidence_class_label(class: EvidenceClass) -> &'static str {
+    match class {
+        EvidenceClass::S => "s",
+        EvidenceClass::C => "c",
+        EvidenceClass::D => "d",
+        EvidenceClass::A => "a",
+    }
+}
+
+fn cleanup_arm_path(path: &Path) -> Result<()> {
+    if !path.exists() {
+        return Ok(());
+    }
+    let metadata = fs::symlink_metadata(path)?;
+    if metadata.file_type().is_dir() {
+        fs::remove_dir_all(path)?;
+    } else {
+        fs::remove_file(path)?;
+    }
+    if path.exists() {
+        return Err(Error::new(
+            "arm runtime/staging cleanup left its path present",
+        ));
+    }
+    Ok(())
+}
+
+fn rename_directory_noreplace(source: &Path, target: &Path) -> Result<()> {
+    if target.exists() {
+        return Err(Error::new(
+            "final raw leaf already exists before atomic publish",
+        ));
+    }
+    let source_c = CString::new(source.as_os_str().as_bytes())
+        .map_err(|_| Error::new("raw staging path contains NUL"))?;
+    let target_c = CString::new(target.as_os_str().as_bytes())
+        .map_err(|_| Error::new("final raw path contains NUL"))?;
+    // SAFETY: both NUL-terminated paths name repository-local directories and
+    // RENAME_NOREPLACE prevents publication from replacing existing evidence.
+    let result = unsafe {
+        libc::renameat2(
+            libc::AT_FDCWD,
+            source_c.as_ptr(),
+            libc::AT_FDCWD,
+            target_c.as_ptr(),
+            libc::RENAME_NOREPLACE,
+        )
+    };
+    if result != 0 {
+        return Err(std::io::Error::last_os_error().into());
+    }
+    File::open(
+        target
+            .parent()
+            .ok_or_else(|| Error::new("final raw leaf has no parent"))?,
+    )?
+    .sync_all()?;
+    File::open(
+        source
+            .parent()
+            .ok_or_else(|| Error::new("raw staging leaf has no parent"))?,
+    )?
+    .sync_all()?;
+    Ok(())
+}
+
+#[allow(clippy::too_many_arguments)]
+fn retain_arm_failure(
+    repository: &Path,
+    evidence_root: &Path,
+    final_leaf: &Path,
+    request: &ProcessArmRequest<'_>,
+    error: &Error,
+    fallback_stage: RoleErrorStage,
+    measured_work_started: bool,
+    runtime_cleaned: bool,
+    staging_cleaned: bool,
+) -> Result<()> {
+    let diagnostic = error.role_diagnostic();
+    let record = ArmFailureRecord {
+        schema: ARM_FAILURE_SCHEMA.to_owned(),
+        evidence_id_sha256: sha256_hex(request.evidence_id.as_bytes()),
+        run_id_sha256: sha256_hex(request.run_id.as_bytes()),
+        class: request.planned.evidence_class,
+        cell: request.planned.cell,
+        arm: request.planned.arm,
+        direct_protocol: request.planned.direct_protocol.map(raw_protocol),
+        raw_ordinal: request.raw_ordinal,
+        stage: diagnostic.map_or(fallback_stage, |value| value.stage),
+        code: diagnostic.map_or_else(
+            || error.role_code().unwrap_or(RoleErrorCode::Internal),
+            |value| value.code,
+        ),
+        measured_work_started,
+        final_leaf: final_leaf.to_string_lossy().into_owned(),
+        runtime_cleaned,
+        staging_cleaned,
+    };
+    record.validate()?;
+    let path = arm_failure_path(evidence_root, request.planned);
+    let directory = path
+        .parent()
+        .ok_or_else(|| Error::new("arm-failure path has no parent"))?;
+    fs::create_dir_all(directory)?;
+    repository_output_path(repository, &directory.join("probe"), false)?;
+    let bytes = json::write_new_canonical(&path, &record)?;
+    if bytes.len() > 65_536 {
+        return Err(Error::new("arm-failure record exceeded its fixed bound"));
+    }
+    Ok(())
+}
+
+fn arm_failure_path(evidence_root: &Path, planned: &PlannedArm) -> PathBuf {
+    evidence_root
+        .join("arm-failures")
+        .join(evidence_class_label(planned.evidence_class))
+        .join(format!(
+            "{:06}-{}-{}.json",
+            planned.ordinal,
+            planned.cell.id(),
+            planned
+                .arm
+                .map(Arm::code)
+                .or_else(|| planned.direct_protocol.map(Protocol::label))
+                .unwrap_or("unknown")
+        ))
+}
+
+pub(crate) fn retain_interrupted_process_arm(
+    repository: &Path,
+    evidence_root: &Path,
+    evidence_id: &str,
+    run_id: &str,
+    planned: &PlannedArm,
+) -> Result<()> {
+    let final_leaf = raw_leaf_path(evidence_root, planned)?;
+    if final_leaf.exists() {
+        return Err(Error::new(
+            "interrupted process arm already has a published raw leaf",
+        ));
+    }
+    let staging_leaf = process_arm_staging_path(evidence_root, planned);
+    let runtime_root = evidence_root.join(format!(
+        ".arm-runtime-{:06}-{}",
+        planned.ordinal,
+        planned.cell.id()
+    ));
+    cleanup_arm_path(&staging_leaf)?;
+    cleanup_arm_path(&runtime_root)?;
+
+    let path = arm_failure_path(evidence_root, planned);
+    if path.exists() {
+        let record: ArmFailureRecord = json::read_strict(&path, crate::schema::JSON_MAX_BYTES)?;
+        record.validate()?;
+        if record.evidence_id_sha256 != sha256_hex(evidence_id.as_bytes())
+            || record.run_id_sha256 != sha256_hex(run_id.as_bytes())
+            || record.class != planned.evidence_class
+            || record.cell != planned.cell
+            || record.arm != planned.arm
+            || record.direct_protocol != planned.direct_protocol.map(raw_protocol)
+            || record.raw_ordinal != planned.ordinal
+            || !record.runtime_cleaned
+            || !record.staging_cleaned
+        {
+            return Err(Error::new(
+                "retained interrupted-arm failure differs from its journal plan",
+            ));
+        }
+        return Ok(());
+    }
+
+    let expected_relative = final_leaf
+        .strip_prefix(evidence_root)
+        .map_err(|_| Error::new("interrupted arm final leaf escaped evidence root"))?;
+    let request = ProcessArmRequest {
+        evidence_id,
+        run_id,
+        planned,
+        raw_ordinal: planned.ordinal,
+        warmup_seconds: 3,
+        measure_seconds: None,
+        calibration_plan_sha256: None,
+        signature_policy: PreMeasureSignaturePolicy::Observe,
+        trust_boundary: TrustBoundaryManifest::coordinated(
+            "01".repeat(32),
+            BASELINE_COMMIT.to_owned(),
+            crate::schema::INITIAL_CANDIDATE_COMMIT.to_owned(),
+        )?,
+        frequency_gate: FrequencyGate::CalibrationAbsolute,
+    };
+    let error = Error::new("coordinator interruption left a partially started process arm")
+        .with_role_diagnostic(RoleErrorStage::Finalize, RoleErrorCode::Panic);
+    retain_arm_failure(
+        repository,
+        evidence_root,
+        expected_relative,
+        &request,
+        &error,
+        RoleErrorStage::Finalize,
+        true,
+        true,
+        true,
+    )
 }
 
 fn raw_leaf_path(root: &Path, planned: &PlannedArm) -> Result<PathBuf> {
@@ -1845,6 +2593,67 @@ fn validate_process_fixture(
     } = phases;
     let materialized =
         materialized.ok_or_else(|| Error::new("process fixture materialization result missing"))?;
+    let proof_phase = if workload == Workload::WebSocket {
+        0
+    } else {
+        1
+    };
+    let mut expected_phases = std::collections::BTreeSet::from([proof_phase, 2, 3]);
+    if let Some(materialization) = ordinary_materialization {
+        expected_phases.extend(materialization.waves.iter().map(|wave| wave.phase));
+    }
+    let aggregate_phases = fixture
+        .phase_aggregates
+        .iter()
+        .map(|phase| phase.phase)
+        .collect::<std::collections::BTreeSet<_>>();
+    let phase_inventory_valid = aggregate_phases.len() == fixture.phase_aggregates.len()
+        && aggregate_phases == expected_phases;
+    let compact_valid = if fixture.compacted {
+        let mut phases = std::collections::BTreeSet::new();
+        let operation_count = fixture
+            .phase_aggregates
+            .iter()
+            .try_fold(0_u64, |total, phase| total.checked_add(phase.operations));
+        fixture.observations.is_empty()
+            && !fixture.phase_aggregates.is_empty()
+            && phase_inventory_valid
+            && operation_count == Some(fixture.observation_count)
+            && fixture.phase_aggregates.iter().all(|phase| {
+                phases.insert(phase.phase)
+                    && crate::schema::validate_non_placeholder_sha256(
+                        "fixture phase operation hash",
+                        &phase.operation_hash_sha256,
+                    )
+                    .is_ok()
+                    && phase.protocol_correct
+                    && phase.payload_correct
+                    && phase.identity_correct
+                    && phase.headers_sanitized
+                    && phase.request_eos
+                    && phase.response_semantics_correct
+            })
+    } else {
+        phase_inventory_valid
+            && fixture.observation_count == fixture.observations.len() as u64
+            && fixture.observations.iter().all(|observation| {
+                observation.protocol == protocol
+                    && observation.payload_ok
+                    && observation.identity_ok
+                    && observation.request_headers_sanitized
+                    && observation.request_eos
+                    && (observation.method == "PING"
+                        || observation.status == 200
+                        || observation.status == 101)
+                    && if protocol == Protocol::H2 {
+                        observation
+                            .stream_id
+                            .is_some_and(|stream| !stream.is_multiple_of(2))
+                    } else {
+                        observation.stream_id.is_none()
+                    }
+            })
+    };
     if fixture.target != target
         || fixture.expected_protocol != protocol
         || fixture.physical_connections == 0
@@ -1854,23 +2663,7 @@ fn validate_process_fixture(
         || fixture.tripwire_bytes != 0
         || fixture.duplicate_operations != 0
         || fixture.unknown_requests != 0
-        || !fixture.observations.iter().all(|observation| {
-            observation.protocol == protocol
-                && observation.payload_ok
-                && observation.identity_ok
-                && observation.request_headers_sanitized
-                && observation.request_eos
-                && (observation.method == "PING"
-                    || observation.status == 200
-                    || observation.status == 101)
-                && if protocol == Protocol::H2 {
-                    observation
-                        .stream_id
-                        .is_some_and(|stream| !stream.is_multiple_of(2))
-                } else {
-                    observation.stream_id.is_none()
-                }
-        })
+        || !compact_valid
     {
         return Err(Error::new(
             "process fixture protocol/correctness/tripwire ledger failed",
@@ -1887,11 +2680,19 @@ fn validate_process_fixture(
                 ));
             }
             fixture.h2_wire[0].validate(workload == Workload::WebSocket)?;
-            let http_observations = fixture
-                .observations
-                .iter()
-                .filter(|observation| observation.method != "PING")
-                .count() as u64;
+            let http_observations = if fixture.compacted {
+                fixture
+                    .phase_aggregates
+                    .iter()
+                    .try_fold(0_u64, |total, phase| total.checked_add(phase.http_requests))
+                    .ok_or_else(|| Error::new("fixture HTTP request count overflow"))?
+            } else {
+                fixture
+                    .observations
+                    .iter()
+                    .filter(|observation| observation.method != "PING")
+                    .count() as u64
+            };
             if fixture.h2_wire[0].request_headers != http_observations {
                 return Err(Error::new(
                     "fixture H2 HEADERS and HTTP observation ledgers differ",
@@ -1900,11 +2701,6 @@ fn validate_process_fixture(
         }
         Protocol::H1 => {}
     }
-    let proof_phase = if workload == Workload::WebSocket {
-        0
-    } else {
-        1
-    };
     let proof_operations = if workload == Workload::WebSocket {
         proof.tunnels
     } else {
@@ -1953,6 +2749,8 @@ fn validate_process_fixture(
 fn write_process_raw_arm(
     repository: &Path,
     leaf: &Path,
+    published_leaf: &Path,
+    expected_relative: &Path,
     request: ProcessArmRequest<'_>,
     quiet: &QuietEvidence,
     proof: &LoadProof,
@@ -1960,6 +2758,8 @@ fn write_process_raw_arm(
     ordinary_materialization: Option<&MaterializationEvidence>,
     measured: &LoadResult,
     fixture: &FixtureResult,
+    ready_session: Option<&ReadySessionEvidence>,
+    thread_map: &ThreadMapEvidence,
     frozen: &SamplerReport,
     sampled: &SamplerReport,
     sampler_evidence: &crate::sampler::SamplerPersistentEvidence,
@@ -1980,12 +2780,7 @@ fn write_process_raw_arm(
     let deadline_ns = measured
         .window_deadline_ns
         .unwrap_or(measured.window_end_ns);
-    let observation_id = format!(
-        "{}-{}-{:06}",
-        request.run_id,
-        cell.id(),
-        request.raw_ordinal
-    );
+    let observation_id = process_observation_id(&request);
     let position = request.planned.row.and_then(|row| {
         crate::schedule::williams_rows()[usize::from(row)]
             .iter()
@@ -2043,41 +2838,7 @@ fn write_process_raw_arm(
     }
     json::write_new_canonical(&leaf.join("quiet.json"), quiet)?;
 
-    let mut frozen_threads = Vec::new();
-    let mut signature_hasher = Sha256::new();
-    signature_hasher.update(b"amg-http2-perf/all-role-thread-signature/v1\0");
-    for inventory in &frozen.inventories {
-        signature_hasher.update(inventory.role.label().as_bytes());
-        signature_hasher.update(inventory.semantic_signature_sha256.as_bytes());
-        for thread in &inventory.threads {
-            frozen_threads.push(FrozenThread {
-                role: inventory.role.label().to_owned(),
-                pid: thread.pid,
-                tid: thread.tid,
-                start_time_ticks: thread.start_time_ticks,
-                comm: thread.comm.clone(),
-                assigned_cpu: thread.assigned_cpu,
-                allowed_cpu: thread.assigned_cpu,
-                observed_last_cpu: thread.assigned_cpu,
-            });
-        }
-    }
-    frozen_threads.sort_by_key(|thread| {
-        (
-            thread.role.clone(),
-            thread.comm.clone(),
-            thread.start_time_ticks,
-            thread.tid,
-        )
-    });
-    let thread_signature_sha256 = format!("{:x}", signature_hasher.finalize());
-    let thread_map = ThreadMapEvidence {
-        schema: "amg-http2-perf/thread-map/v1".to_owned(),
-        signature_sha256: thread_signature_sha256.clone(),
-        threads: frozen_threads,
-    };
-    thread_map.validate()?;
-    json::write_new_canonical(&leaf.join("thread-map.json"), &thread_map)?;
+    json::write_new_canonical(&leaf.join("thread-map.json"), thread_map)?;
 
     let lifecycle = process_lifecycle_events(
         cell.workload,
@@ -2140,34 +2901,56 @@ fn write_process_raw_arm(
         &lifecycle_evidence,
     )?;
 
+    let clock_manifest_sha256 = request.trust_boundary.clock_sha256()?;
     let session_clock = if class == EvidenceClass::D {
         SessionClockEvidence {
-            schema: "amg-http2-perf/session-clock/v1".to_owned(),
+            schema: "amg-http2-perf/session-clock/v2".to_owned(),
             direct: true,
             comparable: true,
             discontinuities: 0,
             samples: Vec::new(),
+            ready_session: None,
+            clock_manifest_sha256: Some(clock_manifest_sha256),
+            protocol_dates: Vec::new(),
         }
     } else {
-        SessionClockEvidence {
-            schema: "amg-http2-perf/session-clock/v1".to_owned(),
-            direct: false,
-            comparable: sampled.realtime_comparable,
-            discontinuities: sampled.realtime_discontinuities,
-            samples: sampler_evidence
-                .realtime_triplets
-                .iter()
-                .map(|sample| ClockSample {
+        let ready_session = ready_session
+            .cloned()
+            .ok_or_else(|| Error::new("gateway raw arm lacks ready-session evidence"))?;
+        let samples = sampler_evidence
+            .realtime_triplets
+            .iter()
+            .map(|sample| {
+                let predicates = ready_predicates_at(&ready_session, sample.realtime_ns)?;
+                Ok(ClockSample {
                     boottime_before_ns: sample.boottime_before_ns,
                     realtime_ns: sample.realtime_ns,
                     boottime_after_ns: sample.boottime_after_ns,
-                    ready: true,
-                    active: true,
-                    refresh_due: false,
-                    touch_due: false,
+                    ready: predicates.ready,
+                    active: predicates.active,
+                    refresh_due: predicates.access_refresh_due,
+                    touch_due: predicates.touch_due,
                 })
+            })
+            .collect::<Result<Vec<_>>>()?;
+        let discontinuities = raw_clock_discontinuities(&samples)?;
+        let mut evidence = SessionClockEvidence {
+            schema: "amg-http2-perf/session-clock/v2".to_owned(),
+            direct: false,
+            comparable: false,
+            discontinuities,
+            samples,
+            ready_session: Some(ready_session),
+            clock_manifest_sha256: Some(clock_manifest_sha256),
+            protocol_dates: proof
+                .protocol_dates
+                .iter()
+                .chain(&measured.protocol_dates)
+                .cloned()
                 .collect(),
-        }
+        };
+        evidence.comparable = evidence.derived_comparable()?;
+        evidence
     };
     session_clock.validate()?;
     raw::write_record_new(
@@ -2177,7 +2960,12 @@ fn write_process_raw_arm(
         &session_clock,
     )?;
 
-    let resources = process_resource_evidence(class, frozen, &sampler_evidence.report)?;
+    let resources = process_resource_evidence(
+        frozen,
+        &sampler_evidence.report,
+        request.frequency_gate,
+        quality_blockers,
+    )?;
     resources.validate(class)?;
     raw::write_record_new(
         &leaf.join("resources.bin"),
@@ -2204,10 +2992,21 @@ fn write_process_raw_arm(
     ];
     let downstream_wire = wire_endpoint_summary(downstream, &measured.h2_wire)?;
     let upstream_wire = wire_endpoint_summary(upstream, &fixture.h2_wire)?;
+    let observed_downstream = proof
+        .observed_protocol
+        .filter(|protocol| measured.observed_protocol == Some(*protocol))
+        .ok_or_else(|| {
+            Error::new("load proof/measurement lacks one observed downstream protocol")
+        })?;
+    let observed_upstream = fixture_measured
+        .observed_protocol
+        .ok_or_else(|| Error::new("fixture lacks one observed upstream protocol"))?;
+    let date_values_sha256 =
+        protocol_date_values_sha256(proof.protocol_dates.iter().chain(&measured.protocol_dates));
     let endpoints = EndpointEvidence {
-        schema: "amg-http2-perf/endpoints/v1".to_owned(),
-        downstream_protocol: raw_protocol(downstream),
-        upstream_protocol: raw_protocol(upstream),
+        schema: "amg-http2-perf/endpoints/v2".to_owned(),
+        downstream_protocol: raw_protocol(observed_downstream),
+        upstream_protocol: raw_protocol(observed_upstream),
         downstream_physical_connections: total_downstream_connections(
             downstream,
             cell.workload,
@@ -2240,6 +3039,42 @@ fn write_process_raw_arm(
         tripwire_bytes: fixture.tripwire_bytes,
         duplicate_operations: fixture.duplicate_operations,
         phases,
+        downstream_protocol_observations: proof
+            .warmup_operations
+            .max(proof.tunnels)
+            .saturating_add(measured.operations_completed),
+        upstream_protocol_observations: fixture_measured.operations,
+        fixture_identity_observations: fixture_measured.operations,
+        fixture_identity_correct_observations: if fixture_measured.identity_correct {
+            fixture_measured.operations
+        } else {
+            0
+        },
+        fixture_identity_correct: fixture_measured.identity_correct,
+        request_header_observations: fixture_measured.operations,
+        request_headers_sanitized_observations: if fixture_measured.headers_sanitized {
+            fixture_measured.operations
+        } else {
+            0
+        },
+        request_headers_sanitized: fixture_measured.headers_sanitized,
+        response_header_observations: measured.operations_completed,
+        response_headers_sanitized_observations: if measured.response_headers_sanitized {
+            measured.operations_completed
+        } else {
+            0
+        },
+        response_headers_sanitized: measured.response_headers_sanitized,
+        gateway_date_observations: if class == EvidenceClass::D {
+            0
+        } else {
+            u64::try_from(proof.protocol_dates.len() + measured.protocol_dates.len())
+                .map_err(|_| Error::new("Date observation count overflow"))?
+        },
+        gateway_date_values_sha256: date_values_sha256,
+        config_manifest_sha256: request.trust_boundary.config_sha256()?,
+        corpus_manifest_sha256: request.trust_boundary.corpus_sha256()?,
+        connection_policy_manifest_sha256: request.trust_boundary.connection_policy_sha256()?,
     };
     let operation = OperationSummaryEvidence {
         schema: "amg-http2-perf/operation-summary/v1".to_owned(),
@@ -2255,7 +3090,7 @@ fn write_process_raw_arm(
         last_operation_id: measured.last_operation_id.clone(),
         operation_hash_sha256: measured.operation_hash_sha256.clone(),
         exact_status: measured.status_ok,
-        exact_version: true,
+        exact_version: observed_downstream == downstream,
         exact_payload: measured.payload_ok,
         exact_eos: measured.eos_ok,
         sse_content_type: measured.sse_content_type_ok,
@@ -2285,14 +3120,11 @@ fn write_process_raw_arm(
             "S/D process arm produced forbidden latency data",
         ));
     }
-    let parsed = raw::validate_evidence_tree(
-        leaf.ancestors()
-            .nth(4)
-            .ok_or_else(|| Error::new("raw process leaf has no evidence root"))?,
-    );
-    if let Err(error) = parsed {
-        return Err(error.context("strict process raw evidence failed immediate parse"));
-    }
+    raw::validate_evidence_leaf(leaf, expected_relative).map_err(|error| {
+        error
+            .context("strict process raw leaf failed immediate parse")
+            .with_role_diagnostic(RoleErrorStage::Finalize, RoleErrorCode::RawValidation)
+    })?;
 
     let calibration_record = match class {
         EvidenceClass::S | EvidenceClass::C | EvidenceClass::D => Some(CalibrationRecord {
@@ -2325,7 +3157,7 @@ fn write_process_raw_arm(
     if let Some(record) = &calibration_record {
         record.validate()?;
     }
-    let raw_leaf = leaf
+    let raw_leaf = published_leaf
         .strip_prefix(repository)
         .map_err(|_| Error::new("raw process leaf escaped repository"))?
         .to_string_lossy()
@@ -2334,7 +3166,7 @@ fn write_process_raw_arm(
         metadata,
         calibration_record,
         raw_leaf,
-        thread_signature_sha256,
+        thread_signature_sha256: thread_map.signature_sha256.clone(),
         lifecycle,
         quality_blockers: quality_blockers.to_vec(),
     })
@@ -2450,9 +3282,10 @@ fn process_lifecycle_events(
 }
 
 fn process_resource_evidence(
-    class: EvidenceClass,
     frozen: &SamplerReport,
     sampled: &SamplerReport,
+    frequency_gate: FrequencyGate,
+    quality_blockers: &[String],
 ) -> Result<ResourceEvidence> {
     let start = frozen
         .resources
@@ -2486,23 +3319,55 @@ fn process_resource_evidence(
     } else {
         &sampled.bracket_attribution
     };
-    let mut buckets = Vec::with_capacity(attribution.len());
-    for sample in attribution {
-        buckets.push(CpuBucketEvidence {
-            cpu: sample.cpu,
-            role: sampled_cpu_role(sample.cpu)?.to_owned(),
-            start_ns: sample.start_ns,
-            end_ns: sample.end_ns,
-            process_runtime_lower: sample.role_runtime_lower_ticks,
-            process_runtime_upper: sample.role_runtime_upper_ticks,
-            tid_runtime_lower: sample.role_runtime_lower_ticks,
-            tid_runtime_upper: sample.role_runtime_upper_ticks,
-            capacity_ticks: sample.capacity_ticks,
-            scheduled_ticks: sample.scheduled_ticks,
-            external_upper_ticks: sample.external_upper_ticks,
-            attribution_uncertainty_ticks: sample.attribution_uncertainty_ticks,
-        });
-    }
+    let buckets = attribution
+        .iter()
+        .map(cpu_bucket_evidence)
+        .collect::<Result<Vec<_>>>()?;
+    let frozen_whole_buckets = sampled
+        .attribution
+        .iter()
+        .map(cpu_bucket_evidence)
+        .collect::<Result<Vec<_>>>()?;
+    let frozen_bracket_buckets = sampled
+        .bracket_attribution
+        .iter()
+        .map(cpu_bucket_evidence)
+        .collect::<Result<Vec<_>>>()?;
+    let dynamic_buckets = sampled
+        .dynamic_attribution
+        .iter()
+        .map(cpu_bucket_evidence)
+        .collect::<Result<Vec<_>>>()?;
+    let residuals = sampled
+        .residuals
+        .iter()
+        .map(|residual| runtime_residual_evidence(residual, "frozen"))
+        .chain(
+            sampled
+                .dynamic_residuals
+                .iter()
+                .map(|residual| runtime_residual_evidence(residual, "dynamic")),
+        )
+        .collect::<Vec<_>>();
+    let scope_decisions = sampled
+        .noise_scopes
+        .iter()
+        .map(|scope| NoiseScopeDecisionEvidence {
+            attribution_phase: scope.attribution_phase.clone(),
+            interval_kind: scope.interval_kind.clone(),
+            scope: scope.scope.clone(),
+            role: scope.role.clone(),
+            cpus: scope.cpus.clone(),
+            start_ns: scope.start_ns,
+            end_ns: scope.end_ns,
+            capacity_ticks: scope.capacity_ticks,
+            external_upper_ticks: scope.external_upper_ticks,
+            limit_basis_points: scope.limit_basis_points,
+            accepted: scope.capacity_ticks > 0
+                && u128::from(scope.external_upper_ticks) * 10_000
+                    <= u128::from(scope.capacity_ticks) * u128::from(scope.limit_basis_points),
+        })
+        .collect();
     let mut utilization = Vec::new();
     for (role, label, cpus) in [
         (Role::Fixture, "fixture", FIXTURE_CPUS),
@@ -2539,8 +3404,17 @@ fn process_resource_evidence(
             capacity_ticks,
         });
     }
+    let (frequency_floor_khz, calibration_frequency_p05_khz) = match frequency_gate {
+        FrequencyGate::CalibrationAbsolute => (4_000_000, None),
+        FrequencyGate::AuthoritativeRelative {
+            calibration_p05_khz,
+        } => (
+            calibration_p05_khz.saturating_mul(95) / 100,
+            Some(calibration_p05_khz),
+        ),
+    };
     Ok(ResourceEvidence {
-        schema: "amg-http2-perf/resources/v1".to_owned(),
+        schema: "amg-http2-perf/resources/v2".to_owned(),
         gateway_ticks_start: gateway_start,
         gateway_ticks_deadline: gateway_end,
         gateway_ticks_drain: gateway_end,
@@ -2548,7 +3422,7 @@ fn process_resource_evidence(
         major_faults: sampled.major_faults_delta,
         swap_in_delta: sampled.swap_in,
         swap_out_delta: sampled.swap_out,
-        steal_ticks_delta: 0,
+        steal_ticks_delta: sampled.steal_ticks_delta,
         memory_psi_full_us: sampled.memory_psi_full_us,
         io_psi_full_us: sampled.io_psi_full_us,
         tctl_start_millidegrees: sampled
@@ -2560,13 +3434,57 @@ fn process_resource_evidence(
         median_frequency_khz: sampled
             .median_frequency_khz
             .ok_or_else(|| Error::new("median frequency sample missing"))?,
-        frequency_floor_khz: 4_000_000,
+        frequency_floor_khz,
         buckets,
         utilization,
         direct_ceiling_ops: None,
-        gateway_ops: (class != EvidenceClass::D).then_some(1),
+        gateway_ops: None,
         calibration_direct_ops: None,
+        frozen_whole_buckets,
+        frozen_bracket_buckets,
+        dynamic_buckets,
+        residuals,
+        scope_decisions,
+        producer_blockers: quality_blockers.to_vec(),
+        calibration_frequency_p05_khz,
     })
+}
+
+fn cpu_bucket_evidence(sample: &crate::control::CpuAttribution) -> Result<CpuBucketEvidence> {
+    Ok(CpuBucketEvidence {
+        cpu: sample.cpu,
+        role: sampled_cpu_role(sample.cpu)?.to_owned(),
+        start_ns: sample.start_ns,
+        end_ns: sample.end_ns,
+        process_runtime_lower: sample.role_runtime_lower_ticks,
+        process_runtime_upper: sample.role_runtime_upper_ticks,
+        tid_runtime_lower: sample.role_runtime_lower_ticks,
+        tid_runtime_upper: sample.role_runtime_upper_ticks,
+        capacity_ticks: sample.capacity_ticks,
+        scheduled_ticks: sample.scheduled_ticks,
+        external_upper_ticks: sample.external_upper_ticks,
+        attribution_uncertainty_ticks: sample.attribution_uncertainty_ticks,
+    })
+}
+
+fn runtime_residual_evidence(
+    residual: &crate::control::RuntimeResidual,
+    phase: &str,
+) -> RuntimeResidualEvidence {
+    RuntimeResidualEvidence {
+        role: residual.role.label().to_owned(),
+        phase: phase.to_owned(),
+        start_ns: residual.start_ns,
+        end_ns: residual.end_ns,
+        process_runtime_lower_ticks: residual.process_runtime_lower_ticks,
+        process_runtime_upper_ticks: residual.process_runtime_upper_ticks,
+        known_tid_runtime_lower_ticks: residual.known_tid_runtime_lower_ticks,
+        known_tid_runtime_upper_ticks: residual.known_tid_runtime_upper_ticks,
+        u_role_lower_ticks: residual.u_role_lower_ticks,
+        u_role_upper_ticks: residual.u_role_upper_ticks,
+        signed_residual_lower_ticks: residual.signed_residual_lower_ticks,
+        signed_residual_upper_ticks: residual.signed_residual_upper_ticks,
+    }
 }
 
 fn sampled_cpu_role(cpu: u16) -> Result<&'static str> {
@@ -2591,9 +3509,34 @@ struct FixturePhaseSummary {
     request_bytes: u64,
     response_bytes: u64,
     operation_hash_sha256: String,
+    observed_protocol: Option<Protocol>,
+    identity_correct: bool,
+    headers_sanitized: bool,
 }
 
 fn fixture_phase_summary(fixture: &FixtureResult, phase: u16) -> Result<FixturePhaseSummary> {
+    let aggregates = fixture
+        .phase_aggregates
+        .iter()
+        .filter(|aggregate| aggregate.phase == phase)
+        .collect::<Vec<_>>();
+    if aggregates.len() == 1 {
+        let aggregate = aggregates[0];
+        return Ok(FixturePhaseSummary {
+            operations: aggregate.operations,
+            request_bytes: aggregate.request_bytes,
+            response_bytes: aggregate.response_bytes,
+            operation_hash_sha256: aggregate.operation_hash_sha256.clone(),
+            observed_protocol: aggregate.observed_protocol,
+            identity_correct: aggregate.identity_correct,
+            headers_sanitized: aggregate.headers_sanitized,
+        });
+    }
+    if fixture.compacted || aggregates.len() > 1 {
+        return Err(Error::new(
+            "compact fixture phase aggregate is missing or duplicated",
+        ));
+    }
     let mut observations = fixture
         .observations
         .iter()
@@ -2628,7 +3571,61 @@ fn fixture_phase_summary(fixture: &FixtureResult, phase: u16) -> Result<FixtureP
         request_bytes,
         response_bytes,
         operation_hash_sha256: format!("{:x}", hasher.finalize()),
+        observed_protocol: observations
+            .first()
+            .map(|observation| observation.protocol)
+            .filter(|protocol| {
+                observations
+                    .iter()
+                    .all(|observation| observation.protocol == *protocol)
+            }),
+        identity_correct: observations
+            .iter()
+            .all(|observation| observation.identity_ok),
+        headers_sanitized: observations
+            .iter()
+            .all(|observation| observation.request_headers_sanitized),
     })
+}
+
+fn raw_clock_discontinuities(samples: &[ClockSample]) -> Result<u64> {
+    samples.windows(2).try_fold(0_u64, |count, pair| {
+        let previous_boot = pair[0]
+            .boottime_before_ns
+            .checked_add(pair[0].boottime_after_ns)
+            .ok_or_else(|| Error::new("previous clock midpoint overflow"))?
+            / 2;
+        let current_boot = pair[1]
+            .boottime_before_ns
+            .checked_add(pair[1].boottime_after_ns)
+            .ok_or_else(|| Error::new("current clock midpoint overflow"))?
+            / 2;
+        let boot_delta = current_boot
+            .checked_sub(previous_boot)
+            .ok_or_else(|| Error::new("clock BOOTTIME moved backwards"))?;
+        let discontinuous = pair[1]
+            .realtime_ns
+            .checked_sub(pair[0].realtime_ns)
+            .is_none_or(|delta| delta.abs_diff(boot_delta) > 100_000_000);
+        count
+            .checked_add(u64::from(discontinuous))
+            .ok_or_else(|| Error::new("clock discontinuity count overflow"))
+    })
+}
+
+fn protocol_date_values_sha256<'a>(
+    dates: impl Iterator<Item = &'a crate::control::ProtocolDateObservation>,
+) -> String {
+    let mut hasher = Sha256::new();
+    hasher.update(b"amg-http2-perf/protocol-date-values/v1\0");
+    for date in dates {
+        hasher.update((date.value.len() as u64).to_be_bytes());
+        hasher.update(date.value.as_bytes());
+        hasher.update(date.unix_seconds.to_be_bytes());
+        hasher.update(date.boottime_before_ns.to_be_bytes());
+        hasher.update(date.boottime_after_ns.to_be_bytes());
+    }
+    format!("{:x}", hasher.finalize())
 }
 
 fn endpoint_phase_from_proof(
@@ -2979,6 +3976,12 @@ pub async fn diagnose_b11_c1_upload(
             completed_arms: 0,
             complete: false,
             crash_detail: safe_failure,
+            campaign_boottime_start_ns: None,
+            campaign_boottime_end_ns: None,
+            machine_sha256: None,
+            build_set_sha256: None,
+            journal_root_sha256: None,
+            partially_started_ordinal: None,
         },
     )?;
     let seal = create_seal(&root)?;
@@ -3096,6 +4099,8 @@ fn write_diagnostic_static_evidence(
         producer_executable_sha256: harness_binary_sha256.to_owned(),
         zstd: ZstdParameterProgram::fixed(),
         raw_limits: RawLimits::fixed(),
+        trust_boundary: None,
+        harness_provenance: None,
     };
     intent.validate()?;
     json::write_new_canonical(&root.join("intent.json"), &intent)?;
@@ -3136,8 +4141,13 @@ fn write_diagnostic_static_evidence(
     let endpoint_bound = 512_u64 + 160_u64 * conn_live + 512_u64 * u64::from(concurrency);
     let projection = ProjectionEvidence {
         schema: PROJECTION_SCHEMA.to_owned(),
+        revision: 0,
+        predecessor: None,
+        source_arm_root_sha256: None,
+        completed_arms: 0,
         runtime_projected_ns: B11_UPLOAD_DIAGNOSTIC_CAP_NS,
         runtime_actual_ns: 0,
+        q_extra_ns: 0,
         raw_projected_bytes: TASK_CAP_BYTES,
         raw_actual_bytes: 0,
         tracked_projected_bytes: TASK_CAP_BYTES,
@@ -3145,6 +4155,7 @@ fn write_diagnostic_static_evidence(
         endpoint_bound_bytes: endpoint_bound,
         conn_live,
         concurrency,
+        storage_admission: None,
     };
     projection.validate()?;
     json::write_new_canonical(&root.join("projection.json"), &projection)?;
@@ -3282,6 +4293,16 @@ pub async fn spawned_b11_get_role_cycle(
     .await?;
     let proof = expect_prepared(&mut load).await?;
     validate_proof(&proof, Protocol::H1, Workload::Get, 1)?;
+    let materialization = run_ordinary_materialization(
+        &mut load,
+        &mut sampler,
+        context.cell,
+        Protocol::H1,
+        None,
+        SMOKE_STABILITY_CAP_NS,
+        &evidence_root.join("materialization.json"),
+    )
+    .await?;
     sampler.send(ControlBody::Freeze).await?;
     let frozen = expect_frozen(&mut sampler)
         .await
@@ -3289,6 +4310,7 @@ pub async fn spawned_b11_get_role_cycle(
     if frozen.post_freeze_change.is_some() {
         return Err(Error::new("spawned role cycle changed at freeze"));
     }
+    ensure_materialization_matches_freeze(&materialization, &frozen)?;
     sampler.send(ControlBody::Release).await?;
     match sampler
         .receive()
@@ -3325,7 +4347,7 @@ pub async fn spawned_b11_get_role_cycle(
         FixturePhaseResults {
             proof: &proof,
             websocket_warmup: None,
-            ordinary_materialization: None,
+            ordinary_materialization: Some(&materialization),
             measured: &measured,
         },
     )?;
@@ -3435,10 +4457,55 @@ fn expect_retained_role_failure(result: Result<ControlBody>) -> Result<SafeRoleF
         .ok_or_else(|| Error::new("real role failure did not retain classified evidence"))
 }
 
+struct OpenSmoke<'a> {
+    root: &'a Path,
+    calibration_id: &'a str,
+    builds: &'a BuildSet,
+    campaign_boottime_start_ns: u64,
+}
+
 pub async fn smoke_all(
     repository: &Path,
     candidate: &str,
     host: HostPreflight,
+) -> Result<(SmokeSummary, PathBuf)> {
+    smoke_all_mode(repository, candidate, host, None).await
+}
+
+pub async fn smoke_into_open_calibration(
+    repository: &Path,
+    candidate: &str,
+    host: HostPreflight,
+    builds: &BuildSet,
+    root: &Path,
+    calibration_id: &str,
+    campaign_boottime_start_ns: u64,
+) -> Result<SmokeSummary> {
+    let (summary, returned_root) = smoke_all_mode(
+        repository,
+        candidate,
+        host,
+        Some(OpenSmoke {
+            root,
+            calibration_id,
+            builds,
+            campaign_boottime_start_ns,
+        }),
+    )
+    .await?;
+    if returned_root != root {
+        return Err(Error::new(
+            "open smoke returned a different calibration root",
+        ));
+    }
+    Ok(summary)
+}
+
+async fn smoke_all_mode(
+    repository: &Path,
+    candidate: &str,
+    host: HostPreflight,
+    open: Option<OpenSmoke<'_>>,
 ) -> Result<(SmokeSummary, PathBuf)> {
     if !host.smoke_ready {
         return Err(Error::new(format!(
@@ -3446,43 +4513,73 @@ pub async fn smoke_all(
             host.blockers.join("; ")
         )));
     }
-    let builds = build_exact_pair(repository, candidate)?;
+    let standalone = open.is_none();
+    let builds = match &open {
+        Some(open) => {
+            if open.builds.candidate.commit != candidate {
+                return Err(Error::new(
+                    "open smoke candidate differs from its initialized build set",
+                ));
+            }
+            open.builds.clone()
+        }
+        None => build_exact_pair(repository, candidate)?,
+    };
     let triplet = realtime_triplet()?;
     let unix_seconds = triplet.realtime_ns / 1_000_000_000;
     let started_utc = utc_rfc3339(unix_seconds)?;
     let harness_binary_sha256 = sha256_hex(&fs::read(std::env::current_exe()?)?);
-    let run_id = format!(
-        "cal-smoke-{}-{}",
-        &candidate[..12],
-        &harness_binary_sha256[..12]
-    );
-    let root = execution_root(repository)
-        .join("calibrations")
-        .join(&run_id);
-    fs::create_dir_all(
-        root.parent()
-            .ok_or_else(|| Error::new("smoke root has no parent"))?,
-    )?;
-    fs::create_dir(&root).context("exclusive-create smoke root")?;
-    set_mode(&root, 0o700)?;
-    let boottime_start_ns = clock_ns(ClockKind::Boottime)?;
+    let (run_id, root, boottime_start_ns) = match &open {
+        Some(open) => (
+            open.calibration_id.to_owned(),
+            open.root.to_path_buf(),
+            open.campaign_boottime_start_ns,
+        ),
+        None => {
+            let run_id = format!(
+                "cal-smoke-{}-{}",
+                &candidate[..12],
+                &harness_binary_sha256[..12]
+            );
+            let root = execution_root(repository)
+                .join("calibrations")
+                .join(&run_id);
+            fs::create_dir_all(
+                root.parent()
+                    .ok_or_else(|| Error::new("smoke root has no parent"))?,
+            )?;
+            fs::create_dir(&root).context("exclusive-create smoke root")?;
+            set_mode(&root, 0o700)?;
+            (run_id, root, clock_ns(ClockKind::Boottime)?)
+        }
+    };
     let monotonic_start_ns = clock_ns(ClockKind::Monotonic)?;
     let monotonic_deadline_ns = monotonic_start_ns
         .checked_add(SMOKE_CAP_NS)
         .ok_or_else(|| Error::new("smoke monotonic deadline overflow"))?;
     let build_set_bytes = json::canonical_bytes(&builds)?;
     let build_set_sha256 = sha256_hex(&build_set_bytes);
-    write_smoke_static_evidence(
-        repository,
-        &root,
-        SmokeStaticEvidence {
-            calibration_id: &run_id,
+    if standalone {
+        write_smoke_static_evidence(
+            repository,
+            &root,
+            SmokeStaticEvidence {
+                calibration_id: &run_id,
+                candidate,
+                host: &host,
+                build_set_bytes: &build_set_bytes,
+                harness_binary_sha256: &harness_binary_sha256,
+            },
+        )?;
+    } else {
+        verify_open_smoke_static_evidence(
+            &root,
+            &run_id,
             candidate,
-            host: &host,
-            build_set_bytes: &build_set_bytes,
-            harness_binary_sha256: &harness_binary_sha256,
-        },
-    )?;
+            &build_set_bytes,
+            &harness_binary_sha256,
+        )?;
+    }
     let quiet = crate::linux::observe_quiet_exact()?;
     quiet.validate()?;
     json::write_new_canonical(&root.join("quiet.json"), &quiet)?;
@@ -3550,6 +4647,7 @@ pub async fn smoke_all(
                             collect_smoke_cases(&arms, &[])?,
                             failure_key,
                             &error,
+                            standalone,
                         );
                         if let Err(retain_error) = retained {
                             return Err(Error::new(format!(
@@ -3588,6 +4686,7 @@ pub async fn smoke_all(
                         collect_smoke_cases(&arms, &[])?,
                         failure_key,
                         &error,
+                        standalone,
                     )?;
                     return Err(error);
                 }
@@ -3643,6 +4742,7 @@ pub async fn smoke_all(
                         collect_smoke_cases(&arms, &direct_upload_controls)?,
                         failure_key,
                         &error,
+                        standalone,
                     )?;
                     return Err(error.context(format!(
                         "smoke direct upload C{concurrency} {} (partial evidence retained at {})",
@@ -3678,6 +4778,7 @@ pub async fn smoke_all(
                     collect_smoke_cases(&arms, &direct_upload_controls)?,
                     failure_key,
                     &error,
+                    standalone,
                 )?;
                 return Err(error);
             }
@@ -3726,6 +4827,9 @@ pub async fn smoke_all(
     };
     topology.validate()?;
     json::write_new_canonical(&root.join("topology-smoke.json"), &topology)?;
+    if !standalone {
+        return Ok((summary, root));
+    }
     json::write_new_canonical(
         &root.join("execution-state.json"),
         &ExecutionStateEvidence {
@@ -3737,6 +4841,12 @@ pub async fn smoke_all(
             completed_arms: 0,
             complete: false,
             crash_detail: None,
+            campaign_boottime_start_ns: None,
+            campaign_boottime_end_ns: None,
+            machine_sha256: None,
+            build_set_sha256: None,
+            journal_root_sha256: None,
+            partially_started_ordinal: None,
         },
     )?;
     create_seal(&root)?;
@@ -3764,6 +4874,40 @@ pub async fn smoke_all(
     Ok((summary, root))
 }
 
+fn verify_open_smoke_static_evidence(
+    root: &Path,
+    calibration_id: &str,
+    candidate: &str,
+    expected_build_set: &[u8],
+    harness_binary_sha256: &str,
+) -> Result<()> {
+    if root.join("seal.json").exists()
+        || root.join("topology-smoke.json").exists()
+        || root.join("smoke-cases").exists()
+        || root.join("quiet.json").exists()
+    {
+        return Err(Error::new(
+            "open calibration root has already started or sealed its smoke",
+        ));
+    }
+    let intent_bytes = fs::read(root.join("intent.json"))?;
+    let intent: Intent = json::require_canonical(&intent_bytes)?;
+    intent.validate()?;
+    if intent.evidence_kind != EvidenceKind::Calibration
+        || intent.evidence_id != calibration_id
+        || intent.candidate_commit != candidate
+        || intent.producer_executable_sha256 != harness_binary_sha256
+        || fs::read(root.join("build-set.json"))? != expected_build_set
+    {
+        return Err(Error::new(
+            "open calibration static identity differs from the exact smoke",
+        ));
+    }
+    let machine: MachineEvidence = json::require_canonical(&fs::read(root.join("machine.json"))?)?;
+    machine.validate()?;
+    Ok(())
+}
+
 fn write_smoke_static_evidence(
     repository: &Path,
     root: &Path,
@@ -3787,6 +4931,8 @@ fn write_smoke_static_evidence(
         producer_executable_sha256: harness_binary_sha256.to_owned(),
         zstd: ZstdParameterProgram::fixed(),
         raw_limits: RawLimits::fixed(),
+        trust_boundary: None,
+        harness_provenance: Some(crate::harness::require_exact_committed_harness(repository)?),
     };
     intent.validate()?;
     json::write_new_canonical(&root.join("intent.json"), &intent)?;
@@ -3825,8 +4971,13 @@ fn write_smoke_static_evidence(
     let endpoint_bound = 512_u64 + 160_u64 * 200 + 512_u64 * 64;
     let projection = ProjectionEvidence {
         schema: PROJECTION_SCHEMA.to_owned(),
+        revision: 0,
+        predecessor: None,
+        source_arm_root_sha256: None,
+        completed_arms: 0,
         runtime_projected_ns: SMOKE_CAP_NS,
         runtime_actual_ns: 0,
+        q_extra_ns: 0,
         raw_projected_bytes: TASK_CAP_BYTES,
         raw_actual_bytes: 0,
         tracked_projected_bytes: TASK_CAP_BYTES,
@@ -3834,6 +4985,7 @@ fn write_smoke_static_evidence(
         endpoint_bound_bytes: endpoint_bound,
         conn_live: 200,
         concurrency: 64,
+        storage_admission: None,
     };
     projection.validate()?;
     json::write_new_canonical(&root.join("projection.json"), &projection)?;
@@ -3931,6 +5083,7 @@ fn retain_failed_smoke(
     mut cases: Vec<SmokeCaseEvidence>,
     failure_key: SmokeCaseKey,
     error: &Error,
+    finalize: bool,
 ) -> Result<()> {
     cases.sort_by(|left, right| left.key.cmp(&right.key));
     let topology = TopologySmokeEvidence {
@@ -3962,6 +5115,9 @@ fn retain_failed_smoke(
             role_failure: error.role_failure().cloned(),
         },
     )?;
+    if !finalize {
+        return Ok(());
+    }
     json::write_new_canonical(
         &root.join("execution-state.json"),
         &ExecutionStateEvidence {
@@ -3973,6 +5129,12 @@ fn retain_failed_smoke(
             completed_arms: 0,
             complete: false,
             crash_detail: Some(error.to_string()),
+            campaign_boottime_start_ns: None,
+            campaign_boottime_end_ns: None,
+            machine_sha256: None,
+            build_set_sha256: None,
+            journal_root_sha256: None,
+            partially_started_ordinal: None,
         },
     )?;
     create_seal(root)?;
@@ -5462,40 +6624,11 @@ fn reconcile_fixture_phase(
     expected_request_bytes: u64,
     expected_response_bytes: u64,
 ) -> Result<()> {
-    let mut observations = fixture
-        .observations
-        .iter()
-        .filter_map(|observation| {
-            crate::topology::parse_operation_id(&observation.operation_id)
-                .ok()
-                .filter(|value| (*value >> 112) as u16 == phase)
-                .map(|_| observation)
-        })
-        .collect::<Vec<_>>();
-    observations.sort_by(|left, right| {
-        left.operation_id
-            .as_bytes()
-            .cmp(right.operation_id.as_bytes())
-    });
-    let mut hasher = Sha256::new();
-    let mut request_bytes = 0_u64;
-    let mut response_bytes = 0_u64;
-    for observation in &observations {
-        hasher.update(observation.operation_id.as_bytes());
-        hasher.update(observation.request_bytes.to_be_bytes());
-        hasher.update(observation.response_bytes.to_be_bytes());
-        request_bytes = request_bytes
-            .checked_add(observation.request_bytes)
-            .ok_or_else(|| Error::new("fixture phase request-byte overflow"))?;
-        response_bytes = response_bytes
-            .checked_add(observation.response_bytes)
-            .ok_or_else(|| Error::new("fixture phase response-byte overflow"))?;
-    }
-    let hash = format!("{:x}", hasher.finalize());
-    if observations.len() as u64 != expected_count
-        || request_bytes != expected_request_bytes
-        || response_bytes != expected_response_bytes
-        || hash != expected_hash
+    let summary = fixture_phase_summary(fixture, phase)?;
+    if summary.operations != expected_count
+        || summary.request_bytes != expected_request_bytes
+        || summary.response_bytes != expected_response_bytes
+        || summary.operation_hash_sha256 != expected_hash
     {
         return Err(Error::new(format!(
             "fixture/load phase {phase} complete operation/byte/hash sets do not reconcile"
@@ -5604,6 +6737,13 @@ fn validate_direct_upload_fixture(
 }
 
 fn sampler_quality_blockers(report: &SamplerReport) -> Vec<String> {
+    sampler_quality_blockers_for(report, FrequencyGate::CalibrationAbsolute)
+}
+
+fn sampler_quality_blockers_for(
+    report: &SamplerReport,
+    frequency_gate: FrequencyGate,
+) -> Vec<String> {
     let mut blockers = Vec::new();
     for bucket in report
         .attribution
@@ -5695,6 +6835,7 @@ fn sampler_quality_blockers(report: &SamplerReport) -> Vec<String> {
     if report.major_faults_delta != 0
         || report.swap_in != 0
         || report.swap_out != 0
+        || report.steal_ticks_delta != 0
         || report.memory_psi_full_us != 0
         || report.io_psi_full_us != 0
     {
@@ -5703,11 +6844,27 @@ fn sampler_quality_blockers(report: &SamplerReport) -> Vec<String> {
     if !report.realtime_comparable || report.realtime_discontinuities != 0 {
         blockers.push("REALTIME continuity evidence is missing or disrupted".to_owned());
     }
-    if report
-        .median_frequency_khz
-        .is_none_or(|frequency| frequency < 4_000_000)
-    {
-        blockers.push("median gateway-role CPU frequency is below 4GHz".to_owned());
+    match (report.median_frequency_khz, frequency_gate) {
+        (Some(frequency), FrequencyGate::CalibrationAbsolute) if frequency >= 4_000_000 => {}
+        (
+            Some(frequency),
+            FrequencyGate::AuthoritativeRelative {
+                calibration_p05_khz,
+            },
+        ) if u128::from(frequency) * 100 >= u128::from(calibration_p05_khz) * 95 => {}
+        (_, FrequencyGate::CalibrationAbsolute) => {
+            blockers.push("median gateway-role CPU frequency is below 4GHz".to_owned());
+        }
+        (
+            _,
+            FrequencyGate::AuthoritativeRelative {
+                calibration_p05_khz,
+            },
+        ) => {
+            blockers.push(format!(
+                "median gateway-role CPU frequency is below 95% of calibration p05 {calibration_p05_khz}kHz"
+            ));
+        }
     }
     blockers
 }
@@ -5800,6 +6957,7 @@ mod tests {
             realtime_samples: 1,
             realtime_discontinuities: 0,
             realtime_comparable: true,
+            steal_ticks_delta: 0,
         };
         assert_eq!(
             sampler_quality_blockers(&report),
@@ -5884,5 +7042,55 @@ mod tests {
             fs::set_permissions(&path, fs::Permissions::from_mode(0o600)).unwrap();
         }
         fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn interrupted_arm_cleanup_retains_a_non_resumable_failure() {
+        let package = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+        let repository = crate::bundle::repository_root(&package).expect("repository");
+        let root = package
+            .join("target")
+            .join(format!("interrupted-process-arm-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&root);
+        fs::create_dir_all(&root).expect("evidence root");
+        let planned = PlannedArm {
+            ordinal: 0,
+            evidence_class: EvidenceClass::S,
+            cell: Cell {
+                workload: Workload::Get,
+                concurrency: 1,
+            },
+            arm: Some(Arm::B11),
+            direct_protocol: None,
+            round: None,
+            row: None,
+            target: Some(10),
+            lane_quotas: vec![10],
+            fresh_process_set: true,
+        };
+        let staging = process_arm_staging_path(&root, &planned);
+        let runtime = root.join(".arm-runtime-000000-get-c1");
+        fs::create_dir_all(&staging).expect("staging");
+        fs::create_dir_all(&runtime).expect("runtime");
+        fs::write(staging.join("partial"), b"partial").expect("staging member");
+        fs::write(runtime.join("cookie.sqlite"), b"runtime").expect("runtime member");
+
+        retain_interrupted_process_arm(
+            &repository,
+            &root,
+            "cal-interrupted",
+            "cal-interrupted",
+            &planned,
+        )
+        .expect("retain interrupted arm");
+        assert!(!staging.exists());
+        assert!(!runtime.exists());
+        let record: ArmFailureRecord =
+            json::read_strict(&arm_failure_path(&root, &planned), 65_536).expect("failure record");
+        assert_eq!(record.raw_ordinal, 0);
+        assert!(record.measured_work_started);
+        assert!(record.runtime_cleaned);
+        assert!(record.staging_cleaned);
+        fs::remove_dir_all(root).expect("cleanup");
     }
 }

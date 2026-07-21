@@ -1,7 +1,10 @@
+use crate::process_plan::{CalibrationExecutionPlan, ScoutPlan};
 use crate::schema::{
     all_cells, hard_comparisons, BlockedCode, BlockedReason, CalibrationPhase, CalibrationRecord,
-    Cell, EvidenceClass,
+    Cell, EvidenceClass, SignatureBinding, AUTHORITATIVE_PARAMETERS_SCHEMA,
+    CALIBRATION_PLAN_SCHEMA,
 };
+use crate::seal::sha256_hex;
 use crate::statistics::{order_stratum_standard_deviations, Metric, PairedMetrics};
 use crate::{Error, Result};
 use serde::{Deserialize, Serialize};
@@ -17,6 +20,281 @@ pub const ANALYSIS_CAP_NS: u64 = 1_800_000_000_000;
 pub const PROJECTION_CAP_NS: u64 = 151_200_000_000_000;
 pub const ACTUAL_CAP_NS: u64 = 172_800_000_000_000;
 pub const PRE_FREEZE_FLOOR_NS: u64 = 17_217_000_000_000;
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct FileHashBinding {
+    pub path: String,
+    pub sha256: String,
+}
+
+impl FileHashBinding {
+    pub fn validate(&self) -> Result<()> {
+        crate::seal::validate_relative_path(&self.path)?;
+        crate::schema::validate_non_placeholder_sha256("file hash binding", &self.sha256)
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct AcceptedScoutPanel {
+    pub cell: Cell,
+    pub attempted_targets: Vec<u64>,
+    pub accepted_target: u64,
+    pub arm_ordinals: Vec<u64>,
+    pub arm_raw_sha256: Vec<String>,
+    pub durations: FrozenDurations,
+}
+
+impl AcceptedScoutPanel {
+    pub fn validate(&self) -> Result<()> {
+        self.cell.validate()?;
+        self.durations.validate()?;
+        let accepted_index = SCOUT_TARGETS
+            .iter()
+            .position(|target| *target == self.accepted_target)
+            .ok_or_else(|| Error::new("accepted scout target is not canonical"))?;
+        if self.attempted_targets != SCOUT_TARGETS[..=accepted_index]
+            || self.arm_ordinals.len() != self.attempted_targets.len() * 5
+            || self.arm_raw_sha256.len() != self.arm_ordinals.len()
+        {
+            return Err(Error::new(
+                "accepted scout panel is not an exact complete target prefix",
+            ));
+        }
+        for hash in &self.arm_raw_sha256 {
+            crate::schema::validate_non_placeholder_sha256("accepted scout raw", hash)?;
+        }
+        Ok(())
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct CalibrationPlanEvidence {
+    pub schema: String,
+    pub calibration_id: String,
+    pub campaign_seed: u64,
+    pub intent: FileHashBinding,
+    pub topology_smoke: FileHashBinding,
+    pub scout_plan: ScoutPlan,
+    pub accepted_scouts: Vec<AcceptedScoutPanel>,
+    pub williams_plan: CalibrationExecutionPlan,
+    pub first_williams_ordinal: u64,
+    pub direct_mappings: Vec<crate::process_plan::DirectMapping>,
+    pub phase_constants_sha256: String,
+}
+
+impl CalibrationPlanEvidence {
+    pub fn validate(&self) -> Result<()> {
+        if self.schema != CALIBRATION_PLAN_SCHEMA {
+            return Err(Error::new("unsupported calibration-plan schema"));
+        }
+        crate::schema::validate_identifier("calibration plan ID", &self.calibration_id)?;
+        self.intent.validate()?;
+        self.topology_smoke.validate()?;
+        if self.scout_plan != crate::process_plan::scout_plan(self.campaign_seed)? {
+            return Err(Error::new(
+                "calibration plan scout schedule does not regenerate from its seed",
+            ));
+        }
+        if self.accepted_scouts.len() != 15 {
+            return Err(Error::new("calibration plan lacks 15 accepted scout cells"));
+        }
+        let mut cells = BTreeSet::new();
+        let mut expected_ordinal = 0_u64;
+        for scout in &self.accepted_scouts {
+            scout.validate()?;
+            if !cells.insert(scout.cell)
+                || scout.arm_ordinals.first().copied() != Some(expected_ordinal)
+            {
+                return Err(Error::new(
+                    "calibration plan accepted scout cells/ordinals are not canonical",
+                ));
+            }
+            for ordinal in &scout.arm_ordinals {
+                if *ordinal != expected_ordinal {
+                    return Err(Error::new(
+                        "calibration plan scout ordinals are not contiguous",
+                    ));
+                }
+                expected_ordinal += 1;
+            }
+        }
+        if cells != all_cells().into_iter().collect()
+            || self.first_williams_ordinal != expected_ordinal
+        {
+            return Err(Error::new(
+                "calibration plan scout cell set or Williams prefix is invalid",
+            ));
+        }
+        let regenerated = crate::process_plan::calibration_plan_with_offset(
+            self.campaign_seed,
+            self.first_williams_ordinal,
+        )?;
+        if self.williams_plan != regenerated
+            || self.direct_mappings != crate::process_plan::direct_mappings()
+        {
+            return Err(Error::new(
+                "calibration plan Williams/direct schedule does not regenerate",
+            ));
+        }
+        crate::schema::validate_non_placeholder_sha256(
+            "calibration phase constants",
+            &self.phase_constants_sha256,
+        )
+    }
+
+    pub fn calibration_durations(&self) -> Vec<CellDurations> {
+        self.accepted_scouts
+            .iter()
+            .map(|entry| CellDurations {
+                cell: entry.cell,
+                durations: entry.durations,
+            })
+            .collect()
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum ParameterDisposition {
+    Admitted,
+    RuntimeBlocked,
+    StorageBlocked,
+    PrecisionBlocked,
+    QualityBlocked,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct AuthoritativeParameters {
+    pub schema: String,
+    pub calibration_id: String,
+    pub intent: FileHashBinding,
+    pub calibration_plan: FileHashBinding,
+    pub accepted_treatment_signatures: Vec<SignatureBinding>,
+    pub variances: Vec<VarianceEstimate>,
+    pub authoritative_durations: Vec<CellDurations>,
+    pub selected_n: Option<u32>,
+    pub disposition: ParameterDisposition,
+    pub direct_plan: Vec<crate::process_plan::PlannedArm>,
+    pub lower_bound_runtime_ns: u64,
+    pub terminal_reason: Option<BlockedReason>,
+}
+
+impl AuthoritativeParameters {
+    pub fn validate(&self) -> Result<()> {
+        if self.schema != AUTHORITATIVE_PARAMETERS_SCHEMA {
+            return Err(Error::new("unsupported authoritative-parameters schema"));
+        }
+        crate::schema::validate_identifier("authoritative calibration ID", &self.calibration_id)?;
+        self.intent.validate()?;
+        self.calibration_plan.validate()?;
+        if self.accepted_treatment_signatures.len() != 75 {
+            return Err(Error::new(
+                "authoritative parameters lack 75 treatment signatures",
+            ));
+        }
+        let mut signatures = BTreeSet::new();
+        for binding in &self.accepted_treatment_signatures {
+            binding.validate()?;
+            if binding.arm.is_none()
+                || binding.direct_protocol.is_some()
+                || !signatures.insert((binding.cell, binding.arm))
+            {
+                return Err(Error::new(
+                    "authoritative treatment signature inventory is invalid",
+                ));
+            }
+        }
+        if self.variances.len() != 180 {
+            return Err(Error::new(
+                "authoritative parameters lack the 45x4 variance matrix",
+            ));
+        }
+        for variance in &self.variances {
+            variance.validate()?;
+        }
+        validate_duration_inventory(&self.authoritative_durations)?;
+        if self.lower_bound_runtime_ns < PRE_FREEZE_FLOOR_NS {
+            return Err(Error::new(
+                "authoritative lower-bound runtime is below the reviewed floor",
+            ));
+        }
+        match self.disposition {
+            ParameterDisposition::Admitted => {
+                if !matches!(self.selected_n, Some(30 | 50))
+                    || self.direct_plan.len() != 30
+                    || self.terminal_reason.is_some()
+                {
+                    return Err(Error::new(
+                        "admitted authoritative parameters are incomplete",
+                    ));
+                }
+            }
+            ParameterDisposition::RuntimeBlocked => {
+                if !matches!(self.selected_n, Some(30 | 50 | 70 | 100))
+                    || !self.direct_plan.is_empty()
+                    || self.terminal_reason.is_none()
+                {
+                    return Err(Error::new(
+                        "runtime-blocked authoritative parameters are inconsistent",
+                    ));
+                }
+            }
+            ParameterDisposition::StorageBlocked => {
+                if !matches!(self.selected_n, Some(30 | 50))
+                    || !self.direct_plan.is_empty()
+                    || self.terminal_reason.is_none()
+                {
+                    return Err(Error::new(
+                        "storage-blocked authoritative parameters are inconsistent",
+                    ));
+                }
+            }
+            ParameterDisposition::PrecisionBlocked | ParameterDisposition::QualityBlocked => {
+                if self.selected_n.is_some()
+                    || !self.direct_plan.is_empty()
+                    || self.terminal_reason.is_none()
+                {
+                    return Err(Error::new(
+                        "blocked authoritative parameters are inconsistent",
+                    ));
+                }
+            }
+        }
+        if let Some(reason) = &self.terminal_reason {
+            reason.validate()?;
+        }
+        Ok(())
+    }
+}
+
+fn validate_duration_inventory(values: &[CellDurations]) -> Result<()> {
+    if values.len() != 15 {
+        return Err(Error::new("duration inventory does not contain 15 cells"));
+    }
+    let mut cells = BTreeSet::new();
+    for value in values {
+        value.cell.validate()?;
+        value.durations.validate()?;
+        if !cells.insert(value.cell) {
+            return Err(Error::new("duration inventory repeats a cell"));
+        }
+    }
+    if cells != all_cells().into_iter().collect() {
+        return Err(Error::new("duration inventory cell set is incomplete"));
+    }
+    Ok(())
+}
+
+#[must_use]
+pub fn phase_constants_sha256() -> String {
+    sha256_hex(
+        b"Tsmoke=300s;Qobs=10s;R=2s;P=2s;Ws=3s;Dw=2s;Ktokio=10s;Sinv=2s;Lws=15s;F=1s;Dm=2s;X=1s;count=15s;qcap=7200s;acap=1800s",
+    )
+}
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ScoutTransition {

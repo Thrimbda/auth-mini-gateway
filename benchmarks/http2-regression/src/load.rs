@@ -2,8 +2,8 @@
 
 use crate::control::{
     AttemptEvidence, ConnectionLedger, ConnectionPolicy, ControlBody, ControlContext,
-    FramedControl, LoadProof, LoadResult, LoadTarget, Role, RoleErrorClass, RoleErrorCode,
-    RoleErrorStage,
+    FramedControl, LoadProof, LoadResult, LoadTarget, ProtocolDateObservation, Role,
+    RoleErrorClass, RoleErrorCode, RoleErrorStage,
 };
 use crate::fixture::BenchBody;
 use crate::linux::{clock_ns, process_identity, ClockKind};
@@ -17,7 +17,7 @@ use crate::wire::{H2FrameObserver, H2WireEvidence, ObservedH2Io};
 use crate::{Error, Result, ResultContext};
 use bytes::Bytes;
 use http::header::{
-    AUTHORIZATION, CONNECTION, CONTENT_LENGTH, COOKIE, HOST, ORIGIN, PROXY_AUTHORIZATION,
+    AUTHORIZATION, CONNECTION, CONTENT_LENGTH, COOKIE, DATE, HOST, ORIGIN, PROXY_AUTHORIZATION,
     SEC_WEBSOCKET_ACCEPT, SEC_WEBSOCKET_KEY, SEC_WEBSOCKET_VERSION, SET_COOKIE, TRANSFER_ENCODING,
     UPGRADE,
 };
@@ -159,6 +159,7 @@ struct Lane {
     attempts: Arc<OperationAttemptTracker>,
     h2_stream_tracker: Option<Arc<ActiveStreamTracker>>,
     phase_sequences: BTreeMap<u16, u64>,
+    observed_protocol: Option<Protocol>,
 }
 
 #[derive(Clone, Copy)]
@@ -196,6 +197,8 @@ struct OperationOutcome {
     payload_ok: bool,
     sse_content_type_ok: bool,
     response_headers_sanitized: bool,
+    observed_protocol: Protocol,
+    protocol_date: Option<ProtocolDateObservation>,
     connection: OperationConnection,
 }
 
@@ -674,6 +677,7 @@ impl LoadSession {
                         attempts: Arc::clone(&attempts),
                         h2_stream_tracker: h2_stream_tracker.clone(),
                         phase_sequences: BTreeMap::new(),
+                        observed_protocol: None,
                     });
                 }
             }
@@ -703,6 +707,7 @@ impl LoadSession {
                         attempts: Arc::clone(&attempts),
                         h2_stream_tracker: h2_stream_tracker.clone(),
                         phase_sequences: BTreeMap::new(),
+                        observed_protocol: None,
                     });
                 }
             }
@@ -738,11 +743,18 @@ impl LoadSession {
                 last_operation_id,
                 operation_hash_sha256,
                 attempts,
+                protocol_dates,
             ) = self.open_all_websockets().await?;
             self.websocket_open_ledger = Some(open_ledger.clone());
             let h2_wire = self.h2_wire_evidence()?;
             return Ok(LoadProof {
                 downstream_protocol: self.protocol,
+                observed_protocol: self
+                    .lanes
+                    .iter()
+                    .map(|lane| lane.observed_protocol)
+                    .reduce(|left, right| (left == right).then_some(left).flatten())
+                    .flatten(),
                 physical_connections: self.physical_connections,
                 h2_settings_proved: self.protocol == Protocol::H1
                     || h2_wire.iter().all(initial_h2_exchange_proved),
@@ -765,6 +777,8 @@ impl LoadSession {
                 attempts,
                 lane_quotas: vec![1; self.lanes.len()],
                 lane_completions: vec![1; self.lanes.len()],
+                response_headers_sanitized: true,
+                protocol_dates,
             });
         }
         if warmup_operations == 0 {
@@ -774,6 +788,7 @@ impl LoadSession {
         let result = self.run_batch(1, count).await?;
         Ok(LoadProof {
             downstream_protocol: self.protocol,
+            observed_protocol: result.observed_protocol,
             physical_connections: if self.fresh_tracker.is_some() {
                 result.connection_ledger.cumulative_connections
             } else {
@@ -798,12 +813,21 @@ impl LoadSession {
             attempts: result.attempts,
             lane_quotas: result.lane_quotas,
             lane_completions: result.lane_completions,
+            response_headers_sanitized: result.response_headers_sanitized,
+            protocol_dates: result.protocol_dates,
         })
     }
 
     async fn open_all_websockets(
         &mut self,
-    ) -> Result<(ConnectionLedger, String, String, String, AttemptEvidence)> {
+    ) -> Result<(
+        ConnectionLedger,
+        String,
+        String,
+        String,
+        AttemptEvidence,
+        Vec<ProtocolDateObservation>,
+    )> {
         let attempts_before = self.attempts.snapshot();
         let lanes = std::mem::take(&mut self.lanes);
         let mut lanes = lanes.into_iter();
@@ -881,12 +905,14 @@ impl LoadSession {
             operation_hasher.update(outcome.request_bytes.to_be_bytes());
             operation_hasher.update(outcome.response_bytes.to_be_bytes());
         }
+        let protocol_dates = bounded_protocol_dates(&outcomes);
         Ok((
             ledger,
             first,
             last,
             format!("{:x}", operation_hasher.finalize()),
             attempts,
+            protocol_dates,
         ))
     }
 
@@ -1133,6 +1159,13 @@ impl LoadSession {
             end_ns: window_end_ns,
             retain_latencies,
         } = window;
+        if window_deadline_ns
+            .is_some_and(|deadline| outcomes.iter().any(|outcome| outcome.start_ns >= deadline))
+        {
+            return Err(Error::new(
+                "fixed-window operation started at or after its common deadline",
+            ));
+        }
         let LaneResultSummary {
             count: lane_count,
             quotas: lane_quotas,
@@ -1230,8 +1263,21 @@ impl LoadSession {
         let last = outcomes
             .last()
             .ok_or_else(|| Error::new("empty outcomes"))?;
+        let observed_protocol = outcomes
+            .iter()
+            .map(|outcome| outcome.observed_protocol)
+            .reduce(|left, right| if left == right { left } else { self.protocol });
+        if observed_protocol != Some(outcomes[0].observed_protocol)
+            || outcomes
+                .iter()
+                .any(|outcome| outcome.observed_protocol != outcomes[0].observed_protocol)
+        {
+            return Err(Error::new("load operations observed mixed HTTP protocols"));
+        }
+        let protocol_dates = bounded_protocol_dates(&outcomes);
         Ok(LoadResult {
             protocol: self.protocol,
+            observed_protocol,
             operations_started: operations,
             operations_completed: operations,
             operations_completed_by_deadline,
@@ -1257,8 +1303,24 @@ impl LoadSession {
             attempts,
             lane_quotas,
             lane_completions,
+            protocol_dates,
         })
     }
+}
+
+fn bounded_protocol_dates(outcomes: &[OperationOutcome]) -> Vec<ProtocolDateObservation> {
+    let mut observed = outcomes
+        .iter()
+        .filter_map(|outcome| outcome.protocol_date.as_ref());
+    let Some(first) = observed.next() else {
+        return Vec::new();
+    };
+    let last = observed.next_back();
+    let mut retained = vec![first.clone()];
+    if let Some(last) = last {
+        retained.push(last.clone());
+    }
+    retained
 }
 
 fn connection_policy(protocol: Protocol, workload: Workload) -> ConnectionPolicy {
@@ -1934,6 +1996,10 @@ impl Lane {
             payload_ok: payload == expected_payload,
             sse_content_type_ok: true,
             response_headers_sanitized: true,
+            observed_protocol: self
+                .observed_protocol
+                .ok_or_else(|| Error::new("WebSocket lane lacks observed handshake protocol"))?,
+            protocol_date: None,
             connection: OperationConnection {
                 connection_id: self.physical_connection_id,
                 stream_id: self.tunnel_stream_id,
@@ -2000,6 +2066,8 @@ async fn open_websocket(mut lane: Lane) -> Result<(Lane, OperationOutcome)> {
     };
     let (mut response, connection_id, stream_id) =
         sender.send(request, lane.protocol == Protocol::H2).await?;
+    let observed_protocol = protocol_from_version(response.version())?;
+    let protocol_date = observe_protocol_date(response.headers())?;
     match lane.protocol {
         Protocol::H1 => {
             if response.status() != StatusCode::SWITCHING_PROTOCOLS
@@ -2041,6 +2109,7 @@ async fn open_websocket(mut lane: Lane) -> Result<(Lane, OperationOutcome)> {
     lane.transport = LaneTransport::WebSocket(Box::pin(TokioIo::new(upgraded)));
     lane.physical_connection_id = Some(connection_id);
     lane.tunnel_stream_id = stream_id;
+    lane.observed_protocol = Some(observed_protocol);
     let outcome = OperationOutcome {
         operation_id: operation_text,
         request_bytes: 0,
@@ -2053,6 +2122,8 @@ async fn open_websocket(mut lane: Lane) -> Result<(Lane, OperationOutcome)> {
         payload_ok: true,
         sse_content_type_ok: true,
         response_headers_sanitized: true,
+        observed_protocol,
+        protocol_date,
         connection: OperationConnection {
             connection_id: Some(connection_id),
             stream_id,
@@ -2111,6 +2182,8 @@ async fn validate_response(
     corpus: &Corpus,
     require_h1_close: bool,
 ) -> Result<OperationOutcome> {
+    let observed_protocol = protocol_from_version(response.version())?;
+    let protocol_date = observe_protocol_date(response.headers())?;
     let close = has_connection_token(response.headers(), "close");
     let keep_alive = has_connection_token(response.headers(), "keep-alive")
         || response.headers().contains_key("keep-alive");
@@ -2191,6 +2264,8 @@ async fn validate_response(
         payload_ok,
         sse_content_type_ok,
         response_headers_sanitized: headers_sanitized,
+        observed_protocol,
+        protocol_date,
         connection: OperationConnection {
             close_tokens: u64::from(close),
             keep_alive_tokens: u64::from(keep_alive),
@@ -2454,12 +2529,117 @@ async fn raw_h1_upload_exchange_with_eof_cap(
         payload_ok,
         sse_content_type_ok: true,
         response_headers_sanitized: headers_sanitized,
+        observed_protocol: Protocol::H1,
+        protocol_date: observe_protocol_date(&headers)?,
         connection: OperationConnection {
             close_tokens: 1,
             transport_eof: 1,
             ..OperationConnection::default()
         },
     })
+}
+
+fn protocol_from_version(version: Version) -> Result<Protocol> {
+    match version {
+        Version::HTTP_11 => Ok(Protocol::H1),
+        Version::HTTP_2 => Ok(Protocol::H2),
+        _ => Err(Error::new(
+            "response used an unsupported observed HTTP version",
+        )),
+    }
+}
+
+fn observe_protocol_date(headers: &http::HeaderMap) -> Result<Option<ProtocolDateObservation>> {
+    let mut values = headers.get_all(DATE).iter();
+    let Some(value) = values.next() else {
+        return Ok(None);
+    };
+    if values.next().is_some() {
+        return Err(Error::new("response contains multiple Date headers"));
+    }
+    let boottime_before_ns = clock_ns(ClockKind::Boottime)?;
+    let value = value
+        .to_str()
+        .map_err(|_| Error::new("response Date header is not visible ASCII"))?
+        .to_owned();
+    let unix_seconds = parse_http_date_seconds(&value)?;
+    let boottime_after_ns = clock_ns(ClockKind::Boottime)?;
+    if boottime_after_ns < boottime_before_ns {
+        return Err(Error::new(
+            "BOOTTIME moved backwards around Date observation",
+        ));
+    }
+    Ok(Some(ProtocolDateObservation {
+        value,
+        unix_seconds,
+        boottime_before_ns,
+        boottime_after_ns,
+    }))
+}
+
+pub(crate) fn parse_http_date_seconds(value: &str) -> Result<u64> {
+    let bytes = value.as_bytes();
+    if bytes.len() != 29
+        || bytes[3..5] != *b", "
+        || bytes[7] != b' '
+        || bytes[11] != b' '
+        || bytes[16] != b' '
+        || bytes[19] != b':'
+        || bytes[22] != b':'
+        || bytes[25..29] != *b" GMT"
+    {
+        return Err(Error::new("response Date header is not IMF-fixdate"));
+    }
+    let decimal = |range: std::ops::Range<usize>| -> Result<i64> {
+        std::str::from_utf8(&bytes[range])
+            .map_err(|_| Error::new("response Date header is not ASCII"))?
+            .parse::<i64>()
+            .map_err(|_| Error::new("response Date header has a non-decimal component"))
+    };
+    let day = decimal(5..7)?;
+    let month = match &bytes[8..11] {
+        b"Jan" => 1,
+        b"Feb" => 2,
+        b"Mar" => 3,
+        b"Apr" => 4,
+        b"May" => 5,
+        b"Jun" => 6,
+        b"Jul" => 7,
+        b"Aug" => 8,
+        b"Sep" => 9,
+        b"Oct" => 10,
+        b"Nov" => 11,
+        b"Dec" => 12,
+        _ => return Err(Error::new("response Date header has an invalid month")),
+    };
+    let year = decimal(12..16)?;
+    let hour = decimal(17..19)?;
+    let minute = decimal(20..22)?;
+    let second = decimal(23..25)?;
+    if !(1..=31).contains(&day)
+        || !(0..=23).contains(&hour)
+        || !(0..=59).contains(&minute)
+        || !(0..=60).contains(&second)
+    {
+        return Err(Error::new(
+            "response Date header has an out-of-range component",
+        ));
+    }
+    let adjusted_year = year - i64::from(month <= 2);
+    let era = adjusted_year.div_euclid(400);
+    let year_of_era = adjusted_year - era * 400;
+    let shifted_month = month + if month > 2 { -3 } else { 9 };
+    let day_of_year = (153 * shifted_month + 2) / 5 + day - 1;
+    let day_of_era = year_of_era * 365 + year_of_era / 4 - year_of_era / 100 + day_of_year;
+    let unix_days = era * 146_097 + day_of_era - 719_468;
+    if unix_days < 0 {
+        return Err(Error::new("response Date header predates the Unix epoch"));
+    }
+    u64::try_from(unix_days)
+        .ok()
+        .and_then(|days| days.checked_mul(86_400))
+        .and_then(|base| base.checked_add(u64::try_from(hour * 3_600 + minute * 60 + second).ok()?))
+        .ok_or_else(|| Error::new("response Date header overflows Unix seconds"))
 }
 
 const FRESH_H1_RESPONSE_BODY_MAX: usize = 4_096;

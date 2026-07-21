@@ -187,11 +187,12 @@ pub async fn run_fixture_role(_context: ControlContext, control: &mut FramedCont
                 }
                 control.send(ControlBody::FixtureConfigured).await?;
             }
-            ControlBody::FixtureSnapshot => {
+            message @ (ControlBody::FixtureSnapshot | ControlBody::FixtureCompactSnapshot) => {
                 control.mark_failure_stage(RoleErrorStage::Drain);
+                let compact = matches!(message, ControlBody::FixtureCompactSnapshot);
                 control
                     .send(ControlBody::FixtureObserved {
-                        result: snapshot(&state)?,
+                        result: snapshot(&state, compact)?,
                     })
                     .await?;
             }
@@ -721,7 +722,7 @@ async fn run_tripwire(listener: TcpListener, state: Arc<FixtureState>) {
     }
 }
 
-fn snapshot(state: &FixtureState) -> Result<FixtureResult> {
+fn snapshot(state: &FixtureState, compact: bool) -> Result<FixtureResult> {
     let config = state
         .config
         .read()
@@ -740,11 +741,21 @@ fn snapshot(state: &FixtureState) -> Result<FixtureResult> {
             .then(left.method.as_bytes().cmp(right.method.as_bytes()))
     });
     let mut hasher = Sha256::new();
+    let mut phases = std::collections::BTreeMap::<u16, Vec<&EndpointObservation>>::new();
     for observation in &observations {
         hasher.update(observation.operation_id.as_bytes());
         hasher.update(observation.request_bytes.to_be_bytes());
         hasher.update(observation.response_bytes.to_be_bytes());
+        let operation = parse_operation_id(&observation.operation_id)?;
+        phases
+            .entry((operation >> 112) as u16)
+            .or_default()
+            .push(observation);
     }
+    let phase_aggregates = phases
+        .into_iter()
+        .map(|(phase, observations)| fixture_phase_aggregate(phase, &observations, &config))
+        .collect::<Result<Vec<_>>>()?;
     let max_requests_per_connection = state
         .requests_per_connection
         .lock()
@@ -761,6 +772,7 @@ fn snapshot(state: &FixtureState) -> Result<FixtureResult> {
         .map(H2FrameObserver::snapshot)
         .collect::<Result<Vec<_>>>()?;
     h2_wire.sort_by_key(|evidence| evidence.connection_id);
+    let observation_count = observations.len() as u64;
     Ok(FixtureResult {
         target: config.target,
         expected_protocol: config.expected_protocol,
@@ -772,9 +784,73 @@ fn snapshot(state: &FixtureState) -> Result<FixtureResult> {
         tripwire_bytes: state.tripwire_bytes.load(Ordering::SeqCst),
         duplicate_operations: state.duplicate_operations.load(Ordering::SeqCst),
         unknown_requests: state.unknown_requests.load(Ordering::SeqCst),
-        observations,
+        compacted: compact,
+        observation_count,
+        observations: if compact { Vec::new() } else { observations },
+        phase_aggregates,
         operation_hash_sha256: format!("{:x}", hasher.finalize()),
         h2_wire,
+    })
+}
+
+fn fixture_phase_aggregate(
+    phase: u16,
+    observations: &[&EndpointObservation],
+    config: &FixtureConfig,
+) -> Result<crate::control::FixturePhaseAggregate> {
+    let mut hasher = Sha256::new();
+    let mut request_bytes = 0_u64;
+    let mut response_bytes = 0_u64;
+    for observation in observations {
+        hasher.update(observation.operation_id.as_bytes());
+        hasher.update(observation.request_bytes.to_be_bytes());
+        hasher.update(observation.response_bytes.to_be_bytes());
+        request_bytes = request_bytes
+            .checked_add(observation.request_bytes)
+            .ok_or_else(|| Error::new("fixture phase request-byte overflow"))?;
+        response_bytes = response_bytes
+            .checked_add(observation.response_bytes)
+            .ok_or_else(|| Error::new("fixture phase response-byte overflow"))?;
+    }
+    Ok(crate::control::FixturePhaseAggregate {
+        phase,
+        operations: observations.len() as u64,
+        http_requests: observations
+            .iter()
+            .filter(|observation| observation.method != "PING")
+            .count() as u64,
+        request_bytes,
+        response_bytes,
+        operation_hash_sha256: format!("{:x}", hasher.finalize()),
+        protocol_correct: observations
+            .iter()
+            .all(|observation| observation.protocol == config.expected_protocol),
+        payload_correct: observations
+            .iter()
+            .all(|observation| observation.payload_ok),
+        identity_correct: observations
+            .iter()
+            .all(|observation| observation.identity_ok),
+        headers_sanitized: observations
+            .iter()
+            .all(|observation| observation.request_headers_sanitized),
+        request_eos: observations
+            .iter()
+            .all(|observation| observation.request_eos),
+        response_semantics_correct: observations.iter().all(|observation| {
+            (observation.method == "PING" || observation.status == 200 || observation.status == 101)
+                && (observation.method == "PING"
+                    || config.workload == Workload::WebSocket
+                    || observation.response_eos)
+        }),
+        observed_protocol: observations
+            .first()
+            .map(|observation| observation.protocol)
+            .filter(|protocol| {
+                observations
+                    .iter()
+                    .all(|observation| observation.protocol == *protocol)
+            }),
     })
 }
 
