@@ -721,7 +721,6 @@ fn relocate_equal_length_path(bytes: &[u8], from: &Path, to: &Path) -> Result<Ve
     }
     let mut output = bytes.to_vec();
     let mut offset = 0_usize;
-    let mut replacements = 0_u64;
     while let Some(relative) = output[offset..]
         .windows(from.len())
         .position(|window| window == from)
@@ -733,14 +732,6 @@ fn relocate_equal_length_path(bytes: &[u8], from: &Path, to: &Path) -> Result<Ve
         offset = start
             .checked_add(from.len())
             .ok_or_else(|| Error::new("binary path relocation offset overflow"))?;
-        replacements = replacements
-            .checked_add(1)
-            .ok_or_else(|| Error::new("binary path relocation count overflow"))?;
-    }
-    if replacements == 0 {
-        return Err(Error::new(
-            "clean rebuild binary contains no relocatable build-root path",
-        ));
     }
     Ok(output)
 }
