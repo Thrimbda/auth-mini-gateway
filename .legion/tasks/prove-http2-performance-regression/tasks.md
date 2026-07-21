@@ -3,7 +3,7 @@
 ## Quick Resume
 
 **Current phase**: Verification and delivery
-**Current item**: Complete the commit, PR, retention, merge, cleanup, and main-refresh lifecycle
+**Current item**: Merge the closeout PR, verify retained evidence from the fetched merged base, clean retained state, and refresh main
 **Progress**: 7/8 tasks complete
 ---
 
@@ -28,7 +28,7 @@
 ## Phase 4: Verification and delivery
 
 - [x] Independently verify harness correctness, terminal evidence, functional gates, and repository checks; run readiness/security review. | Result: implementation `PASS`; 151 benchmark tests plus `process-arms`, 160 root tests, strict Clippy, release self-test, and byte-equal terminal-bundle verification passed.
-- [ ] Produce walkthrough/wiki evidence and complete commit, rebase, PR, checks/review, merge, cleanup, and main refresh. | Acceptance: reviewer artifacts exist and the delivery lifecycle reaches terminal state.
+- [ ] Produce walkthrough/wiki evidence and complete commit, rebase, PR, checks/review, merge, cleanup, and main refresh. | Current state: main PR #13 merged at `9f9fb3f`; tracked-path terminal evidence and closeout docs are prepared on `legion/prove-http2-performance-regression-closeout`. Acceptance: the second PR merges, post-merge retention verification passes, retained state/worktree/branches are cleaned, and main is refreshed.
 ---
 
 ## Discovered Tasks

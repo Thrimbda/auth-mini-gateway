@@ -11,13 +11,16 @@
 - `superseded-by`: `(none)`
 - `empirical-proof`: `BLOCKED-before-sampling`
 - `performance-verdict`: `none`
+- `implementation-pr`: [#13](https://github.com/Thrimbda/auth-mini-gateway/pull/13), merged at `9f9fb3f0959cefac0608cdece5f661b3b7973cef`
+- `closeout-state`: tracked terminal evidence prepared; closeout PR and post-merge retention pending
 
 ## Outcome Summary
 
 - The repository-local HTTP/1 and HTTP/2 benchmark harness passed final implementation review at candidate `91bb210cbf6703e1f3258b517cee1acfd337da79`; no implementation finding remains open.
 - Verification passed 151 benchmark tests plus `process-arms`, 160 root tests, strict Clippy, the release self-test, and independent byte-equal terminal-bundle reconstruction.
 - Exact-candidate smoke `cal-smoke-91bb210cbf67-b2297c713de2` stopped before cases after 12 consecutive 10-second quiet candidates produced zero accepted observations. Stable orchestrator inventory did not hide approximately 38%-81% external logical-CPU activity or nonzero I/O PSI `full`.
-- The terminal evidence is sealed and independently verified as `BLOCKED`. No scout, calibration, authoritative sample, performance verdict, production change, or regression remediation exists.
+- The terminal evidence is sealed and independently verified as `BLOCKED`. Its ordinary-Git closeout copy is under `.legion/tasks/prove-http2-performance-regression/artifacts/cal-smoke-91bb210cbf67-b2297c713de2/`, so reviewers need not rely only on ignored `.perf` staging.
+- No scout, calibration, authoritative sample, performance verdict, production change, or regression remediation exists.
 - Main conclusion: implementation **PASS**, empirical proof **BLOCKED** by Axiom noise, therefore no no-regression claim. The task remains active only for delivery lifecycle closure.
 
 ## Reusable Decisions
@@ -30,8 +33,8 @@
 
 ## Open Gates
 
-- Complete commit/rebase, PR checks and review, merge, retained-evidence verification, cleanup, and main-workspace refresh.
-- Run `delivery-ready` against the committed artifact and `delivery-retained` against the fetched merged base before authorizing ignored-evidence cleanup.
+- Merge the closeout PR containing the tracked terminal evidence and lifecycle docs.
+- Run post-merge `delivery-retained` against the fetched durable base before authorizing ignored-evidence cleanup, worktree/branch removal, and main-workspace refresh.
 
 ## Related Raw Sources
 
@@ -43,9 +46,11 @@
 - [Implementation review](../../tasks/prove-http2-performance-regression/docs/review-change.md)
 - [Test report](../../tasks/prove-http2-performance-regression/docs/test-report.md)
 - [Reviewer walkthrough](../../tasks/prove-http2-performance-regression/docs/report-walkthrough.md)
+- [Tracked terminal artifact](../../tasks/prove-http2-performance-regression/artifacts/cal-smoke-91bb210cbf67-b2297c713de2/)
 
 ## Verification
 
 - Final implementation review passed on 2026-07-21 with no open finding.
 - The final terminal source seal root is `a78786cedf214fcff3fe779fa985bfdcc3eb203d007945dcac6e29f02d3e3e0e`; bundle index SHA-256 is `681d6fa1c8c28dfe0a666dae13dcffca970cf7d09d923441d2c9b4c2f1ad35e0`.
+- The tracked chunk SHA-256 is `1e5f375b64f9009c16689484e6f37120e9a18ebec179d86e686adf97551dcd5a`; verification receipt SHA-256 is `cb14b85dd1ad3413c40d53d87893483924085da2c1122b78b0eb8458a0d61f82`.
 - Independent verification returned `success=true`, `byte_equal=true`, and terminal `BLOCKED`.

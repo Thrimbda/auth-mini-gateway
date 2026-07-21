@@ -71,3 +71,12 @@
 - The terminal source seal root is `a78786cedf214fcff3fe779fa985bfdcc3eb203d007945dcac6e29f02d3e3e0e`; bundle index SHA-256 is `681d6fa1c8c28dfe0a666dae13dcffca970cf7d09d923441d2c9b4c2f1ad35e0`. Independent verification returned `success=true`, `byte_equal=true`, and terminal `BLOCKED`.
 - No scout, calibration, authoritative, or performance-verdict sample was produced. No production change or regression remediation was attempted.
 - Main conclusion: implementation readiness is `PASS`, but empirical proof is `BLOCKED` by Axiom host noise; therefore this task makes no no-regression claim. Only the delivery lifecycle remains.
+
+## 2026-07-21 - Main PR merged; tracked closeout evidence prepared
+
+- Main implementation PR [#13](https://github.com/Thrimbda/auth-mini-gateway/pull/13) merged at `9f9fb3f0959cefac0608cdece5f661b3b7973cef`.
+- Materialized the ordinary-Git terminal evidence copy at `.legion/tasks/prove-http2-performance-regression/artifacts/cal-smoke-91bb210cbf67-b2297c713de2/` for the closeout PR.
+- The tracked-path copy has bundle index SHA-256 `681d6fa1c8c28dfe0a666dae13dcffca970cf7d09d923441d2c9b4c2f1ad35e0`, chunk SHA-256 `1e5f375b64f9009c16689484e6f37120e9a18ebec179d86e686adf97551dcd5a`, verification receipt SHA-256 `cb14b85dd1ad3413c40d53d87893483924085da2c1122b78b0eb8458a0d61f82`, and seal root `a78786cedf214fcff3fe779fa985bfdcc3eb203d007945dcac6e29f02d3e3e0e`.
+- The receipt records `success=true`, `byte_equal=true`, and terminal `BLOCKED`.
+- Current branch is `legion/prove-http2-performance-regression-closeout`. A second closeout PR must merge before the fetched-base retention check can authorize `.perf` cleanup, worktree/branch removal, and main-workspace refresh.
+- Conclusion unchanged: implementation `PASS`, empirical proof `BLOCKED`, and no performance or no-regression claim.

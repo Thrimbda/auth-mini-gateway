@@ -55,3 +55,6 @@
 - Recorded the interim implementation and delivery gates; no performance verdict was claimed.
 - Updated the task after final implementation review closed all findings and exact candidate `91bb210` terminated `BLOCKED` at the Axiom quiet gate before cases.
 - Recorded the independently byte-equal terminal bundle, the prohibition on retry or threshold changes, the absence of performance samples/remediation, and the remaining delivery-only lifecycle.
+- Recorded main implementation PR #13 merged at `9f9fb3f0959cefac0608cdece5f661b3b7973cef`.
+- Pointed reviewers to the ordinary-Git terminal artifact prepared for the closeout PR, including index, chunk, receipt, and seal hashes.
+- Kept the task active pending the closeout PR merge, fetched-base retention verification, cleanup, and main-workspace refresh.
