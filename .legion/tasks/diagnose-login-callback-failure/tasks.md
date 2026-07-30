@@ -4,7 +4,7 @@
 
 **当前阶段**: (none)
 **当前检查项**: (none)
-**进度**: 4/4 任务完成
+**进度**: 5/5 任务完成
 ---
 
 ## 阶段 1: Contract and design ✅ COMPLETE
@@ -21,6 +21,7 @@
 ## 阶段 3: Verification and delivery ✅ COMPLETE
 
 - [x] Run formatting, tests, current-auth-mini E2E, security review, walkthrough, and wiki writeback. | 验收: All applicable gates pass with recorded evidence and no secret disclosure.
+- [x] Complete PR lifecycle. | 验收: PR #16 merged as `9083f358463a185d6890ac1096c4745e0a5bf6c0`; no required checks reported; closeout cleanup is tracked in the task log.
 ---
 
 ## 发现的新任务

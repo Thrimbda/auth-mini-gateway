@@ -12,10 +12,11 @@
 - Implemented audience-bound callback, refresh, and Pending recovery without downstream `/me`.
 - Updated active docs, examples, real-auth E2E, and benchmark identity fixtures for user-ID-only authorization.
 - Passed cargo fmt/test, real auth-mini E2E, old-binary compatibility, proxy/mode-switch drills, HTTP/2 benchmark tests, security review, walkthrough, and wiki writeback.
+- PR #16 merged as squash commit `9083f358463a185d6890ac1096c4745e0a5bf6c0`; GitHub reported no required checks, and the repository security review recorded PASS.
 
 ### 🟡 进行中
 
-- Commit, push, PR lifecycle, checks/review follow-up, merge, cleanup, and main refresh.
+- Closeout documentation, worktree cleanup, and main-workspace refresh.
 
 ### ⚠️ 阻塞/待定
 
@@ -65,9 +66,8 @@
 
 **下次继续从这里开始：**
 
-1. Commit the reviewed worktree changes.
-2. Fetch/rebase `origin/master`, push the PR branch, create the PR, and enable auto-merge if allowed.
-3. Follow checks/review to terminal state, then clean up the worktree and refresh the main workspace.
+1. Merge the closeout documentation PR.
+2. Remove the task worktree and refresh the main workspace to the merged `origin/master`.
 
 **注意事项：**
 

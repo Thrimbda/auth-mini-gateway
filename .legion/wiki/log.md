@@ -69,3 +69,4 @@
 - Updated current truth for audience-bound auth-mini login: gateway-host `aud` is mandatory, downstream sessions do not use `/me`, and authorization/trusted identity are exact user-ID-only.
 - Updated refresh, real-E2E, and identity-header patterns for signed-claim Pending finalization, distinct issuer/gateway audience testing, and user-ID-only injection.
 - Replaced the stale real-auth fixture follow-up with production `ALLOW_USER_IDS` provisioning and per-hostname browser rollout evidence.
+- Recorded PR #16 squash merge `9083f358463a185d6890ac1096c4745e0a5bf6c0`; GitHub reported no required checks, and `review-change` remained PASS.
