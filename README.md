@@ -9,12 +9,15 @@ Rust/SQLite gateway that enforces auth-mini sessions either as an nginx
 - Receives auth-mini fragment callbacks through a first-party bridge page.
 - Stores auth-mini access/refresh tokens only in the server-side SQLite database.
 - Keeps the browser session as an opaque, HttpOnly signed cookie.
-- Verifies auth-mini access JWTs with `/jwks`.
+- Verifies auth-mini access JWTs locally with `/jwks`, including the exact
+  gateway-hostname audience; the callback and refresh paths never call `/me`.
 - Refreshes expired or near-expired access tokens through auth-mini `/session/refresh`.
 - Uses a 7-day idle timeout and a non-sliding 30-day absolute lifetime.
 - Refreshes on protected requests and preserves the local session across temporary auth-mini failures.
-- Durably revokes only on local logout/expiry or an exact auth-mini refresh rejection.
-- Applies exact email/user-id allowlists independently of the IdP authentication method.
+- Durably revokes only on local logout/expiry, an exact auth-mini refresh
+  rejection, or a cryptographically valid rotated token signed for another
+  audience.
+- Applies an exact auth-mini user-ID allowlist independently of the IdP authentication method.
 - Keeps the existing nginx `auth_request` adapter as the default mode.
 - Optionally streams authenticated HTTP, SSE, and WebSocket traffic to one
   startup-configured upstream.
@@ -64,15 +67,23 @@ The gateway expects a real auth-mini server at `AUTH_MINI_ISSUER`. For local bro
 - `TRUSTED_PROXY_CIDRS`: comma-separated direct-peer CIDRs with explicit
   prefixes. Empty (the default) trusts no forwarding peer.
 - `GATEWAY_PUBLIC_BASE_URL`: public origin serving gateway routes through nginx.
-- `AUTH_MINI_ISSUER`: auth-mini issuer used for JWT `iss` validation and for `/jwks`, `/me`, refresh, and logout; it must be reachable by the gateway.
+  Its normalized hostname is also the required JWT audience (`aud`) for every
+  initial, refreshed, and recovered access token. The login redirect carries an
+  explicit `aud` parameter only when this origin is an exact loopback host
+  (`localhost`, `127.0.0.1`, or `::1`); production HTTPS origins let auth-mini
+  derive the audience from `redirect_uri`.
+- `AUTH_MINI_ISSUER`: auth-mini issuer used for JWT `iss` validation and for `/jwks`, refresh, and logout; it must be reachable by the gateway.
 - `AUTH_MINI_PUBLIC_BASE_URL`: browser-visible auth-mini origin; defaults to `AUTH_MINI_ISSUER`.
 - `AUTH_MINI_LOGIN_URL`: optional full login URL; defaults to `${AUTH_MINI_PUBLIC_BASE_URL}/web/#/login`.
 - `GATEWAY_DB`: SQLite database path.
 - `GATEWAY_COOKIE_SECRET`: at least 32 random characters.
 - `COOKIE_SECURE`: set `true` behind HTTPS.
 - `COOKIE_SAME_SITE`: `lax`, `strict`, or `none`.
-- `ALLOW_EMAILS`: comma-separated exact email allowlist, compared case-insensitively.
-- `ALLOW_USER_IDS`: optional comma-separated auth-mini user id allowlist.
+- `ALLOW_USER_IDS`: comma-separated exact auth-mini user id (JWT `sub`)
+  allowlist. Empty denies all users.
+- `ALLOW_EMAILS`: unsupported. Any nonempty value fails startup with
+  `allow_emails_unsupported` so an ignored email list cannot be mistaken for
+  active authorization.
 - `SESSION_TTL_SECONDS`: inactivity timeout, default `604800` (7 days).
 - `SESSION_ABSOLUTE_TTL_SECONDS`: hard lifetime from callback, default `2592000` (30 days).
 - `SESSION_TOUCH_INTERVAL_SECONDS`: successful-request touch merge interval, default `3600`.
@@ -130,7 +141,7 @@ binary and the existing maintenance/old-binary procedure.
 parameters, absolute-form authorities, cookies, and application redirects
 cannot select another destination. Browser cookies, Authorization,
 Proxy-Authorization, spoofed `X-Auth-Mini-*`, inbound forwarding fields, and
-hop-by-hop headers are removed. The gateway injects only verified user ID/email
+hop-by-hop headers are removed. The gateway injects only the verified user ID
 and regenerated forwarding metadata. An untrusted peer always becomes the
 client IP. A configured trusted direct peer may supply exactly one bare IPv4 or
 IPv6 value; malformed, repeated, list, port, bracket, zone, or opaque values are
@@ -200,9 +211,29 @@ The supported production target is one active gateway instance backed by durable
 
 Only successful `204` authorization checks can advance the idle deadline, and they never advance the absolute deadline. Positive cookies carry an absolute `Expires` value and no `Max-Age`; clear cookies carry both `Max-Age=0` and a past `Expires`.
 
-Temporary, rate-limit, transport, timeout, and indeterminate refresh failures return `503` through nginx without clearing the session. Only exact `401 {"error":"session_invalidated"}` or `session_superseded` responses from `/session/refresh` can remotely revoke it. `/me` never has revoke authority.
+Temporary, rate-limit, transport, timeout, and indeterminate refresh failures return `503` through nginx without clearing the session. Only exact `401 {"error":"session_invalidated"}` or `session_superseded` responses from `/session/refresh`, or a signed rotated token whose audience is not the gateway hostname, remotely revoke it.
 
-Auth-mini HTTP redirects are never followed, and JWKS, `/me`, and refresh success require exact `200 OK`. Redirects and other unexpected success statuses fail closed without replaying refresh credentials or advancing local state.
+Auth-mini HTTP redirects are never followed, and JWKS and refresh success require exact `200 OK`. Redirects and other unexpected success statuses fail closed without replaying refresh credentials or advancing local state.
+
+## Audience and user-ID migration
+
+Current auth-mini binds redirect logins to the callback hostname as a signed
+JWT `aud` and reserves `/me` for self-audience tokens. The gateway therefore:
+
+- derives one expected audience from the `GATEWAY_PUBLIC_BASE_URL` hostname,
+- requires that exact string `aud` on initial, refreshed, and recovered tokens
+  after signature verification, and
+- builds sessions and identity only from signed claims (`sub`, `sid`, `amr`,
+  `exp`) without calling `/me`.
+
+Operators migrating from an email-allowlist deployment must provision exact
+auth-mini user IDs into `ALLOW_USER_IDS` for every allowed user and clear
+`ALLOW_EMAILS` before starting this binary. Existing sessions keep working
+under user-ID policy until their recorded refresh boundary; a legacy token
+whose audience is missing or issuer-bound is revoked at refresh or Pending
+recovery and the browser logs in again. Rolling back only the gateway binary
+does not restore login against current auth-mini; full functional rollback
+requires the previous gateway together with a pre-audience auth-mini.
 
 ## Silent SSO capability
 

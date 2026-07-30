@@ -62,3 +62,10 @@
 - Recorded retained artifact tree `266a1341af0b2309b50503266ea8be5865fc15ae0623bb51c5c7b15c4dfd0be8`, ledger `9e9fe765a485785365aa26ae7bb218a89b2bf29893bfa6d95b920169af83142e`, ready receipt `8f8da4ba20a6aef97f4512da8f67589eda589e1b903ad199a4474f21d9cfb96b`, and retained receipt file `953d10fd2cb26b70ec25b1799932394bbdd43f19b9ce0a6e132da64dce69c283`.
 - Marked repository delivery complete at `8/8` while preserving the implementation `PASS`, empirical `BLOCKED`, and absence of any no-regression claim.
 - Recorded the finalization docs PR as the last repository mutation and the immediate post-merge local sequence: reverify fetched `master`, preserve non-authorized historical evidence outside the worktree, remove the worktree and merged local branches, and refresh main.
+
+## 2026-07-30
+
+- Added the `diagnose-login-callback-failure` task summary after Heavy RFC review, implementation, real official auth-mini verification, security review, and walkthrough.
+- Updated current truth for audience-bound auth-mini login: gateway-host `aud` is mandatory, downstream sessions do not use `/me`, and authorization/trusted identity are exact user-ID-only.
+- Updated refresh, real-E2E, and identity-header patterns for signed-claim Pending finalization, distinct issuer/gateway audience testing, and user-ID-only injection.
+- Replaced the stale real-auth fixture follow-up with production `ALLOW_USER_IDS` provisioning and per-hostname browser rollout evidence.

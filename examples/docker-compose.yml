@@ -20,7 +20,8 @@ services:
       GATEWAY_COOKIE_SECRET: ${GATEWAY_COOKIE_SECRET:-compose-dev-secret-change-me-32chars}
       COOKIE_SECURE: "false"
       COOKIE_SAME_SITE: lax
-      ALLOW_EMAILS: ${ALLOW_EMAILS:-allowed@example.com}
+      # Exact auth-mini user IDs only. ALLOW_EMAILS is unsupported and a
+      # nonempty value intentionally fails gateway startup.
       ALLOW_USER_IDS: ${ALLOW_USER_IDS:-}
       SESSION_TTL_SECONDS: ${SESSION_TTL_SECONDS:-604800}
       SESSION_ABSOLUTE_TTL_SECONDS: ${SESSION_ABSOLUTE_TTL_SECONDS:-2592000}

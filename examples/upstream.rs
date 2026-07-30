@@ -85,14 +85,12 @@ async fn handle(mut request: Request<Incoming>) -> Result<Response<GatewayBody>,
         .get("x-auth-mini-user-id")
         .and_then(|value| value.to_str().ok())
         .unwrap_or("");
-    let email = request
-        .headers()
-        .get("x-auth-mini-email")
-        .and_then(|value| value.to_str().ok())
-        .unwrap_or("");
+    let email_header_present = request.headers().contains_key("x-auth-mini-email");
     Ok(text_response(
         200,
-        format!("protected upstream\nuser_id={user_id}\nemail={email}\n"),
+        format!(
+            "protected upstream\nuser_id={user_id}\nemail_header_present={email_header_present}\n"
+        ),
     ))
 }
 

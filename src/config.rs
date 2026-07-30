@@ -19,6 +19,7 @@ pub struct Config {
     pub host: String,
     pub port: u16,
     pub public_base_url: String,
+    pub auth_mini_audience: String,
     pub auth_mini_issuer: String,
     pub auth_mini_public_base_url: String,
     pub auth_mini_login_url: Option<String>,
@@ -31,7 +32,6 @@ pub struct Config {
     pub session_touch_interval_seconds: i64,
     pub login_state_ttl_seconds: i64,
     pub refresh_skew_seconds: i64,
-    pub allow_emails: HashSet<String>,
     pub allow_user_ids: HashSet<String>,
     pub logout_redirect: String,
     pub upstream: Option<UpstreamBase>,
@@ -169,6 +169,7 @@ impl Config {
             "public_base_url_invalid",
             "GATEWAY_PUBLIC_BASE_URL must be a valid HTTP(S) URL",
         )?;
+        let auth_mini_audience = derive_gateway_audience(&public_base_url)?;
         let auth_mini_public_base_url = normalize_base_url(
             &env::var("AUTH_MINI_PUBLIC_BASE_URL").unwrap_or_else(|_| auth_mini_issuer.clone()),
             "auth_mini_public_base_url_invalid",
@@ -211,11 +212,13 @@ impl Config {
         let upstream = parse_upstream_url(env::var("UPSTREAM_URL").ok().as_deref())?;
         let upstream_protocol =
             parse_upstream_protocol(env::var("UPSTREAM_PROTOCOL").ok().as_deref())?;
+        reject_email_allowlist(env::var("ALLOW_EMAILS").ok().as_deref())?;
 
         let config = Self {
             host: env::var("HOST").unwrap_or_else(|_| "127.0.0.1".to_string()),
             port: parse_u16("PORT", 3000)?,
             public_base_url,
+            auth_mini_audience,
             auth_mini_issuer,
             auth_mini_public_base_url,
             auth_mini_login_url: env::var("AUTH_MINI_LOGIN_URL")
@@ -237,7 +240,6 @@ impl Config {
             session_touch_interval_seconds: parse_i64("SESSION_TOUCH_INTERVAL_SECONDS", 60 * 60)?,
             login_state_ttl_seconds: parse_i64("LOGIN_STATE_TTL_SECONDS", 10 * 60)?,
             refresh_skew_seconds: parse_i64("REFRESH_SKEW_SECONDS", 60)?,
-            allow_emails: parse_csv_lower("ALLOW_EMAILS"),
             allow_user_ids: parse_csv("ALLOW_USER_IDS"),
             logout_redirect: env::var("LOGOUT_REDIRECT").unwrap_or_else(|_| "/".to_string()),
             upstream,
@@ -249,6 +251,13 @@ impl Config {
         };
         config.validate()?;
         Ok(config)
+    }
+
+    pub fn login_requires_explicit_audience(&self) -> bool {
+        Url::parse(&self.public_base_url)
+            .ok()
+            .and_then(|url| url.host().map(|host| is_allowed_loopback(&host)))
+            .unwrap_or(false)
     }
 
     pub fn validate(&self) -> Result<(), ConfigError> {
@@ -401,7 +410,12 @@ fn normalize_base_url(
     message: &'static str,
 ) -> Result<String, ConfigError> {
     let mut parsed = Url::parse(value).map_err(|_| ConfigError::new(class, message))?;
-    if parsed.scheme() != "http" && parsed.scheme() != "https" {
+    if !matches!(parsed.scheme(), "http" | "https")
+        || parsed.cannot_be_a_base()
+        || parsed.host().is_none()
+        || !parsed.username().is_empty()
+        || parsed.password().is_some()
+    {
         return Err(ConfigError::new(class, message));
     }
     parsed.set_query(None);
@@ -409,6 +423,48 @@ fn normalize_base_url(
     let path = parsed.path().trim_end_matches('/').to_string();
     parsed.set_path(&path);
     Ok(parsed.to_string().trim_end_matches('/').to_string())
+}
+
+fn derive_gateway_audience(public_base_url: &str) -> Result<String, ConfigError> {
+    let parsed = Url::parse(public_base_url).map_err(|_| public_base_error())?;
+    let host = parsed.host().ok_or_else(public_base_error)?;
+    if parsed.scheme() != "https" && !is_allowed_loopback(&host) {
+        return Err(public_base_error());
+    }
+    Ok(normalize_host(host))
+}
+
+fn normalize_host<T: AsRef<str>>(host: Host<T>) -> String {
+    match host {
+        Host::Domain(domain) => domain.as_ref().trim_end_matches('.').to_string(),
+        Host::Ipv4(address) => address.to_string(),
+        Host::Ipv6(address) => address.to_string(),
+    }
+}
+
+fn is_allowed_loopback(host: &Host<&str>) -> bool {
+    match host {
+        Host::Domain(domain) => domain.trim_end_matches('.') == "localhost",
+        Host::Ipv4(address) => *address == std::net::Ipv4Addr::LOCALHOST,
+        Host::Ipv6(address) => *address == std::net::Ipv6Addr::LOCALHOST,
+    }
+}
+
+fn public_base_error() -> ConfigError {
+    ConfigError::new(
+        "public_base_url_invalid",
+        "GATEWAY_PUBLIC_BASE_URL must use HTTPS or an exact loopback HTTP(S) host",
+    )
+}
+
+fn reject_email_allowlist(value: Option<&str>) -> Result<(), ConfigError> {
+    if value.is_some_and(|value| value.split(',').any(|entry| !entry.trim().is_empty())) {
+        return Err(ConfigError::new(
+            "allow_emails_unsupported",
+            "ALLOW_EMAILS is unsupported; configure exact ALLOW_USER_IDS values",
+        ));
+    }
+    Ok(())
 }
 
 fn parse_capacity(
@@ -528,13 +584,6 @@ fn parse_csv(name: &str) -> HashSet<String> {
         .collect()
 }
 
-fn parse_csv_lower(name: &str) -> HashSet<String> {
-    parse_csv(name)
-        .into_iter()
-        .map(|value| value.to_ascii_lowercase())
-        .collect()
-}
-
 #[cfg(test)]
 mod tests {
     use std::net::{Ipv4Addr, Ipv6Addr};
@@ -556,6 +605,49 @@ mod tests {
         assert!(validate_session_lifetimes(0, 604_800, 2_592_000).is_err());
         assert!(validate_session_lifetimes(604_801, 604_800, 2_592_000).is_err());
         assert!(validate_session_lifetimes(3_600, 2_592_001, 2_592_000).is_err());
+    }
+
+    #[test]
+    fn gateway_audience_matches_auth_mini_hostname_normalization() {
+        assert_eq!(
+            derive_gateway_audience("https://App.Example.COM.:9443").expect("audience"),
+            "app.example.com"
+        );
+        assert_eq!(
+            derive_gateway_audience("http://localhost:8080").expect("loopback"),
+            "localhost"
+        );
+        assert_eq!(
+            derive_gateway_audience("http://127.0.0.1:8080").expect("loopback"),
+            "127.0.0.1"
+        );
+        assert_eq!(
+            derive_gateway_audience("http://[::1]:8080").expect("loopback"),
+            "::1"
+        );
+        for invalid in [
+            "http://app.example.com",
+            "http://127.0.0.2:8080",
+            "http://0.0.0.0:8080",
+        ] {
+            assert_eq!(
+                derive_gateway_audience(invalid)
+                    .expect_err("non-loopback HTTP must fail")
+                    .class(),
+                "public_base_url_invalid"
+            );
+        }
+    }
+
+    #[test]
+    fn email_allowlist_requires_explicit_user_id_migration() {
+        assert!(reject_email_allowlist(None).is_ok());
+        assert!(reject_email_allowlist(Some("")).is_ok());
+        assert!(reject_email_allowlist(Some(" , ")).is_ok());
+        let error = reject_email_allowlist(Some("allowed@example.com"))
+            .expect_err("email allowlist must fail");
+        assert_eq!(error.class(), "allow_emails_unsupported");
+        assert!(!error.to_string().contains("allowed@example.com"));
     }
 
     #[test]

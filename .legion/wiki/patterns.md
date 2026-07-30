@@ -19,7 +19,8 @@ For server-side sessions backed by rotating refresh tokens:
 - treat stale refresh failures as non-fatal if another request already advanced the session
 - before writing refreshed credentials, confirm the session still exists, is not revoked, and still has the expected refresh token
 - use a durable compare-and-swap update for refresh token rotation
-- persist rotated credentials into a fail-closed identity-pending state before remote identity refresh; finalize only after a fresh matching identity response
+- persist rotated credentials into a fail-closed identity-pending state before finalizing the new generation
+- finalize Pending only from the provider's current trusted identity proof; for audience-bound auth-mini that proof is the signed JWT itself, not a downstream `/me` call
 - do not let `/me` or equivalent profile endpoints revoke refresh sessions; only the refresh endpoint owns that wire authority
 - ensure logout-vs-refresh races fail closed by making refresh writeback fail after revocation
 - reject redirects and unexpected success statuses at token, identity, and JWKS boundaries
@@ -53,9 +54,10 @@ For gateway changes that depend on auth-mini contracts, prefer a harness that:
 - launches the real auth-mini Rust binary with a temporary SQLite DB
 - seeds auth-mini OTP/test data directly into that DB only for setup
 - obtains real tokens through auth-mini HTTP endpoints
-- runs the production gateway against auth-mini `/jwks`, `/me`, refresh, and logout
+- runs the production gateway against auth-mini `/jwks`, refresh, and logout, plus `/me` only when a self-audience token is intentionally under test
 - puts nginx and an HTTP/WebSocket upstream in the composed path
 - verifies restart persistence, refresh rotation, temporary failure recovery, exact rejection revocation, deny-by-default policy, renewal cookies, and WebSocket upgrade
+- for audience-bound contracts, uses distinct issuer and gateway hostnames, asserts login `redirect_uri`/loopback `aud`, decodes signed claims without printing tokens, proves downstream `/me` isolation, and tests a real signed wrong-audience callback
 - verifies old-binary compatibility and WAL-consistent backup/restore when session schema changes
 - avoids printing access tokens, refresh tokens, session cookies, cookie secrets, and callback bodies in diagnostics
 
@@ -63,9 +65,10 @@ For gateway changes that depend on auth-mini contracts, prefer a harness that:
 
 When returning identity headers from a gateway to nginx `auth_request`:
 
-- treat user id and email as untrusted even if they came from a verified token
+- treat every identity value as untrusted even if it came from a verified token
 - reject CR, LF, and control bytes before writing response headers
 - deny the auth check rather than forwarding malformed identity data
+- emit only claims that are present in the signed downstream token; current auth-mini gateways emit user ID only
 
 ## Authenticated fixed-upstream proxy pattern
 

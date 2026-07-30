@@ -7,7 +7,7 @@ use reqwest::redirect;
 use reqwest::StatusCode;
 use serde::{Deserialize, Serialize};
 
-use crate::jwt::{verify_access_token, Jwks, VerifiedAccessToken};
+use crate::jwt::{verify_access_token, AccessTokenVerificationError, Jwks, VerifiedAccessToken};
 use crate::util::{Clock, SystemClock};
 
 const MAX_AUTH_MINI_BODY: u64 = 64 * 1024;
@@ -22,12 +22,6 @@ impl std::fmt::Display for AuthMiniOperationError {
 }
 
 impl std::error::Error for AuthMiniOperationError {}
-
-#[derive(Clone, PartialEq, Eq)]
-pub struct MeResponse {
-    pub user_id: String,
-    pub email: Option<String>,
-}
 
 #[derive(Clone)]
 pub struct TokenResponse {
@@ -63,39 +57,28 @@ pub enum IndeterminateClass {
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum InitialAccessError {
+    Invalid,
+    AudienceRejected,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum RefreshError {
     Rejected(RefreshRejected),
+    AudienceRejected,
     Temporary(TemporaryClass),
     Indeterminate(IndeterminateClass),
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum IdentityUnavailable {
-    Temporary(TemporaryClass),
-    HttpStatus(u16),
-    InvalidBody,
-    IdentityMismatch,
-    ContractDrift,
-}
-
-#[derive(Clone, PartialEq, Eq)]
-pub enum IdentityFetchOutcome {
-    Fresh(MeResponse),
-    Unavailable(IdentityUnavailable),
-}
-
 pub trait AuthMini: Send + Sync {
-    fn verify_initial_access(
-        &self,
-        token: &str,
-    ) -> Result<VerifiedAccessToken, AuthMiniOperationError>;
+    fn verify_initial_access(&self, token: &str)
+        -> Result<VerifiedAccessToken, InitialAccessError>;
     fn prepare_refresh_verifier(&self) -> Result<Jwks, RefreshError>;
     fn verify_refreshed_access(
         &self,
         token: &str,
         jwks: &Jwks,
     ) -> Result<VerifiedAccessToken, RefreshError>;
-    fn fetch_identity(&self, access_token: &str) -> IdentityFetchOutcome;
     fn refresh(&self, session_id: &str, refresh_token: &str)
         -> Result<TokenResponse, RefreshError>;
     fn logout(&self, access_token: &str) -> Result<(), AuthMiniOperationError>;
@@ -103,19 +86,21 @@ pub trait AuthMini: Send + Sync {
 
 pub struct AuthMiniClient {
     issuer: String,
+    audience: String,
     client: Client,
     clock: Arc<dyn Clock>,
     jwks_cache: Mutex<Option<(Instant, Jwks)>>,
 }
 
 impl AuthMiniClient {
-    pub fn new(issuer: String) -> Self {
-        Self::with_clock(issuer, Arc::new(SystemClock))
+    pub fn new(issuer: String, audience: String) -> Self {
+        Self::with_clock(issuer, audience, Arc::new(SystemClock))
     }
 
-    pub fn with_clock(issuer: String, clock: Arc<dyn Clock>) -> Self {
+    pub fn with_clock(issuer: String, audience: String, clock: Arc<dyn Clock>) -> Self {
         Self {
             issuer,
+            audience,
             client: Client::builder()
                 .redirect(redirect::Policy::none())
                 .timeout(Duration::from_secs(10))
@@ -180,10 +165,21 @@ impl AuthMini for AuthMiniClient {
     fn verify_initial_access(
         &self,
         token: &str,
-    ) -> Result<VerifiedAccessToken, AuthMiniOperationError> {
-        let jwks = self.jwks().map_err(|_| AuthMiniOperationError)?;
-        verify_access_token(token, &jwks, &self.issuer, self.clock.now().timestamp())
-            .map_err(|_| AuthMiniOperationError)
+    ) -> Result<VerifiedAccessToken, InitialAccessError> {
+        let jwks = self.jwks().map_err(|_| InitialAccessError::Invalid)?;
+        match verify_access_token(
+            token,
+            &jwks,
+            &self.issuer,
+            &self.audience,
+            self.clock.now().timestamp(),
+        ) {
+            Ok(verified) => Ok(verified),
+            Err(AccessTokenVerificationError::AudienceRejected) => {
+                Err(InitialAccessError::AudienceRejected)
+            }
+            Err(AccessTokenVerificationError::Invalid) => Err(InitialAccessError::Invalid),
+        }
     }
 
     fn prepare_refresh_verifier(&self) -> Result<Jwks, RefreshError> {
@@ -195,63 +191,21 @@ impl AuthMini for AuthMiniClient {
         token: &str,
         jwks: &Jwks,
     ) -> Result<VerifiedAccessToken, RefreshError> {
-        verify_access_token(token, jwks, &self.issuer, self.clock.now().timestamp())
-            .map_err(|_| RefreshError::Indeterminate(IndeterminateClass::TokenVerification))
-    }
-
-    fn fetch_identity(&self, access_token: &str) -> IdentityFetchOutcome {
-        let response = match self
-            .client
-            .get(self.url("/me"))
-            .bearer_auth(access_token)
-            .send()
-        {
-            Ok(response) => response,
-            Err(error) => {
-                let class = if error.is_timeout() {
-                    TemporaryClass::Timeout
-                } else {
-                    TemporaryClass::Transport
-                };
-                return IdentityFetchOutcome::Unavailable(IdentityUnavailable::Temporary(class));
+        match verify_access_token(
+            token,
+            jwks,
+            &self.issuer,
+            &self.audience,
+            self.clock.now().timestamp(),
+        ) {
+            Ok(verified) => Ok(verified),
+            Err(AccessTokenVerificationError::AudienceRejected) => {
+                Err(RefreshError::AudienceRejected)
             }
-        };
-        if response.status() != StatusCode::OK {
-            let status = response.status();
-            if status == StatusCode::REQUEST_TIMEOUT {
-                return IdentityFetchOutcome::Unavailable(IdentityUnavailable::Temporary(
-                    TemporaryClass::Timeout,
-                ));
-            }
-            if status == StatusCode::TOO_MANY_REQUESTS {
-                return IdentityFetchOutcome::Unavailable(IdentityUnavailable::Temporary(
-                    TemporaryClass::RateLimited,
-                ));
-            }
-            if status.is_server_error() {
-                return IdentityFetchOutcome::Unavailable(IdentityUnavailable::Temporary(
-                    TemporaryClass::Upstream,
-                ));
-            }
-            return IdentityFetchOutcome::Unavailable(IdentityUnavailable::HttpStatus(
-                status.as_u16(),
-            ));
+            Err(AccessTokenVerificationError::Invalid) => Err(RefreshError::Indeterminate(
+                IndeterminateClass::TokenVerification,
+            )),
         }
-        let body = match bounded_body(response) {
-            Ok(body) => body,
-            Err(()) => return IdentityFetchOutcome::Unavailable(IdentityUnavailable::InvalidBody),
-        };
-        let response: MeWire = match serde_json::from_slice(&body) {
-            Ok(response) => response,
-            Err(_) => return IdentityFetchOutcome::Unavailable(IdentityUnavailable::InvalidBody),
-        };
-        if response.user_id.is_empty() {
-            return IdentityFetchOutcome::Unavailable(IdentityUnavailable::InvalidBody);
-        }
-        IdentityFetchOutcome::Fresh(MeResponse {
-            user_id: response.user_id,
-            email: response.email,
-        })
     }
 
     fn refresh(
@@ -341,12 +295,6 @@ fn bounded_body(response: Response) -> Result<Vec<u8>, ()> {
     Ok(body)
 }
 
-#[derive(Deserialize)]
-struct MeWire {
-    user_id: String,
-    email: Option<String>,
-}
-
 #[derive(Serialize)]
 struct RefreshRequest<'a> {
     session_id: &'a str,
@@ -411,12 +359,6 @@ mod tests {
                 IndeterminateClass::InvalidSuccessBody
             ))
         ));
-    }
-
-    #[test]
-    fn identity_unavailable_has_no_rejected_variant() {
-        let outcome = IdentityFetchOutcome::Unavailable(IdentityUnavailable::HttpStatus(401));
-        assert!(matches!(outcome, IdentityFetchOutcome::Unavailable(_)));
     }
 
     #[test]
@@ -485,7 +427,7 @@ mod tests {
             "308 Permanent Redirect",
         ] {
             let (issuer, source_hits, target, server) = redirect_server(status);
-            let client = AuthMiniClient::new(issuer);
+            let client = AuthMiniClient::new(issuer, "gateway.example".to_string());
             assert!(matches!(
                 client.refresh("fixture-session", "fixture-refresh"),
                 Err(RefreshError::Indeterminate(
@@ -498,17 +440,7 @@ mod tests {
         }
 
         let (issuer, source_hits, target, server) = redirect_server("302 Found");
-        let client = AuthMiniClient::new(issuer);
-        assert!(matches!(
-            client.fetch_identity("fixture-access"),
-            IdentityFetchOutcome::Unavailable(IdentityUnavailable::HttpStatus(302))
-        ));
-        server.join().expect("redirect source");
-        assert_eq!(source_hits.load(Ordering::SeqCst), 1);
-        assert_target_not_hit(&target);
-
-        let (issuer, source_hits, target, server) = redirect_server("302 Found");
-        let client = AuthMiniClient::new(issuer);
+        let client = AuthMiniClient::new(issuer, "gateway.example".to_string());
         assert!(matches!(
             client.prepare_refresh_verifier(),
             Err(RefreshError::Indeterminate(
@@ -531,38 +463,12 @@ mod tests {
                 ))
             ));
             assert!(matches!(
-                identity_against(status, r#"{"user_id":"fixture-user","email":null}"#),
-                IdentityFetchOutcome::Unavailable(IdentityUnavailable::HttpStatus(201 | 206))
-            ));
-            assert!(matches!(
                 jwks_against(status, r#"{"keys":[]}"#),
                 Err(RefreshError::Indeterminate(
                     IndeterminateClass::UnexpectedStatus
                 ))
             ));
         }
-    }
-
-    #[test]
-    fn identity_wire_maps_failures_without_a_rejection_path() {
-        assert!(matches!(
-            identity_against("404 Not Found", r#"{"error":"not_found"}"#),
-            IdentityFetchOutcome::Unavailable(IdentityUnavailable::HttpStatus(404))
-        ));
-        assert!(matches!(
-            identity_against("503 Service Unavailable", ""),
-            IdentityFetchOutcome::Unavailable(IdentityUnavailable::Temporary(
-                TemporaryClass::Upstream
-            ))
-        ));
-        assert!(matches!(
-            identity_against("200 OK", "not-json"),
-            IdentityFetchOutcome::Unavailable(IdentityUnavailable::InvalidBody)
-        ));
-        assert!(matches!(
-            identity_against("200 OK", r#"{"email":null}"#),
-            IdentityFetchOutcome::Unavailable(IdentityUnavailable::InvalidBody)
-        ));
     }
 
     fn refresh_against(
@@ -582,22 +488,17 @@ mod tests {
             )
             .expect("response");
         });
-        let client = AuthMiniClient::new(format!("http://{address}"));
+        let client =
+            AuthMiniClient::new(format!("http://{address}"), "gateway.example".to_string());
         let result = client.refresh("fixture-session", "fixture-refresh");
-        server.join().expect("server");
-        result
-    }
-
-    fn identity_against(status: &'static str, body: &'static str) -> IdentityFetchOutcome {
-        let (issuer, server) = response_server(status, body, None);
-        let result = AuthMiniClient::new(issuer).fetch_identity("fixture-access");
         server.join().expect("server");
         result
     }
 
     fn jwks_against(status: &'static str, body: &'static str) -> Result<Jwks, RefreshError> {
         let (issuer, server) = response_server(status, body, None);
-        let result = AuthMiniClient::new(issuer).prepare_refresh_verifier();
+        let result =
+            AuthMiniClient::new(issuer, "gateway.example".to_string()).prepare_refresh_verifier();
         server.join().expect("server");
         result
     }

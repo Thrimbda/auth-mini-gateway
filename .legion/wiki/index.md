@@ -2,6 +2,7 @@
 
 ## Current Task Summaries
 
+- [diagnose-login-callback-failure](tasks/diagnose-login-callback-failure.md): audience-bound auth-mini login with exact gateway-host JWT validation, no downstream `/me`, and user-ID-only authorization.
 - [prove-http2-performance-regression](tasks/prove-http2-performance-regression.md): implementation PASS; exact-candidate empirical proof BLOCKED before sampling by Axiom noise, with no no-regression claim and only delivery lifecycle closure pending.
 - [enable-http2-proxy](tasks/enable-http2-proxy.md): ALPN-authoritative HTTPS H2, explicit cleartext protocol selection, no-replay multiplexing, and RFC 8441 capability monitoring.
 - [harden-proxy-production-boundaries](tasks/harden-proxy-production-boundaries.md): bound downstream/upstream/resolver lifetimes, harden proxy header and forwarding trust, and make Acorn/FRP rollout executable.

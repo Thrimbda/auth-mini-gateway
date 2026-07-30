@@ -151,10 +151,6 @@ async fn proxy_request(
         HeaderValue::from_static(auth_mini_http2_regression::session::USER_ID),
     );
     upstream_request.headers_mut().insert(
-        "x-auth-mini-email",
-        HeaderValue::from_static(auth_mini_http2_regression::session::USER_EMAIL),
-    );
-    upstream_request.headers_mut().insert(
         "x-forwarded-host",
         HeaderValue::from_static("public.example"),
     );
