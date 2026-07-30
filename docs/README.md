@@ -16,7 +16,7 @@ Use this gateway when you want:
 - server-side storage of auth-mini access and refresh tokens.
 - browser sessions represented only by opaque, signed, HttpOnly cookies.
 - a single active gateway instance with durable SQLite WAL persistence.
-- simple email/user-id allowlists independent of the IdP authentication method.
+- an exact auth-mini user-ID allowlist independent of the IdP authentication method.
 
 ## Not Trying To Include
 
@@ -48,7 +48,7 @@ sequenceDiagram
     Browser->>Auth: Complete auth-mini login
     Auth-->>Browser: Fragment callback with tokens
     Browser->>Gateway: POST /auth/callback/session
-    Gateway->>Auth: Verify /jwks and fetch /me
+    Gateway->>Auth: Verify signature, issuer, and gateway audience via /jwks
     Gateway-->>Browser: Opaque gateway cookie
     Browser->>Nginx: Request protected app with cookie
     Nginx->>Gateway: auth_request /auth/check
@@ -77,10 +77,10 @@ examples below; do not expose `7780` or `4096` publicly.
 - New sessions have a 7-day idle timeout and a hard 30-day lifetime from callback creation.
 - Only successful protected-request authorization advances idle time, at most once per hour.
 - Access refresh is request-driven; it does not require browser background execution.
-- A rotated token is stored as identity `Pending` before `/me` is fetched. Pending sessions fail closed until a fresh matching identity is available.
-- Temporary or uncertain refresh and identity failures return `503` without clearing the browser session.
-- Local logout/expiry is terminal. Remote revocation is trusted only for the refresh endpoint's exact `session_invalidated` or `session_superseded` response.
-- `/me` failures, including `401 invalid_access_token`, never revoke a session.
+- A rotated token is stored as identity `Pending` behind the compatibility deny gate, then finalized locally by re-verifying the persisted JWT (signature, issuer, exact gateway-hostname audience, matching `sub`/`sid`). No `/me` call occurs. Pending sessions fail closed until finalization.
+- Temporary or uncertain refresh and verification failures return `503` without clearing the browser session.
+- Local logout/expiry is terminal. Remote revocation is trusted only for the refresh endpoint's exact `session_invalidated` or `session_superseded` response, or for a cryptographically valid rotated token signed for another audience.
+- The gateway authorizes exact auth-mini user IDs from `ALLOW_USER_IDS`; email is never an authorization fact or an emitted identity. Nonempty `ALLOW_EMAILS` fails startup.
 
 Silent SSO is currently **unsupported** by the pinned auth-mini capability evidence. It is not implemented or simulated in the gateway.
 

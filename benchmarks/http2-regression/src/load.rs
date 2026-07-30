@@ -8,7 +8,7 @@ use crate::control::{
 use crate::fixture::BenchBody;
 use crate::linux::{clock_ns, process_identity, ClockKind};
 use crate::schema::Workload;
-use crate::session::{USER_EMAIL, USER_ID};
+use crate::session::USER_ID;
 use crate::topology::{
     masked_ping, operation_id, operation_id_text, parse_unmasked_pong, planned_connection_id,
     websocket_accept, Corpus, Protocol, CORPUS_BYTES, SSE_EVENTS,
@@ -2156,9 +2156,6 @@ fn apply_target_headers(
             request
                 .headers_mut()
                 .insert("x-auth-mini-user-id", HeaderValue::from_static(USER_ID));
-            request
-                .headers_mut()
-                .insert("x-auth-mini-email", HeaderValue::from_static(USER_EMAIL));
             request.headers_mut().insert(
                 "x-forwarded-host",
                 HeaderValue::from_static("public.example"),

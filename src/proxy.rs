@@ -53,7 +53,6 @@ const H2_CLIENT_PREFACE: &[u8; 24] = b"PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n";
 #[derive(Clone, Debug)]
 pub struct ProxyIdentity {
     pub user_id: String,
-    pub email: Option<String>,
 }
 
 #[derive(Clone, Debug)]
@@ -3418,9 +3417,6 @@ fn sanitize_request_headers(
         "x-auth-mini-user-id",
         identity_header_value(&identity.user_id)?,
     );
-    if let Some(email) = identity.email.as_deref() {
-        headers.insert("x-auth-mini-email", identity_header_value(email)?);
-    }
     if websocket && protocol == ActualProtocol::Http1 {
         headers.insert(CONNECTION, HeaderValue::from_static("upgrade"));
         headers.insert(UPGRADE, HeaderValue::from_static("websocket"));

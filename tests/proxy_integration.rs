@@ -9,7 +9,7 @@ use std::sync::{Arc, Mutex};
 use std::task::{Context, Poll};
 
 use auth_mini_gateway::auth_mini::{
-    AuthMini, AuthMiniOperationError, IdentityFetchOutcome, RefreshError, TokenResponse,
+    AuthMini, AuthMiniOperationError, InitialAccessError, RefreshError, TokenResponse,
 };
 use auth_mini_gateway::config::{
     parse_trusted_proxy_cidrs, parse_upstream_url, Config, SameSite, TrustedProxySet, UpstreamBase,
@@ -211,8 +211,8 @@ impl AuthMini for NoopAuth {
     fn verify_initial_access(
         &self,
         _token: &str,
-    ) -> Result<VerifiedAccessToken, AuthMiniOperationError> {
-        Err(AuthMiniOperationError)
+    ) -> Result<VerifiedAccessToken, InitialAccessError> {
+        Err(InitialAccessError::Invalid)
     }
 
     fn prepare_refresh_verifier(&self) -> Result<Jwks, RefreshError> {
@@ -225,10 +225,6 @@ impl AuthMini for NoopAuth {
         _jwks: &Jwks,
     ) -> Result<VerifiedAccessToken, RefreshError> {
         panic!("fresh integration sessions do not refresh")
-    }
-
-    fn fetch_identity(&self, _access_token: &str) -> IdentityFetchOutcome {
-        panic!("fresh integration sessions do not fetch identity")
     }
 
     fn refresh(
@@ -2105,7 +2101,7 @@ async fn auth_check_status_identity_cleanup_and_logout_contract_is_directly_asse
     assert_status(&accepted, 204);
     let accepted_head = response_head(&accepted).to_ascii_lowercase();
     assert!(accepted_head.contains("x-auth-mini-user-id: user-1"));
-    assert!(accepted_head.contains("x-auth-mini-email: user@example.com"));
+    assert!(!accepted_head.contains("x-auth-mini-email"));
 
     let logout = request_once(
         allowed.address,
@@ -2152,7 +2148,7 @@ async fn non_ascii_identity_header_bytes_match_auth_check_and_proxy() {
     assert!(check_head
         .windows(USER_ID.len())
         .any(|value| value == USER_ID.as_bytes()));
-    assert!(check_head
+    assert!(!check_head
         .windows(EMAIL.len())
         .any(|value| value == EMAIL.as_bytes()));
 
@@ -2173,13 +2169,7 @@ async fn non_ascii_identity_header_bytes_match_auth_check_and_proxy() {
             .as_bytes(),
         USER_ID.as_bytes()
     );
-    assert_eq!(
-        headers
-            .get("x-auth-mini-email")
-            .expect("email header")
-            .as_bytes(),
-        EMAIL.as_bytes()
-    );
+    assert!(!headers.contains_key("x-auth-mini-email"));
 
     gateway.task.abort();
     fixture.task.abort();
@@ -2385,14 +2375,10 @@ async fn proxy_streams_required_methods_large_chunked_bodies_and_sse_with_sanita
         assert_eq!(entry.headers.get("host").unwrap(), "public.example");
         assert_eq!(entry.headers.get("x-auth-mini-user-id").unwrap(), "user-1");
         assert_eq!(
-            entry.headers.get("x-auth-mini-email").unwrap(),
-            "user@example.com"
-        );
-        assert_eq!(
             entry.headers.get_all("x-auth-mini-user-id").iter().count(),
             1
         );
-        assert_eq!(entry.headers.get_all("x-auth-mini-email").iter().count(), 1);
+        assert!(!entry.headers.contains_key("x-auth-mini-email"));
         assert!(!entry.headers.contains_key("x-auth-mini-admin"));
         assert_eq!(entry.headers.get("x-forwarded-proto").unwrap(), "https");
         assert_eq!(
@@ -4018,7 +4004,7 @@ async fn fatal_accept_exits_without_waiting_for_started_libc_resolver() {
     let mut child = Command::new(env!("CARGO_BIN_EXE_auth-mini-gateway"))
         .env("HOST", address.ip().to_string())
         .env("PORT", address.port().to_string())
-        .env("GATEWAY_PUBLIC_BASE_URL", "http://public.example")
+        .env("GATEWAY_PUBLIC_BASE_URL", "https://public.example")
         .env("AUTH_MINI_ISSUER", "http://127.0.0.1:9")
         .env("AUTH_MINI_PUBLIC_BASE_URL", "http://127.0.0.1:9")
         .env("GATEWAY_DB", &database)
@@ -4423,7 +4409,7 @@ async fn successful_selected_h2_logs_are_exact_and_secret_free() {
         .env("PORT", address.port().to_string())
         .env(
             "GATEWAY_PUBLIC_BASE_URL",
-            format!("http://{AUTHORITY_MARKER}"),
+            format!("https://{AUTHORITY_MARKER}"),
         )
         .env("AUTH_MINI_ISSUER", "http://127.0.0.1:9")
         .env("AUTH_MINI_PUBLIC_BASE_URL", "http://127.0.0.1:9")
@@ -4731,6 +4717,7 @@ async fn start_gateway_with_options(
         host: "127.0.0.1".to_string(),
         port: 0,
         public_base_url: "https://public.example".to_string(),
+        auth_mini_audience: "public.example".to_string(),
         auth_mini_issuer: "http://127.0.0.1:7777".to_string(),
         auth_mini_public_base_url: "http://localhost:7777".to_string(),
         auth_mini_login_url: None,
@@ -4743,7 +4730,6 @@ async fn start_gateway_with_options(
         session_touch_interval_seconds: 3_600,
         login_state_ttl_seconds: 600,
         refresh_skew_seconds: 60,
-        allow_emails: HashSet::new(),
         allow_user_ids,
         logout_redirect: "/".to_string(),
         upstream,

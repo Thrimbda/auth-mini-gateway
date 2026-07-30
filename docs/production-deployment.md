@@ -50,7 +50,7 @@ Browser
   -> auth-mini-gateway 127.0.0.1:7780
   -> OpenCode 127.0.0.1:4096
 
-auth-mini-gateway -> auth-mini issuer (JWKS, /me, refresh, logout)
+auth-mini-gateway -> auth-mini issuer (JWKS, refresh, logout)
 ```
 
 Only nginx `:443` and the firewalled frps control port are externally reachable.
@@ -99,9 +99,10 @@ openssl rand -base64 48
 Before deploying the gateway, configure auth-mini itself:
 
 - Its issuer must be the externally visible auth-mini origin, for example `https://auth.example.com`.
-- That issuer URL must be reachable by the gateway because `AUTH_MINI_ISSUER` is used both as the expected JWT issuer and as the HTTP base for `/jwks`, `/me`, `/session/refresh`, and `/session/logout`.
+- That issuer URL must be reachable by the gateway because `AUTH_MINI_ISSUER` is used both as the expected JWT issuer and as the HTTP base for `/jwks`, `/session/refresh`, and `/session/logout`.
 - Passkey deployments must use the correct auth-mini RP ID and browser origin for the auth-mini domain.
-- Users who should reach the protected app must authenticate through auth-mini and then match the gateway allowlist by email or auth-mini user id.
+- Current auth-mini signs redirect logins with the callback hostname as the JWT audience. The gateway requires that exact audience: the normalized `GATEWAY_PUBLIC_BASE_URL` hostname must be the origin users actually complete login against, and each deployed gateway hostname needs its own gateway instance/config pair.
+- Users who should reach the protected app must authenticate through auth-mini and match `ALLOW_USER_IDS` by exact auth-mini user id.
 
 If your internal network uses a different service name than the public issuer, make the public issuer hostname resolvable from the gateway as well. Do not set `AUTH_MINI_ISSUER` to an internal URL unless auth-mini also signs tokens with that exact URL as `iss`.
 
@@ -125,8 +126,7 @@ GATEWAY_DB=/data/auth-mini-gateway.sqlite
 GATEWAY_COOKIE_SECRET=<strong-random-secret>
 COOKIE_SECURE=true
 COOKIE_SAME_SITE=lax
-ALLOW_EMAILS=alice@example.com,bob@example.com
-ALLOW_USER_IDS=
+ALLOW_USER_IDS=<auth-mini-user-id-1>,<auth-mini-user-id-2>
 SESSION_TTL_SECONDS=604800
 SESSION_ABSOLUTE_TTL_SECONDS=2592000
 SESSION_TOUCH_INTERVAL_SECONDS=3600
@@ -137,7 +137,7 @@ LOGOUT_REDIRECT=/
 
 Important settings:
 
-- `GATEWAY_PUBLIC_BASE_URL` is the protected app origin served by nginx. It is used for callback redirects and return target validation.
+- `GATEWAY_PUBLIC_BASE_URL` is the protected app origin served by nginx. It is used for callback redirects and return target validation. Its normalized hostname is also the required JWT audience for every initial, refreshed, and recovered access token; the login redirect adds an explicit `aud` parameter only for exact loopback origins.
 - `UPSTREAM_URL` empty selects adapter mode. In proxy mode use one fixed
   loopback target, such as `http://127.0.0.1:4096`; invalid values stop startup
   without making a reachability request.
@@ -154,6 +154,7 @@ Important settings:
 - `GATEWAY_DB` must point to persistent storage. Back up this file and its WAL files consistently.
 - `GATEWAY_COOKIE_SECRET` must remain stable. Rotating it invalidates all browser gateway cookies.
 - `COOKIE_SECURE` should be `true` for HTTPS production deployments.
+- `ALLOW_USER_IDS` is the only authorization list: exact comma-separated auth-mini user IDs (JWT `sub` values). Obtain them from the auth-mini admin view or from existing gateway session rows, and provision them before rollout; an empty list denies every user. `ALLOW_EMAILS` is unsupported and any nonempty value fails startup with `allow_emails_unsupported`.
 - Session settings must satisfy `0 < SESSION_TOUCH_INTERVAL_SECONDS <= SESSION_TTL_SECONDS <= SESSION_ABSOLUTE_TTL_SECONDS`. Defaults are one-hour touch merging, seven-day inactivity, and a hard 30-day lifetime.
 
 ## Docker Deployment
@@ -184,7 +185,7 @@ docker run -d \
   -e GATEWAY_COOKIE_SECRET='<strong-random-secret>' \
   -e COOKIE_SECURE=true \
   -e COOKIE_SAME_SITE=lax \
-  -e ALLOW_EMAILS=alice@example.com,bob@example.com \
+  -e ALLOW_USER_IDS='<auth-mini-user-id-1>,<auth-mini-user-id-2>' \
   -e SESSION_TTL_SECONDS=604800 \
   -e SESSION_ABSOLUTE_TTL_SECONDS=2592000 \
   -e SESSION_TOUCH_INTERVAL_SECONDS=3600 \
@@ -210,7 +211,7 @@ export NGINX_PORT=8080
 export GATEWAY_COOKIE_SECRET='<strong-random-secret>'
 export AUTH_MINI_ISSUER=https://auth.example.com
 export AUTH_MINI_PUBLIC_BASE_URL=https://auth.example.com
-export ALLOW_EMAILS=alice@example.com,bob@example.com
+export ALLOW_USER_IDS='<auth-mini-user-id-1>,<auth-mini-user-id-2>'
 ```
 
 Then start the topology:
@@ -254,7 +255,7 @@ GATEWAY_DB=/var/lib/auth-mini-gateway/auth-mini-gateway.sqlite
 GATEWAY_COOKIE_SECRET=<strong-random-secret>
 COOKIE_SECURE=true
 COOKIE_SAME_SITE=lax
-ALLOW_EMAILS=alice@example.com,bob@example.com
+ALLOW_USER_IDS=<auth-mini-user-id-1>,<auth-mini-user-id-2>
 SESSION_TTL_SECONDS=604800
 SESSION_ABSOLUTE_TTL_SECONDS=2592000
 SESSION_TOUCH_INTERVAL_SECONDS=3600
@@ -341,7 +342,6 @@ location = /_auth {
 location / {
   auth_request /_auth;
   auth_request_set $auth_user_id $upstream_http_x_auth_mini_user_id;
-  auth_request_set $auth_email $upstream_http_x_auth_mini_email;
   auth_request_set $auth_set_cookie $upstream_http_set_cookie;
   add_header Set-Cookie $auth_set_cookie always;
   error_page 401 = /__login_redirect;
@@ -354,7 +354,6 @@ location / {
   proxy_set_header Connection $connection_upgrade;
   proxy_set_header Cookie "";
   proxy_set_header X-Auth-Mini-User-Id $auth_user_id;
-  proxy_set_header X-Auth-Mini-Email $auth_email;
   proxy_pass http://protected_upstream;
 }
 
@@ -540,7 +539,7 @@ Run these checks before moving real users:
 
 4. Allowlist denial:
 
-   Sign in as an auth-mini user outside `ALLOW_EMAILS` and `ALLOW_USER_IDS`.
+   Sign in as an auth-mini user outside `ALLOW_USER_IDS`.
 
    Expected: `403 Forbidden`; upstream should not receive the request.
 
@@ -605,14 +604,26 @@ drill uses SQLite's backup API while committed data remains in WAL frames,
 restores to a separate database, checks integrity/schema/snapshot boundaries,
 and starts the real gateway against the restored copy.
 
+### User-ID and audience migration
+
+Current auth-mini binds redirect logins to the callback hostname as a signed JWT audience and reserves `/me` for self-audience tokens. This gateway binary enforces that contract: it derives the expected audience from the `GATEWAY_PUBLIC_BASE_URL` hostname, requires it on initial, refreshed, and recovered tokens, and authorizes only exact `ALLOW_USER_IDS` values.
+
+1. Obtain exact auth-mini user IDs for every allowed user from the auth-mini admin view or from existing gateway session rows (never copy token columns).
+2. Set `ALLOW_USER_IDS` on each gateway service and remove or empty `ALLOW_EMAILS`; a nonempty `ALLOW_EMAILS` intentionally blocks startup.
+3. Deploy the fixed gateway to each distinct public hostname; two hostnames sharing one auth-mini issuer require separate expected audiences and therefore separate gateway configs.
+4. Complete a fresh login and refresh drill per hostname before opening traffic.
+
+Existing Ready sessions remain usable under user-ID policy until their recorded access refresh boundary. A legacy session whose next token carries the issuer audience or no audience is conditionally revoked at refresh or Pending recovery and the browser logs in again; the migration window is bounded by the recorded refresh boundary and never broadens access. Users whose IDs were not provisioned receive `403` until provisioned.
+
 ### Rollback
 
 1. Keep `auth_request` or a maintenance deny in place; never expose the upstream during rollback.
 2. Stop the new gateway and all refresh flights.
 3. Restore the previous binary/image and old environment. Do not lower `user_version` or drop v2 columns.
-4. Ready rows remain readable by the old binary. Pending rows have a past compatibility deadline and therefore fail closed; the old binary may prune them, requiring login again.
+4. Ready rows remain readable by the old binary, including new rows with NULL email. Pending rows have a past compatibility deadline and therefore fail closed; the old binary may prune them, requiring login again.
 5. If the database is suspect, restore the WAL-consistent backup. A token rotated after that backup may be superseded and require login again.
 6. Never repair Pending rows by manually copying tokens, email, or revocation values.
+7. Rolling back only the gateway cannot restore fresh login or refresh against current auth-mini, because the previous gateway depends on the now self-audience-only `/me`. Prefer rolling forward. Full functional rollback requires the previous gateway binary together with a pre-audience auth-mini deployment.
 
 ### Proxy-mode rollout and old-binary rollback
 
@@ -677,13 +688,13 @@ database restore is required solely for this binary rollback.
 - Keep the gateway private. Public traffic should enter through nginx.
 - Keep the protected upstream private. Public bypass around nginx defeats the gateway.
 - Use HTTPS in production and set `COOKIE_SECURE=true`.
-- Treat auth-mini as the authority for authentication methods. The gateway authorizes verified identities through exact email/user-id allowlists.
+- Treat auth-mini as the authority for authentication methods. The gateway authorizes verified identities through the exact `ALLOW_USER_IDS` allowlist only.
 - Treat identity headers from `/auth/check` as data for the upstream, not as proof outside the nginx-protected path.
 - In proxy mode, the gateway strips browser `Cookie`, `Authorization`,
   `Proxy-Authorization`, inbound `Forwarded`/`X-Forwarded-*`, spoofed
   `X-Auth-Mini-*`, fixed hop-by-hop fields, and every field nominated by
   `Connection`. It rejects underscore header names before auth and injects only
-  verified user ID/email.
+  the verified user ID.
 - The proxy preserves the external Host for application semantics but never
   uses it to select the upstream. `X-Forwarded-Proto` comes from
   `GATEWAY_PUBLIC_BASE_URL`, `X-Forwarded-Host` from the accepted Host, and one
@@ -699,11 +710,12 @@ database restore is required solely for this binary rollback.
 ### Refresh and identity residuals
 
 - The gateway disables automatic HTTP redirects for auth-mini calls. Redirect responses are unavailable results; in particular, a `307`/`308` cannot replay the refresh POST or its credentials to `Location`.
-- JWKS, `/me`, and refresh success require exact `200 OK`. Other `2xx` responses are contract drift and fail closed without advancing identity state or token generation.
+- JWKS and refresh success require exact `200 OK`. Other `2xx` responses are contract drift and fail closed without advancing identity state or token generation.
 - A timeout, transport error, `429`, `5xx`, unknown response, parse failure, or other indeterminate refresh result denies the current request with `503`, keeps the local session, and permits a later independent request to retry.
 - Only exact refresh-endpoint `401` errors `session_invalidated` and `session_superseded` are remote revoke authority. auth-mini currently may fold an internal failure into `session_invalidated`; alert on invalidation spikes and track an auth-mini follow-up to return `5xx` for internal errors.
 - If auth-mini commits token rotation but its response is lost, all requests already joined to that flight receive `503`. A later independent refresh may receive `session_superseded`, conditionally revoke the old local generation, and require login. The gateway does not automatically retry a rotating POST.
-- After successful rotation, tokens are durably `Pending` until fresh matching `/me` data is stored. Every non-fresh `/me` result—including exact `401 invalid_access_token`—keeps Pending and returns `503`; `/me` cannot revoke or clear the session.
+- After successful rotation, tokens are durably `Pending` until the persisted access JWT is re-verified locally (signature, issuer, exact gateway-hostname audience, matching `sub`/`sid`) and the row finalizes to Ready with no email. No `/me` call occurs in callback, refresh, or crash recovery.
+- A cryptographically valid refreshed or recovered token signed for another audience is terminal for that local generation: the expected generation is conditionally revoked and the browser must log in again. Temporary or uncertain verification failures still return `503` without revoking.
 - Logout is local-first and terminal. A failed remote logout never restores local access.
 
 ### Cookie deadlines
@@ -731,13 +743,14 @@ Check:
 
 - `AUTH_MINI_ISSUER` exactly matches the JWT `iss` configured in auth-mini.
 - `AUTH_MINI_ISSUER/jwks` is reachable from the gateway.
+- The token audience matches the gateway: current auth-mini signs `aud` as the normalized `GATEWAY_PUBLIC_BASE_URL` hostname. A token minted for another downstream hostname, or an older token with issuer/no audience, is rejected at callback and conditionally revoked at refresh or Pending recovery.
 - auth-mini's clock and gateway host clock are reasonably synchronized.
 
 ### User logs in but gets 403
 
 Check:
 
-- User email is listed in `ALLOW_EMAILS`, or auth-mini user id is listed in `ALLOW_USER_IDS`.
+- The user's exact auth-mini user id (JWT `sub`) is listed in `ALLOW_USER_IDS`. Email is not an authorization input; `ALLOW_EMAILS` is unsupported and blocks startup when nonempty.
 
 ### Sessions disappear after restart
 

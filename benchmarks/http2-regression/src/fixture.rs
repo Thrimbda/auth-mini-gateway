@@ -6,7 +6,7 @@ use crate::control::{
 };
 use crate::linux::process_identity;
 use crate::schema::Workload;
-use crate::session::{USER_EMAIL, USER_ID};
+use crate::session::USER_ID;
 use crate::topology::{
     parse_masked_ping, parse_operation_id, unmasked_pong, websocket_accept, Corpus, Protocol,
     CORPUS_BYTES,
@@ -403,11 +403,7 @@ async fn fixture_response_inner(
     let identity_ok = request
         .headers()
         .get("x-auth-mini-user-id")
-        .is_some_and(|value| value == USER_ID)
-        && request
-            .headers()
-            .get("x-auth-mini-email")
-            .is_some_and(|value| value == USER_EMAIL);
+        .is_some_and(|value| value == USER_ID);
     if !headers_ok || !identity_ok {
         return Err(Error::new(
             "gateway request identity/header sanitation failed",

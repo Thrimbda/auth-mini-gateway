@@ -29,8 +29,7 @@ use tokio::sync::{watch, Semaphore};
 use url::{form_urlencoded, Url};
 
 use crate::auth_mini::{
-    AuthMini, AuthMiniClient, IdentityFetchOutcome, IdentityUnavailable, IndeterminateClass,
-    RefreshError,
+    AuthMini, AuthMiniClient, IndeterminateClass, InitialAccessError, RefreshError,
 };
 use crate::capacity::{DownstreamLease, DownstreamStreamLease};
 use crate::config::Config;
@@ -1193,7 +1192,6 @@ async fn handle_proxy_fallback(
             &state.public_proto,
             ProxyIdentity {
                 user_id: identity.user_id,
-                email: identity.email,
             },
             renewal.clone(),
             body_bearing,
@@ -1670,19 +1668,16 @@ fn create_session_from_tokens(
     store: &Store,
     auth_mini: &dyn AuthMini,
 ) -> Result<GatewaySession, Box<dyn std::error::Error>> {
-    let verified = auth_mini
-        .verify_initial_access(&tokens.access_token)
-        .map_err(|_| "access verification failed")?;
+    let verified = match auth_mini.verify_initial_access(&tokens.access_token) {
+        Ok(verified) => verified,
+        Err(InitialAccessError::AudienceRejected) => {
+            eprintln!("event=callback_session outcome=audience_rejected");
+            return Err("access verification failed".into());
+        }
+        Err(InitialAccessError::Invalid) => return Err("access verification failed".into()),
+    };
     if verified.auth_session_id != tokens.session_id {
         return Err("session id mismatch".into());
-    }
-
-    let me = match auth_mini.fetch_identity(&tokens.access_token) {
-        IdentityFetchOutcome::Fresh(me) => me,
-        IdentityFetchOutcome::Unavailable(_) => return Err("identity unavailable".into()),
-    };
-    if me.user_id != verified.user_id {
-        return Err("user mismatch".into());
     }
 
     Ok(store.create_session(NewSession {
@@ -1690,7 +1685,7 @@ fn create_session_from_tokens(
         access_token: tokens.access_token,
         refresh_token: tokens.refresh_token,
         user_id: verified.user_id,
-        email: me.email,
+        email: None,
         amr: verified.amr,
         access_expires_at: unix_to_time(verified.exp)?,
         idle_ttl_seconds: config.session_ttl_seconds,
@@ -1701,7 +1696,6 @@ fn create_session_from_tokens(
 #[derive(Clone, Debug, PartialEq, Eq)]
 struct VerifiedIdentity {
     user_id: String,
-    email: Option<String>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -1762,9 +1756,6 @@ fn handle_auth_check(
         } => {
             let mut response =
                 Response::empty(204).with_header("X-Auth-Mini-User-Id", &identity.user_id);
-            if let Some(email) = identity.email.as_deref() {
-                response = response.with_header("X-Auth-Mini-Email", email);
-            }
             if let Some(cookie) = session_renewal {
                 response = response.with_cookie(cookie);
             }
@@ -1879,7 +1870,6 @@ fn auth_decision(
         return AuthDecision::Allow {
             identity: VerifiedIdentity {
                 user_id: touched.0.user_id,
-                email: touched.0.email,
             },
             session_renewal,
         };
@@ -1930,6 +1920,15 @@ fn refresh_gateway_session(
     }
     let verified = match auth_mini.verify_refreshed_access(&refreshed.access_token, &jwks) {
         Ok(verified) => verified,
+        Err(RefreshError::AudienceRejected) => {
+            eprintln!("event=refresh_flight outcome=audience_rejected");
+            return revoke_expected_generation(
+                session,
+                store,
+                auth_mini,
+                RejectedReason::AudienceRejected,
+            );
+        }
         Err(error) => return refresh_error_outcome(error),
     };
     if verified.auth_session_id != session.auth_session_id || verified.user_id != session.user_id {
@@ -1992,6 +1991,15 @@ fn handle_refresh_rejection(
             eprintln!("event=refresh_flight outcome=rejected_superseded");
         }
     }
+    revoke_expected_generation(expected, store, auth_mini, RejectedReason::Remote(reason))
+}
+
+fn revoke_expected_generation(
+    expected: &GatewaySession,
+    store: &Store,
+    auth_mini: &dyn AuthMini,
+    reason: RejectedReason,
+) -> FlightOutcome {
     match store.lookup_session(&expected.id) {
         Ok(SessionLookup::Active(current))
             if current.observed_version() != expected.observed_version()
@@ -2012,9 +2020,7 @@ fn handle_refresh_rejection(
         Ok(SessionLookup::Active(_)) => {}
     }
     match store.conditional_revoke(expected) {
-        Ok(true) => FlightOutcome::Rejected {
-            reason: RejectedReason::Remote(reason),
-        },
+        Ok(true) => FlightOutcome::Rejected { reason },
         Ok(false) => match store.lookup_session(&expected.id) {
             Ok(SessionLookup::Active(current))
                 if current.observed_version() != expected.observed_version()
@@ -2075,30 +2081,30 @@ fn recover_pending_identity(
     auth_mini: &dyn AuthMini,
 ) -> FlightOutcome {
     debug_assert_eq!(pending.identity_state, IdentityState::Pending);
-    let me = match auth_mini.fetch_identity(&pending.access_token) {
-        IdentityFetchOutcome::Fresh(me) if me.user_id == pending.user_id => me,
-        IdentityFetchOutcome::Fresh(_) => {
-            eprintln!("event=identity_finalize outcome=pending_identity_mismatch");
-            return FlightOutcome::Indeterminate {
-                class: IndeterminateClass::IdentityMismatch,
-            };
-        }
-        IdentityFetchOutcome::Unavailable(IdentityUnavailable::Temporary(class)) => {
-            return FlightOutcome::Temporary { class }
-        }
-        IdentityFetchOutcome::Unavailable(IdentityUnavailable::HttpStatus(401)) => {
-            eprintln!("event=identity_pending outcome=pending_me_401");
-            return FlightOutcome::Indeterminate {
-                class: IndeterminateClass::ContractDrift,
-            };
-        }
-        IdentityFetchOutcome::Unavailable(_) => {
-            return FlightOutcome::Indeterminate {
-                class: IndeterminateClass::ContractDrift,
-            }
-        }
+    let jwks = match auth_mini.prepare_refresh_verifier() {
+        Ok(jwks) => jwks,
+        Err(error) => return refresh_error_outcome(error),
     };
-    match store.finalize_pending(pending, me.email.as_deref()) {
+    let verified = match auth_mini.verify_refreshed_access(&pending.access_token, &jwks) {
+        Ok(verified) => verified,
+        Err(RefreshError::AudienceRejected) => {
+            eprintln!("event=pending_finalize outcome=audience_rejected");
+            return revoke_expected_generation(
+                pending,
+                store,
+                auth_mini,
+                RejectedReason::AudienceRejected,
+            );
+        }
+        Err(error) => return refresh_error_outcome(error),
+    };
+    if verified.auth_session_id != pending.auth_session_id || verified.user_id != pending.user_id {
+        eprintln!("event=identity_finalize outcome=pending_identity_mismatch");
+        return FlightOutcome::Indeterminate {
+            class: IndeterminateClass::IdentityMismatch,
+        };
+    }
+    match store.finalize_pending(pending, None) {
         Ok(CasResult::Updated(ready)) if ready.identity_state == IdentityState::Ready => {
             eprintln!("event=identity_finalize outcome=pending_ready");
             FlightOutcome::Ready {
@@ -2126,6 +2132,9 @@ fn refresh_error_outcome(error: RefreshError) -> FlightOutcome {
     match error {
         RefreshError::Rejected(reason) => FlightOutcome::Rejected {
             reason: RejectedReason::Remote(reason),
+        },
+        RefreshError::AudienceRejected => FlightOutcome::Indeterminate {
+            class: IndeterminateClass::ContractDrift,
         },
         RefreshError::Temporary(class) => FlightOutcome::Temporary { class },
         RefreshError::Indeterminate(class) => FlightOutcome::Indeterminate { class },
@@ -2218,10 +2227,14 @@ pub fn build_auth_mini_login_url(state: &str, config: &Config) -> String {
         .and_then(|base| base.join("/auth/callback"))
         .expect("validated public base url")
         .to_string();
-    let params = form_urlencoded::Serializer::new(String::new())
+    let mut params = form_urlencoded::Serializer::new(String::new());
+    params
         .append_pair("redirect_uri", &redirect_uri)
-        .append_pair("state", state)
-        .finish();
+        .append_pair("state", state);
+    if config.login_requires_explicit_audience() {
+        params.append_pair("aud", &config.auth_mini_audience);
+    }
+    let params = params.finish();
 
     if let Some(login_url) = config.auth_mini_login_url.as_deref() {
         let separator = if login_url.contains('?') { '&' } else { '?' };
@@ -2238,7 +2251,6 @@ fn evaluate_session_policy(session: &GatewaySession, config: &Config) -> PolicyD
     evaluate(
         Identity {
             user_id: &session.user_id,
-            email: session.email.as_deref(),
         },
         config,
     )
@@ -2246,11 +2258,6 @@ fn evaluate_session_policy(session: &GatewaySession, config: &Config) -> PolicyD
 
 fn identity_headers_are_safe(session: &GatewaySession) -> bool {
     is_safe_header_value(&session.user_id)
-        && session
-            .email
-            .as_deref()
-            .map(is_safe_header_value)
-            .unwrap_or(true)
 }
 
 fn session_needs_refresh(session: &GatewaySession, config: &Config, now: DateTime<Utc>) -> bool {
@@ -2311,8 +2318,7 @@ mod tests {
     use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
 
     use crate::auth_mini::{
-        AuthMiniClient, AuthMiniOperationError, IdentityUnavailable, MeResponse, RefreshRejected,
-        TokenResponse,
+        AuthMiniClient, AuthMiniOperationError, InitialAccessError, RefreshRejected, TokenResponse,
     };
     use crate::config::SameSite;
     use crate::jwt::{Jwks, VerifiedAccessToken};
@@ -2471,6 +2477,155 @@ mod tests {
         assert!(login_url.starts_with("http://localhost:7777/web/#/login?"));
         assert!(login_url.contains("redirect_uri=http%3A%2F%2Flocalhost%3A8080%2Fauth%2Fcallback"));
         assert!(login_url.contains("state=state-1"));
+        assert_eq!(login_url.matches("aud=").count(), 1);
+        assert!(login_url.contains("aud=localhost"));
+    }
+
+    #[test]
+    fn callback_creates_ready_session_from_signed_claims_without_identity_fetch() {
+        let (_dir, database, store, mut config) = callback_fixture();
+        config.allow_user_ids.insert("user".to_string());
+        let auth = MockAuthMini::new(Vec::new(), "user".to_string(), "auth-session".to_string())
+            .with_initial(vec![Ok(VerifiedAccessToken {
+                user_id: "user".to_string(),
+                auth_session_id: "auth-session".to_string(),
+                amr: vec!["email_otp".to_string()],
+                exp: Utc
+                    .with_ymd_and_hms(2026, 7, 13, 14, 0, 0)
+                    .single()
+                    .expect("time")
+                    .timestamp(),
+            })]);
+        let state = store
+            .create_login_state("/private", config.login_state_ttl_seconds)
+            .expect("login state");
+        let response = handle_callback_session(
+            &callback_request(&state.id, &config),
+            &config,
+            &store,
+            &auth,
+        )
+        .expect("callback response");
+        assert_eq!(response.status(), 200);
+        assert_eq!(response.header_values("X-Auth-Mini-Email").count(), 0);
+        assert_eq!(session_count(&database), 1);
+        let sessions = store.lookup_session(&callback_session_id(&database));
+        let SessionLookup::Active(session) = sessions.expect("session lookup") else {
+            panic!("callback session active");
+        };
+        assert_eq!(session.identity_state, IdentityState::Ready);
+        assert_eq!(session.user_id, "user");
+        assert!(session.email.is_none());
+        assert_eq!(session.amr, vec!["email_otp".to_string()]);
+        assert_eq!(auth.verification_calls.load(Ordering::SeqCst), 0);
+        assert_eq!(auth.refresh_calls.load(Ordering::SeqCst), 0);
+    }
+
+    #[test]
+    fn callback_stores_session_but_denies_unallowlisted_user() {
+        let (_dir, database, store, config) = callback_fixture();
+        let auth = MockAuthMini::new(Vec::new(), "user".to_string(), "auth-session".to_string())
+            .with_initial(vec![Ok(verified_for("user", "auth-session"))]);
+        let state = store
+            .create_login_state("/private", config.login_state_ttl_seconds)
+            .expect("login state");
+        let response = handle_callback_session(
+            &callback_request(&state.id, &config),
+            &config,
+            &store,
+            &auth,
+        )
+        .expect("callback response");
+        assert_eq!(response.status(), 403);
+        assert_eq!(session_count(&database), 1);
+        assert!(response
+            .header_values("Set-Cookie")
+            .any(|value| value.contains("amg_session=") && !value.contains("Max-Age=0")));
+    }
+
+    #[test]
+    fn callback_rejects_audience_invalid_and_sid_mismatch_without_a_session() {
+        for initial in [
+            Err(InitialAccessError::AudienceRejected),
+            Err(InitialAccessError::Invalid),
+            Ok(verified_for("user", "other-session")),
+        ] {
+            let (_dir, database, store, config) = callback_fixture();
+            let auth =
+                MockAuthMini::new(Vec::new(), "user".to_string(), "auth-session".to_string())
+                    .with_initial(vec![initial]);
+            let state = store
+                .create_login_state("/private", config.login_state_ttl_seconds)
+                .expect("login state");
+            let response = handle_callback_session(
+                &callback_request(&state.id, &config),
+                &config,
+                &store,
+                &auth,
+            )
+            .expect("callback response");
+            assert_eq!(response.status(), 401);
+            assert_eq!(session_count(&database), 0);
+            let replayed = handle_callback_session(
+                &callback_request(&state.id, &config),
+                &config,
+                &store,
+                &auth,
+            )
+            .expect("replay response");
+            assert_eq!(replayed.status(), 400);
+        }
+    }
+
+    fn callback_fixture() -> (tempfile::TempDir, PathBuf, Store, Config) {
+        let dir = tempdir().expect("callback tempdir");
+        let database = dir.path().join("gateway.sqlite");
+        Store::initialize(&database).expect("callback store");
+        let store = Store::new(database.clone());
+        let config = test_config();
+        (dir, database, store, config)
+    }
+
+    fn callback_request(state_id: &str, config: &Config) -> Request {
+        let signed = crate::cookies::sign_value(state_id, &config.cookie_secret);
+        let body = format!(
+            r#"{{"access_token":"callback-access","refresh_token":"callback-refresh","session_id":"auth-session","token_type":"Bearer","state":"{state_id}"}}"#
+        );
+        Request {
+            method: "POST".to_string(),
+            target: "/auth/callback/session".to_string(),
+            path: "/auth/callback/session".to_string(),
+            query: std::collections::HashMap::new(),
+            headers: vec![("Cookie".to_string(), format!("amg_login_state={signed}"))],
+            body: body.into_bytes(),
+        }
+    }
+
+    fn session_count(database: &std::path::Path) -> usize {
+        rusqlite::Connection::open(database)
+            .expect("open callback database")
+            .query_row("SELECT COUNT(*) FROM gateway_sessions", [], |row| {
+                row.get::<_, usize>(0)
+            })
+            .expect("count sessions")
+    }
+
+    fn callback_session_id(database: &std::path::Path) -> String {
+        rusqlite::Connection::open(database)
+            .expect("open callback database")
+            .query_row("SELECT id FROM gateway_sessions", [], |row| row.get(0))
+            .expect("callback session id")
+    }
+
+    #[test]
+    fn production_login_url_derives_audience_without_explicit_parameter() {
+        let mut config = test_config();
+        config.public_base_url = "https://App.Example.com:8443".to_string();
+        config.auth_mini_audience = "app.example.com".to_string();
+        let login_url = build_auth_mini_login_url("state-1", &config);
+        assert!(login_url
+            .contains("redirect_uri=https%3A%2F%2Fapp.example.com%3A8443%2Fauth%2Fcallback"));
+        assert!(!login_url.contains("aud="));
     }
 
     #[cfg(target_os = "linux")]
@@ -3001,7 +3156,6 @@ mod tests {
             config,
             Arc::new(MockAuthMini::new(
                 Vec::new(),
-                Vec::new(),
                 "unused-user".to_string(),
                 "unused-session".to_string(),
             )),
@@ -3252,7 +3406,6 @@ mod tests {
             config,
             Arc::new(MockAuthMini::new(
                 Vec::new(),
-                Vec::new(),
                 "unused-user".to_string(),
                 "unused-session".to_string(),
             )),
@@ -3386,7 +3539,6 @@ mod tests {
         };
         assert_eq!(count_login_states(), 0);
         let auth: Arc<dyn AuthMini> = Arc::new(MockAuthMini::new(
-            Vec::new(),
             Vec::new(),
             "unused-user".to_string(),
             "unused-session".to_string(),
@@ -3627,7 +3779,6 @@ mod tests {
             let store = Arc::new(Store::new(database));
             let flights = Arc::new(FlightCoordinator::default());
             let auth = Arc::new(MockAuthMini::new(
-                Vec::new(),
                 Vec::new(),
                 "unused-user".to_string(),
                 "unused-session".to_string(),
@@ -4003,7 +4154,7 @@ mod tests {
     }
 
     #[test]
-    fn me_http_failure_keeps_pending_and_later_identity_flight_recovers() {
+    fn pending_verification_failure_keeps_pending_and_later_flight_recovers() {
         let (_dir, store, session, config, _clock) = test_store_session();
         let auth = MockAuthMini::new(
             vec![Ok(TokenResponse {
@@ -4011,16 +4162,16 @@ mod tests {
                 access_token: "rotated-access".to_string(),
                 refresh_token: "rotated-refresh".to_string(),
             })],
-            vec![
-                IdentityFetchOutcome::Unavailable(IdentityUnavailable::HttpStatus(401)),
-                IdentityFetchOutcome::Fresh(MeResponse {
-                    user_id: session.user_id.clone(),
-                    email: Some("fresh@example.com".to_string()),
-                }),
-            ],
             session.user_id.clone(),
             session.auth_session_id.clone(),
-        );
+        )
+        .with_verifications(vec![
+            Ok(verified_for(&session.user_id, &session.auth_session_id)),
+            Err(RefreshError::Indeterminate(
+                IndeterminateClass::TokenVerification,
+            )),
+            Ok(verified_for(&session.user_id, &session.auth_session_id)),
+        ]);
         let coordinator = FlightCoordinator::default();
         let mut first_leader = match coordinator.acquire(&session.id, session.observed_version()) {
             Acquire::Leader(leader) => leader,
@@ -4048,9 +4199,9 @@ mod tests {
             _ => panic!("ready active"),
         };
         assert_eq!(ready.identity_state, IdentityState::Ready);
-        assert_eq!(ready.email.as_deref(), Some("fresh@example.com"));
+        assert!(ready.email.is_none());
         assert_eq!(auth.refresh_calls.load(Ordering::SeqCst), 1);
-        assert_eq!(auth.identity_calls.load(Ordering::SeqCst), 2);
+        assert_eq!(auth.verification_calls.load(Ordering::SeqCst), 3);
     }
 
     #[test]
@@ -4058,7 +4209,6 @@ mod tests {
         let (_dir, store, session, config, _clock) = test_store_session();
         let auth = MockAuthMini::new(
             vec![Err(RefreshError::Rejected(RefreshRejected::Superseded))],
-            vec![],
             session.user_id.clone(),
             session.auth_session_id.clone(),
         );
@@ -4080,7 +4230,7 @@ mod tests {
             SessionLookup::Inactive
         ));
         assert_eq!(auth.refresh_calls.load(Ordering::SeqCst), 1);
-        assert_eq!(auth.identity_calls.load(Ordering::SeqCst), 0);
+        assert_eq!(auth.verification_calls.load(Ordering::SeqCst), 0);
     }
 
     #[test]
@@ -4093,7 +4243,6 @@ mod tests {
                 )),
                 Err(RefreshError::Rejected(RefreshRejected::Superseded)),
             ],
-            vec![],
             session.user_id.clone(),
             session.auth_session_id.clone(),
         );
@@ -4145,7 +4294,6 @@ mod tests {
                 access_token: "rotated-access".to_string(),
                 refresh_token: "rotated-refresh".to_string(),
             })],
-            vec![],
             session.user_id.clone(),
             session.auth_session_id.clone(),
         );
@@ -4163,7 +4311,7 @@ mod tests {
                 class: IndeterminateClass::Persistence
             }
         );
-        assert_eq!(auth.identity_calls.load(Ordering::SeqCst), 0);
+        assert_eq!(auth.verification_calls.load(Ordering::SeqCst), 1);
     }
 
     #[test]
@@ -4187,10 +4335,6 @@ mod tests {
         };
         let auth = MockAuthMini::new(
             vec![],
-            vec![IdentityFetchOutcome::Fresh(MeResponse {
-                user_id: pending.user_id.clone(),
-                email: Some("fresh@example.com".to_string()),
-            })],
             pending.user_id.clone(),
             pending.auth_session_id.clone(),
         );
@@ -4229,14 +4373,14 @@ mod tests {
             let config = Arc::new(config);
             let flights = Arc::new(FlightCoordinator::default());
             let gate = RemoteGate::new();
-            let auth = Arc::new(ScenarioAuth::new(
-                scenario,
-                session.user_id.clone(),
-                session.auth_session_id.clone(),
-                Some(gate.clone()),
-                None,
-                Vec::new(),
-            ));
+            let auth = Arc::new(
+                ScenarioAuth::new(
+                    scenario,
+                    session.user_id.clone(),
+                    session.auth_session_id.clone(),
+                )
+                .with_refresh_gate(gate.clone()),
+            );
 
             let leader = spawn_auth_check(
                 Arc::clone(&config),
@@ -4284,10 +4428,11 @@ mod tests {
             }
             assert_eq!(auth.refresh_calls.load(Ordering::SeqCst), 1);
             if scenario == RefreshScenario::Success {
-                assert_eq!(auth.identity_calls.load(Ordering::SeqCst), 1);
+                assert_eq!(auth.verification_calls.load(Ordering::SeqCst), 2);
                 let ready = active_session(&store, &session.id);
                 assert_eq!(ready.identity_state, IdentityState::Ready);
                 assert_eq!(ready.refresh_generation, 1);
+                assert!(ready.email.is_none());
             } else if scenario == RefreshScenario::Rejected {
                 assert!(matches!(
                     store.lookup_session(&session.id).expect("lookup"),
@@ -4302,21 +4447,21 @@ mod tests {
     }
 
     #[test]
-    fn pending_alias_joins_the_running_refresh_identity_flight() {
+    fn pending_alias_joins_the_running_refresh_finalize_flight() {
         let (_dir, store, session, mut config, _clock) = test_store_session();
         config.allow_user_ids.insert(session.user_id.clone());
         let store = Arc::new(store);
         let config = Arc::new(config);
         let flights = Arc::new(FlightCoordinator::default());
-        let identity_gate = RemoteGate::new();
-        let auth = Arc::new(ScenarioAuth::new(
-            RefreshScenario::Success,
-            session.user_id.clone(),
-            session.auth_session_id.clone(),
-            None,
-            Some(identity_gate.clone()),
-            Vec::new(),
-        ));
+        let finalize_gate = RemoteGate::new();
+        let auth = Arc::new(
+            ScenarioAuth::new(
+                RefreshScenario::Success,
+                session.user_id.clone(),
+                session.auth_session_id.clone(),
+            )
+            .with_verification_gate(2, finalize_gate.clone()),
+        );
 
         let leader = spawn_auth_check(
             Arc::clone(&config),
@@ -4325,7 +4470,7 @@ mod tests {
             Arc::clone(&flights),
             &session.id,
         );
-        identity_gate.wait_until_entered();
+        finalize_gate.wait_until_entered();
         let pending = active_session(&store, &session.id);
         assert_eq!(pending.identity_state, IdentityState::Pending);
         assert_eq!(pending.refresh_generation, 1);
@@ -4338,15 +4483,15 @@ mod tests {
             &session.id,
         );
         flights.wait_for_joiners(&session.id, 1);
-        identity_gate.release();
+        finalize_gate.release();
         assert_eq!(leader.join().expect("leader").status(), 204);
         assert_eq!(alias_joiner.join().expect("alias joiner").status(), 204);
         assert_eq!(auth.refresh_calls.load(Ordering::SeqCst), 1);
-        assert_eq!(auth.identity_calls.load(Ordering::SeqCst), 1);
+        assert_eq!(auth.verification_calls.load(Ordering::SeqCst), 2);
     }
 
     #[test]
-    fn pending_identity_failure_matrix_retries_without_revocation() {
+    fn pending_recovery_failure_matrix_retries_without_revocation() {
         let (_dir, store, session, mut config, _clock) = test_store_session();
         config.allow_user_ids.insert(session.user_id.clone());
         let pending = make_pending(&store, &session, store.now() + Duration::hours(2));
@@ -4354,25 +4499,21 @@ mod tests {
             RefreshScenario::Success,
             session.user_id.clone(),
             session.auth_session_id.clone(),
-            None,
-            None,
-            vec![
-                IdentityFetchOutcome::Unavailable(IdentityUnavailable::HttpStatus(401)),
-                IdentityFetchOutcome::Unavailable(IdentityUnavailable::HttpStatus(404)),
-                IdentityFetchOutcome::Unavailable(IdentityUnavailable::Temporary(
-                    crate::auth_mini::TemporaryClass::Upstream,
-                )),
-                IdentityFetchOutcome::Unavailable(IdentityUnavailable::InvalidBody),
-                IdentityFetchOutcome::Fresh(MeResponse {
-                    user_id: "mismatched-user".to_string(),
-                    email: None,
-                }),
-                IdentityFetchOutcome::Fresh(MeResponse {
-                    user_id: session.user_id.clone(),
-                    email: Some("fresh@example.com".to_string()),
-                }),
-            ],
-        );
+        )
+        .with_prepare_errors(vec![
+            RefreshError::Temporary(crate::auth_mini::TemporaryClass::Upstream),
+            RefreshError::Indeterminate(IndeterminateClass::ContractDrift),
+        ])
+        .with_verifications(vec![
+            Err(RefreshError::Temporary(
+                crate::auth_mini::TemporaryClass::Timeout,
+            )),
+            Err(RefreshError::Indeterminate(
+                IndeterminateClass::TokenVerification,
+            )),
+            Ok(verified_for("mismatched-user", &session.auth_session_id)),
+            Ok(verified_for(&session.user_id, &session.auth_session_id)),
+        ]);
         let flights = FlightCoordinator::default();
         for _ in 0..5 {
             let response = handle_auth_check(
@@ -4400,26 +4541,82 @@ mod tests {
         let ready = active_session(&store, &pending.id);
         assert_eq!(ready.identity_state, IdentityState::Ready);
         assert_eq!(ready.refresh_generation, pending.refresh_generation);
-        assert_eq!(ready.email.as_deref(), Some("fresh@example.com"));
+        assert!(ready.email.is_none());
         assert_eq!(auth.refresh_calls.load(Ordering::SeqCst), 0);
-        assert_eq!(auth.identity_calls.load(Ordering::SeqCst), 6);
+        assert_eq!(auth.verification_calls.load(Ordering::SeqCst), 4);
     }
 
     #[test]
-    fn fresh_identity_replaces_policy_input_including_null_email() {
+    fn refresh_audience_rejection_conditionally_revokes_rotated_generation() {
         let (_dir, store, session, mut config, _clock) = test_store_session();
-        config.allow_emails.insert("old@example.com".to_string());
+        config.allow_user_ids.insert(session.user_id.clone());
+        let auth = MockAuthMini::new(
+            vec![Ok(TokenResponse {
+                session_id: session.auth_session_id.clone(),
+                access_token: "rotated-access".to_string(),
+                refresh_token: "rotated-refresh".to_string(),
+            })],
+            session.user_id.clone(),
+            session.auth_session_id.clone(),
+        )
+        .with_verifications(vec![Err(RefreshError::AudienceRejected)]);
+        let response = handle_auth_check(
+            &auth_check_request(&session.id, &config),
+            &config,
+            &store,
+            &auth,
+            &FlightCoordinator::default(),
+        );
+        assert_eq!(response.status(), 401);
+        assert!(response
+            .header_values("Set-Cookie")
+            .any(|value| value.contains("Max-Age=0")));
+        assert!(matches!(
+            store.lookup_session(&session.id).expect("lookup"),
+            SessionLookup::Inactive
+        ));
+        assert_eq!(auth.refresh_calls.load(Ordering::SeqCst), 1);
+        assert_eq!(auth.verification_calls.load(Ordering::SeqCst), 1);
+    }
+
+    #[test]
+    fn pending_audience_rejection_conditionally_revokes_and_requires_login() {
+        let (_dir, store, session, mut config, _clock) = test_store_session();
+        config.allow_user_ids.insert(session.user_id.clone());
+        let pending = make_pending(&store, &session, store.now() + Duration::hours(2));
+        let auth = MockAuthMini::new(
+            vec![],
+            session.user_id.clone(),
+            session.auth_session_id.clone(),
+        )
+        .with_verifications(vec![Err(RefreshError::AudienceRejected)]);
+        let response = handle_auth_check(
+            &auth_check_request(&pending.id, &config),
+            &config,
+            &store,
+            &auth,
+            &FlightCoordinator::default(),
+        );
+        assert_eq!(response.status(), 401);
+        assert!(response
+            .header_values("Set-Cookie")
+            .any(|value| value.contains("Max-Age=0")));
+        assert!(matches!(
+            store.lookup_session(&pending.id).expect("lookup"),
+            SessionLookup::Inactive
+        ));
+        assert_eq!(auth.refresh_calls.load(Ordering::SeqCst), 0);
+        assert_eq!(auth.verification_calls.load(Ordering::SeqCst), 1);
+    }
+
+    #[test]
+    fn pending_finalize_applies_user_id_policy_and_null_email() {
+        let (_dir, store, session, config, _clock) = test_store_session();
         let pending = make_pending(&store, &session, store.now() + Duration::hours(2));
         let denied_auth = ScenarioAuth::new(
             RefreshScenario::Success,
             session.user_id.clone(),
             session.auth_session_id.clone(),
-            None,
-            None,
-            vec![IdentityFetchOutcome::Fresh(MeResponse {
-                user_id: session.user_id.clone(),
-                email: Some("new-denied@example.com".to_string()),
-            })],
         );
         let response = handle_auth_check(
             &auth_check_request(&pending.id, &config),
@@ -4430,34 +4627,29 @@ mod tests {
         );
         assert_eq!(response.status(), 403);
         assert_eq!(response.header_values("X-Auth-Mini-Email").count(), 0);
-        assert_eq!(
-            active_session(&store, &pending.id).email.as_deref(),
-            Some("new-denied@example.com")
-        );
+        assert_eq!(response.header_values("X-Auth-Mini-User-Id").count(), 0);
+        let ready = active_session(&store, &pending.id);
+        assert_eq!(ready.identity_state, IdentityState::Ready);
+        assert!(ready.email.is_none());
 
         let (_dir, store, session, mut config, _clock) = test_store_session();
         config.allow_user_ids.insert(session.user_id.clone());
         let pending = make_pending(&store, &session, store.now() + Duration::hours(2));
-        let null_auth = ScenarioAuth::new(
+        let allowed_auth = ScenarioAuth::new(
             RefreshScenario::Success,
             session.user_id.clone(),
             session.auth_session_id.clone(),
-            None,
-            None,
-            vec![IdentityFetchOutcome::Fresh(MeResponse {
-                user_id: session.user_id.clone(),
-                email: None,
-            })],
         );
         let response = handle_auth_check(
             &auth_check_request(&pending.id, &config),
             &config,
             &store,
-            &null_auth,
+            &allowed_auth,
             &FlightCoordinator::default(),
         );
         assert_eq!(response.status(), 204);
         assert_eq!(response.header_values("X-Auth-Mini-Email").count(), 0);
+        assert_eq!(response.header_values("X-Auth-Mini-User-Id").count(), 1);
         assert!(active_session(&store, &pending.id).email.is_none());
     }
 
@@ -4469,15 +4661,15 @@ mod tests {
         let store = Arc::new(store);
         let config = Arc::new(config);
         let flights = Arc::new(FlightCoordinator::default());
-        let identity_gate = RemoteGate::new();
-        let auth = Arc::new(ScenarioAuth::new(
-            RefreshScenario::Success,
-            session.user_id.clone(),
-            session.auth_session_id.clone(),
-            None,
-            Some(identity_gate.clone()),
-            Vec::new(),
-        ));
+        let finalize_gate = RemoteGate::new();
+        let auth = Arc::new(
+            ScenarioAuth::new(
+                RefreshScenario::Success,
+                session.user_id.clone(),
+                session.auth_session_id.clone(),
+            )
+            .with_verification_gate(2, finalize_gate.clone()),
+        );
         let leader = spawn_auth_check(
             Arc::clone(&config),
             Arc::clone(&store),
@@ -4485,7 +4677,7 @@ mod tests {
             Arc::clone(&flights),
             &pending.id,
         );
-        identity_gate.wait_until_entered();
+        finalize_gate.wait_until_entered();
         let rotated_pending = active_session(&store, &pending.id);
         assert_eq!(rotated_pending.identity_state, IdentityState::Pending);
         assert_eq!(
@@ -4500,11 +4692,11 @@ mod tests {
             &pending.id,
         );
         flights.wait_for_joiners(&pending.id, 1);
-        identity_gate.release();
+        finalize_gate.release();
         assert_eq!(leader.join().expect("leader").status(), 204);
         assert_eq!(joiner.join().expect("joiner").status(), 204);
         assert_eq!(auth.refresh_calls.load(Ordering::SeqCst), 1);
-        assert_eq!(auth.identity_calls.load(Ordering::SeqCst), 1);
+        assert_eq!(auth.verification_calls.load(Ordering::SeqCst), 2);
         assert_eq!(
             active_session(&store, &pending.id).refresh_generation,
             pending.refresh_generation + 1
@@ -4512,7 +4704,7 @@ mod tests {
     }
 
     #[test]
-    fn logout_idle_and_absolute_expiry_win_during_pending_identity_fetch() {
+    fn logout_idle_and_absolute_expiry_win_during_pending_finalize() {
         run_pending_terminal_race(TerminalRace::Logout);
         run_pending_terminal_race(TerminalRace::IdleExpiry);
         run_pending_terminal_race(TerminalRace::AbsoluteExpiry);
@@ -4539,16 +4731,13 @@ mod tests {
 
         let (_dir, store, session, config, _clock) = test_store_session();
         let pending = make_pending(&store, &session, store.now() + Duration::hours(2));
-        let (issuer, server) = one_response_server(
-            "206 Partial Content",
-            r#"{"user_id":"user","email":"fresh@example.com"}"#,
-            None,
-        );
+        let (issuer, server) = one_response_server("206 Partial Content", r#"{"keys":[]}"#, None);
         let wire_auth = WireAuth::new(
             issuer,
             session.user_id.clone(),
             session.auth_session_id.clone(),
-        );
+        )
+        .with_real_jwks();
         let mut leader =
             match FlightCoordinator::default().acquire(&pending.id, pending.observed_version()) {
                 Acquire::Leader(leader) => leader,
@@ -4647,28 +4836,67 @@ mod tests {
 
     struct MockAuthMini {
         refreshes: Mutex<VecDeque<Result<TokenResponse, RefreshError>>>,
-        identities: Mutex<VecDeque<IdentityFetchOutcome>>,
+        verifications: Mutex<VecDeque<Result<VerifiedAccessToken, RefreshError>>>,
+        initial: Mutex<VecDeque<Result<VerifiedAccessToken, InitialAccessError>>>,
+        prepare_errors: Mutex<VecDeque<RefreshError>>,
         user_id: String,
         session_id: String,
         refresh_calls: AtomicUsize,
-        identity_calls: AtomicUsize,
+        verification_calls: AtomicUsize,
     }
 
     impl MockAuthMini {
         fn new(
             refreshes: Vec<Result<TokenResponse, RefreshError>>,
-            identities: Vec<IdentityFetchOutcome>,
             user_id: String,
             session_id: String,
         ) -> Self {
             Self {
                 refreshes: Mutex::new(refreshes.into()),
-                identities: Mutex::new(identities.into()),
+                verifications: Mutex::new(VecDeque::new()),
+                initial: Mutex::new(VecDeque::new()),
+                prepare_errors: Mutex::new(VecDeque::new()),
                 user_id,
                 session_id,
                 refresh_calls: AtomicUsize::new(0),
-                identity_calls: AtomicUsize::new(0),
+                verification_calls: AtomicUsize::new(0),
             }
+        }
+
+        fn with_verifications(
+            self,
+            verifications: Vec<Result<VerifiedAccessToken, RefreshError>>,
+        ) -> Self {
+            self.verifications
+                .lock()
+                .expect("verification queue")
+                .extend(verifications);
+            self
+        }
+
+        fn with_initial(
+            self,
+            initial: Vec<Result<VerifiedAccessToken, InitialAccessError>>,
+        ) -> Self {
+            self.initial.lock().expect("initial queue").extend(initial);
+            self
+        }
+
+        fn verified(&self) -> VerifiedAccessToken {
+            verified_for(&self.user_id, &self.session_id)
+        }
+    }
+
+    fn verified_for(user_id: &str, session_id: &str) -> VerifiedAccessToken {
+        VerifiedAccessToken {
+            user_id: user_id.to_string(),
+            auth_session_id: session_id.to_string(),
+            amr: vec!["fixture".to_string()],
+            exp: Utc
+                .with_ymd_and_hms(2026, 7, 13, 14, 0, 0)
+                .single()
+                .expect("time")
+                .timestamp(),
         }
     }
 
@@ -4676,11 +4904,23 @@ mod tests {
         fn verify_initial_access(
             &self,
             _token: &str,
-        ) -> Result<VerifiedAccessToken, AuthMiniOperationError> {
-            Err(AuthMiniOperationError)
+        ) -> Result<VerifiedAccessToken, InitialAccessError> {
+            self.initial
+                .lock()
+                .expect("initial queue")
+                .pop_front()
+                .expect("initial verification fixture")
         }
 
         fn prepare_refresh_verifier(&self) -> Result<Jwks, RefreshError> {
+            if let Some(error) = self
+                .prepare_errors
+                .lock()
+                .expect("prepare error queue")
+                .pop_front()
+            {
+                return Err(error);
+            }
             Ok(Jwks { keys: Vec::new() })
         }
 
@@ -4689,25 +4929,12 @@ mod tests {
             _token: &str,
             _jwks: &Jwks,
         ) -> Result<VerifiedAccessToken, RefreshError> {
-            Ok(VerifiedAccessToken {
-                user_id: self.user_id.clone(),
-                auth_session_id: self.session_id.clone(),
-                amr: vec!["test".to_string()],
-                exp: Utc
-                    .with_ymd_and_hms(2026, 7, 13, 14, 0, 0)
-                    .single()
-                    .expect("time")
-                    .timestamp(),
-            })
-        }
-
-        fn fetch_identity(&self, _access_token: &str) -> IdentityFetchOutcome {
-            self.identity_calls.fetch_add(1, Ordering::SeqCst);
-            self.identities
+            self.verification_calls.fetch_add(1, Ordering::SeqCst);
+            self.verifications
                 .lock()
-                .expect("identity queue")
+                .expect("verification queue")
                 .pop_front()
-                .expect("identity fixture")
+                .unwrap_or_else(|| Ok(self.verified()))
         }
 
         fn refresh(
@@ -4769,31 +4996,55 @@ mod tests {
         user_id: String,
         session_id: String,
         refresh_gate: Option<RemoteGate>,
-        identity_gate: Option<RemoteGate>,
-        identities: Mutex<VecDeque<IdentityFetchOutcome>>,
+        verification_gate: Option<(usize, RemoteGate)>,
+        verifications: Mutex<VecDeque<Result<VerifiedAccessToken, RefreshError>>>,
+        prepare_errors: Mutex<VecDeque<RefreshError>>,
         refresh_calls: AtomicUsize,
-        identity_calls: AtomicUsize,
+        verification_calls: AtomicUsize,
     }
 
     impl ScenarioAuth {
-        fn new(
-            scenario: RefreshScenario,
-            user_id: String,
-            session_id: String,
-            refresh_gate: Option<RemoteGate>,
-            identity_gate: Option<RemoteGate>,
-            identities: Vec<IdentityFetchOutcome>,
-        ) -> Self {
+        fn new(scenario: RefreshScenario, user_id: String, session_id: String) -> Self {
             Self {
                 scenario,
                 user_id,
                 session_id,
-                refresh_gate,
-                identity_gate,
-                identities: Mutex::new(identities.into()),
+                refresh_gate: None,
+                verification_gate: None,
+                verifications: Mutex::new(VecDeque::new()),
+                prepare_errors: Mutex::new(VecDeque::new()),
                 refresh_calls: AtomicUsize::new(0),
-                identity_calls: AtomicUsize::new(0),
+                verification_calls: AtomicUsize::new(0),
             }
+        }
+
+        fn with_refresh_gate(mut self, gate: RemoteGate) -> Self {
+            self.refresh_gate = Some(gate);
+            self
+        }
+
+        fn with_verification_gate(mut self, call: usize, gate: RemoteGate) -> Self {
+            self.verification_gate = Some((call, gate));
+            self
+        }
+
+        fn with_verifications(
+            self,
+            verifications: Vec<Result<VerifiedAccessToken, RefreshError>>,
+        ) -> Self {
+            self.verifications
+                .lock()
+                .expect("verification queue")
+                .extend(verifications);
+            self
+        }
+
+        fn with_prepare_errors(self, errors: Vec<RefreshError>) -> Self {
+            self.prepare_errors
+                .lock()
+                .expect("prepare error queue")
+                .extend(errors);
+            self
         }
     }
 
@@ -4801,11 +5052,19 @@ mod tests {
         fn verify_initial_access(
             &self,
             _token: &str,
-        ) -> Result<VerifiedAccessToken, AuthMiniOperationError> {
-            Err(AuthMiniOperationError)
+        ) -> Result<VerifiedAccessToken, InitialAccessError> {
+            Err(InitialAccessError::Invalid)
         }
 
         fn prepare_refresh_verifier(&self) -> Result<Jwks, RefreshError> {
+            if let Some(error) = self
+                .prepare_errors
+                .lock()
+                .expect("prepare error queue")
+                .pop_front()
+            {
+                return Err(error);
+            }
             Ok(Jwks { keys: Vec::new() })
         }
 
@@ -4814,33 +5073,17 @@ mod tests {
             _token: &str,
             _jwks: &Jwks,
         ) -> Result<VerifiedAccessToken, RefreshError> {
-            Ok(VerifiedAccessToken {
-                user_id: self.user_id.clone(),
-                auth_session_id: self.session_id.clone(),
-                amr: vec!["fixture".to_string()],
-                exp: Utc
-                    .with_ymd_and_hms(2026, 7, 13, 14, 0, 0)
-                    .single()
-                    .expect("time")
-                    .timestamp(),
-            })
-        }
-
-        fn fetch_identity(&self, _access_token: &str) -> IdentityFetchOutcome {
-            self.identity_calls.fetch_add(1, Ordering::SeqCst);
-            if let Some(gate) = self.identity_gate.as_ref() {
-                gate.block_remote();
+            let call = self.verification_calls.fetch_add(1, Ordering::SeqCst) + 1;
+            if let Some((gated_call, gate)) = self.verification_gate.as_ref() {
+                if *gated_call == call {
+                    gate.block_remote();
+                }
             }
-            self.identities
+            self.verifications
                 .lock()
-                .expect("identity queue")
+                .expect("verification queue")
                 .pop_front()
-                .unwrap_or_else(|| {
-                    IdentityFetchOutcome::Fresh(MeResponse {
-                        user_id: self.user_id.clone(),
-                        email: Some("fresh@example.com".to_string()),
-                    })
-                })
+                .unwrap_or_else(|| Ok(verified_for(&self.user_id, &self.session_id)))
         }
 
         fn refresh(
@@ -4877,6 +5120,7 @@ mod tests {
 
     struct WireAuth {
         client: AuthMiniClient,
+        real_jwks: bool,
         user_id: String,
         session_id: String,
     }
@@ -4884,10 +5128,16 @@ mod tests {
     impl WireAuth {
         fn new(issuer: String, user_id: String, session_id: String) -> Self {
             Self {
-                client: AuthMiniClient::new(issuer),
+                client: AuthMiniClient::new(issuer, "localhost".to_string()),
+                real_jwks: false,
                 user_id,
                 session_id,
             }
+        }
+
+        fn with_real_jwks(mut self) -> Self {
+            self.real_jwks = true;
+            self
         }
     }
 
@@ -4895,12 +5145,16 @@ mod tests {
         fn verify_initial_access(
             &self,
             _token: &str,
-        ) -> Result<VerifiedAccessToken, AuthMiniOperationError> {
-            Err(AuthMiniOperationError)
+        ) -> Result<VerifiedAccessToken, InitialAccessError> {
+            Err(InitialAccessError::Invalid)
         }
 
         fn prepare_refresh_verifier(&self) -> Result<Jwks, RefreshError> {
-            Ok(Jwks { keys: Vec::new() })
+            if self.real_jwks {
+                self.client.prepare_refresh_verifier()
+            } else {
+                Ok(Jwks { keys: Vec::new() })
+            }
         }
 
         fn verify_refreshed_access(
@@ -4908,20 +5162,7 @@ mod tests {
             _token: &str,
             _jwks: &Jwks,
         ) -> Result<VerifiedAccessToken, RefreshError> {
-            Ok(VerifiedAccessToken {
-                user_id: self.user_id.clone(),
-                auth_session_id: self.session_id.clone(),
-                amr: vec!["fixture".to_string()],
-                exp: Utc
-                    .with_ymd_and_hms(2026, 7, 13, 14, 0, 0)
-                    .single()
-                    .expect("time")
-                    .timestamp(),
-            })
-        }
-
-        fn fetch_identity(&self, access_token: &str) -> IdentityFetchOutcome {
-            self.client.fetch_identity(access_token)
+            Ok(verified_for(&self.user_id, &self.session_id))
         }
 
         fn refresh(
@@ -4955,15 +5196,15 @@ mod tests {
         let store = Arc::new(store);
         let config = Arc::new(config);
         let flights = Arc::new(FlightCoordinator::default());
-        let identity_gate = RemoteGate::new();
-        let auth = Arc::new(ScenarioAuth::new(
-            RefreshScenario::Success,
-            session.user_id.clone(),
-            session.auth_session_id.clone(),
-            None,
-            Some(identity_gate.clone()),
-            Vec::new(),
-        ));
+        let finalize_gate = RemoteGate::new();
+        let auth = Arc::new(
+            ScenarioAuth::new(
+                RefreshScenario::Success,
+                session.user_id.clone(),
+                session.auth_session_id.clone(),
+            )
+            .with_verification_gate(2, finalize_gate.clone()),
+        );
         let check = spawn_auth_check(
             Arc::clone(&config),
             Arc::clone(&store),
@@ -4971,7 +5212,7 @@ mod tests {
             Arc::clone(&flights),
             &session.id,
         );
-        identity_gate.wait_until_entered();
+        finalize_gate.wait_until_entered();
         assert_eq!(
             active_session(&store, &session.id).identity_state,
             IdentityState::Pending
@@ -4988,7 +5229,7 @@ mod tests {
             TerminalRace::IdleExpiry => clock.set(session.idle_expires_at),
             TerminalRace::AbsoluteExpiry => clock.set(session.absolute_expires_at),
         }
-        identity_gate.release();
+        finalize_gate.release();
         let response = check.join().expect("auth check");
         assert_eq!(response.status(), 401);
         assert!(response
@@ -5098,7 +5339,6 @@ mod tests {
             config: Arc::clone(&config),
             auth_mini: Arc::new(MockAuthMini::new(
                 Vec::new(),
-                Vec::new(),
                 "unused-user".to_string(),
                 "unused-session".to_string(),
             )),
@@ -5146,6 +5386,7 @@ mod tests {
             host: "127.0.0.1".to_string(),
             port: 3000,
             public_base_url: "http://localhost:8080".to_string(),
+            auth_mini_audience: "localhost".to_string(),
             auth_mini_issuer: "http://127.0.0.1:7777".to_string(),
             auth_mini_public_base_url: "http://localhost:7777".to_string(),
             auth_mini_login_url: None,
@@ -5158,7 +5399,6 @@ mod tests {
             session_touch_interval_seconds: 3_600,
             login_state_ttl_seconds: 600,
             refresh_skew_seconds: 60,
-            allow_emails: HashSet::new(),
             allow_user_ids: HashSet::new(),
             logout_redirect: "/".to_string(),
             upstream: None,

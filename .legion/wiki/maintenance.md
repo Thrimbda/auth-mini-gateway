@@ -12,7 +12,8 @@
 - Add auth-mini refresh idempotency, result lookup, or previous-token recovery to close the post-commit lost-response residual.
 - Make auth-mini internal refresh failures return 5xx instead of folding them into `401 session_invalidated`.
 - Run a physical mobile Safari smoke for overnight suspension, first-request recovery, and absolute `Expires` behavior.
-- Rerun `scripts/e2e-real-auth-mini.sh` with the pinned auth-mini checkout to close the current real-auth compatibility gap and capture direct proxy login, refresh outage/recovery, denial, WebSocket, logout, and secret-boundary evidence.
+- Provision exact `ALLOW_USER_IDS` and clear `ALLOW_EMAILS` for each deployed gateway before rolling out audience-bound login; rerun the current official auth-mini E2E after any future upstream contract change.
+- Run the audience-bound gateway against the physical Axiom/Acorn deployment after user IDs are provisioned, including a fresh browser login for each public hostname.
 - Re-review the same-connection SETTINGS proof, ongoing fixed-memory capability monitor, enqueue linearization, transport-drop witness, and pre-service nonzero CONNECT boundary before upgrading pinned Hyper/h2.
 - Before any OpenCode or HTTP/2 production rollout, validate Acorn nginx and FRP with deployed credentials, prove selected-protocol and `http1` rollback evidence, then prove the physical `:443 -> 127.0.0.1:18081 -> Axiom 127.0.0.1:7780 -> OpenCode 127.0.0.1:4096` chain and no unintended public/FRP route to `3000`, `7780`, or `4096`.
 - Install the hardened gateway unit and record effective `LimitNOFILE`, `TasksMax`, `MemoryMax`, Threads, VmRSS, and VmSize under R + 16 margin + 64-auth stress before public exposure.

@@ -115,7 +115,10 @@ fn run() -> Result<(), SanitizedExit> {
         .enable_all()
         .build()
         .map_err(|_| SanitizedExit::RuntimeBuildFailed)?;
-    let auth_mini = Arc::new(AuthMiniClient::new(config.auth_mini_issuer.clone()));
+    let auth_mini = Arc::new(AuthMiniClient::new(
+        config.auth_mini_issuer.clone(),
+        config.auth_mini_audience.clone(),
+    ));
     let terminal_result = runtime.block_on(run_server(config, auth_mini));
     runtime.shutdown_background();
     terminal_result

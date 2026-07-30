@@ -8,6 +8,7 @@ use crate::db::ObservedVersion;
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum RejectedReason {
     Remote(RefreshRejected),
+    AudienceRejected,
     LocalInactive,
 }
 
