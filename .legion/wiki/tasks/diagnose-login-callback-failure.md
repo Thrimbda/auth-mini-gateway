@@ -42,3 +42,4 @@
 
 - Production rollout remains blocked until exact `ALLOW_USER_IDS` values are provisioned and `ALLOW_EMAILS` is cleared for each gateway service.
 - Existing sessions can remain usable by an already allowlisted user ID until their recorded refresh boundary; legacy issuer/missing audience then requires re-login.
+- PR #16 merged as `9083f358463a185d6890ac1096c4745e0a5bf6c0` with no required GitHub checks reported.
