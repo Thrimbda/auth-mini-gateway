@@ -840,6 +840,66 @@ if [[ "$status" != "403" || "$hits_before" != "$hits_after" ]]; then
   exit 1
 fi
 
+printf 'Checking a denied account can switch accounts from the callback page...\n'
+callback_page_file="$TMP_DIR/callback-page.html"
+curl --ipv4 -fsS -o "$callback_page_file" "$PUBLIC_BASE/auth/callback"
+switch_target=$(python3 - "$callback_page_file" <<'PY'
+import re, sys
+page = open(sys.argv[1], encoding="utf-8").read()
+if "response.status === 403" not in page or "does not have access to this site" not in page:
+    raise SystemExit("callback page lacks the allowlist-denial message")
+links = re.findall(r'<a href="([^"]*)">Sign in with a different account</a>', page)
+if links != ["/logout?return_to=%2Flogin"]:
+    raise SystemExit(f"unexpected switch-account links: {links}")
+print(links[0])
+PY
+)
+SWITCH_JAR="$TMP_DIR/switch-cookies.txt"
+state=$(login_start "$SWITCH_JAR" "$TMP_DIR/switch-login.headers")
+seed_otp denied@example.com 888888
+mint_tokens denied@example.com 888888 "$TMP_DIR/switch-denied-tokens.json" "$PUBLIC_BASE/auth/callback" localhost
+callback_session "$SWITCH_JAR" "$TMP_DIR/switch-denied-tokens.json" "$state" 403
+switch_status=$(curl --ipv4 -sS -o /dev/null -D "$TMP_DIR/switch-logout.headers" -b "$SWITCH_JAR" -c "$SWITCH_JAR" \
+  -w '%{http_code}' "$PUBLIC_BASE$switch_target")
+switch_location=$(sed -n 's/^[Ll]ocation: *//p' "$TMP_DIR/switch-logout.headers" | tr -d '\r')
+if [[ "$switch_status" != "302" || "$switch_location" != "/login" ]]; then
+  printf 'switch-account link expected 302 to /login, got %s to %s\n' "$switch_status" "$switch_location" >&2
+  exit 1
+fi
+status=$(curl --ipv4 -sS -o /dev/null -D "$TMP_DIR/switch-login-again.headers" -b "$SWITCH_JAR" -c "$SWITCH_JAR" \
+  -w '%{http_code}' "$PUBLIC_BASE$switch_location")
+state=$(python3 - "$TMP_DIR/switch-login-again.headers" "$AUTH_BASE" <<'PY'
+import sys, urllib.parse
+lines = open(sys.argv[1], encoding="utf-8").read().splitlines()
+location = next((line.split(":", 1)[1].strip() for line in lines if line.lower().startswith("location:")), "")
+if not location.startswith(sys.argv[2]):
+    raise SystemExit(f"switch-account login did not return to auth-mini: {location}")
+parsed = urllib.parse.urlparse(location)
+fragment_query = parsed.fragment.split("?", 1)[1] if "?" in parsed.fragment else ""
+state = urllib.parse.parse_qs(parsed.query or fragment_query).get("state", [None])[0]
+if not state:
+    raise SystemExit("switch-account login redirect lacks state")
+print(state)
+PY
+)
+if [[ "$status" != "302" ]]; then
+  printf 'switch-account login expected 302, got %s\n' "$status" >&2
+  exit 1
+fi
+seed_otp allowed@example.com 999999
+mint_tokens allowed@example.com 999999 "$TMP_DIR/switch-allowed-tokens.json" "$PUBLIC_BASE/auth/callback" localhost
+callback_session "$SWITCH_JAR" "$TMP_DIR/switch-allowed-tokens.json" "$state" 200
+status=$(protected_status "$SWITCH_JAR" "$TMP_DIR/switch-protected.txt")
+if [[ "$status" != "200" ]] || ! grep -q "user_id=$ALLOWED_USER_ID" "$TMP_DIR/switch-protected.txt"; then
+  printf 'switched account did not reach upstream, got %s\n' "$status" >&2
+  exit 1
+fi
+logout_status=$(curl --ipv4 -sS -o /dev/null -b "$SWITCH_JAR" -c "$SWITCH_JAR" -w '%{http_code}' "$PUBLIC_BASE/logout")
+if [[ "$logout_status" != "302" ]]; then
+  printf 'switched-account logout failed, got %s\n' "$logout_status" >&2
+  exit 1
+fi
+
 printf 'Checking a real wrong-audience token is rejected without a session or upstream hit...\n'
 WRONG_JAR="$TMP_DIR/wrong-cookies.txt"
 state=$(login_start "$WRONG_JAR" "$TMP_DIR/wrong-login.headers")

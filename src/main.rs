@@ -1,3 +1,4 @@
+use std::io::IsTerminal as _;
 use std::process::ExitCode;
 use std::sync::Arc;
 
@@ -17,8 +18,10 @@ use auth_mini_gateway::server::run_server;
 
 fn main() -> ExitCode {
     install_sanitized_panic_hook();
+    // journald and other captured outputs show escape codes literally.
     tracing_subscriber::fmt()
         .with_target(false)
+        .with_ansi(std::io::stderr().is_terminal())
         .with_writer(std::io::stderr)
         .init();
 
