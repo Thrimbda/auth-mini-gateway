@@ -3976,6 +3976,23 @@ fn listener_fatal_process_boundary_is_single_sanitized_nonzero_event() {
     }
 }
 
+#[test]
+fn piped_stderr_logs_carry_no_ansi_escapes() {
+    let output = Command::new(env!("CARGO_BIN_EXE_auth-mini-gateway"))
+        .env("AMG_TEST_LISTENER_FATAL", "1")
+        .env_remove("NO_COLOR")
+        .stderr(Stdio::piped())
+        .stdout(Stdio::piped())
+        .output()
+        .expect("run listener-fatal probe");
+    let stderr = String::from_utf8(output.stderr).expect("listener fatal stderr");
+    assert!(stderr.contains("process_exit"), "{stderr}");
+    assert!(
+        !stderr.contains('\u{1b}'),
+        "ANSI escape in piped log: {stderr:?}"
+    );
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn fatal_accept_exits_without_waiting_for_started_libc_resolver() {
     const COOKIE_SECRET: &str = "terminal-cookie-secret-at-least-32-characters";

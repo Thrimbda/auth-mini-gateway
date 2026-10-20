@@ -541,7 +541,7 @@ Run these checks before moving real users:
 
    Sign in as an auth-mini user outside `ALLOW_USER_IDS`.
 
-   Expected: `403 Forbidden`; upstream should not receive the request.
+   Expected: the callback page says the account does not have access to this site and offers "Sign in with a different account" (`/logout?return_to=%2Flogin`, which revokes the denied gateway session and returns to auth-mini's account chooser); later protected requests from that browser get `403 Forbidden`; upstream should not receive the request.
 
 5. Logout:
 
@@ -748,6 +748,8 @@ Check:
 - auth-mini's clock and gateway host clock are reasonably synchronized.
 
 ### User logs in but gets 403
+
+The callback page reports this as "this account does not have access to this site", not as a login failure: auth-mini accepted the login and the gateway denied the user id. "Login failed. Please try again." means the session exchange itself failed (`400` state/callback, `401` token verification, or `5xx`).
 
 Check:
 

@@ -2185,12 +2185,16 @@ fn auth_unavailable() -> Response {
 }
 
 fn callback_page() -> Response {
+    // A 403 from the session exchange means the auth-mini login succeeded but
+    // the account is not allowlisted; the gateway session it set is revoked by
+    // /logout, and /login returns to auth-mini's account chooser.
     Response::html(
         r#"<!doctype html>
 <html lang="en">
-<head><meta charset="utf-8"><title>Completing login</title></head>
+<head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1"><title>Completing login</title></head>
 <body>
-<p>Completing login...</p>
+<p id="status">Completing login...</p>
+<p id="switch-account" hidden><a href="/logout?return_to=%2Flogin">Sign in with a different account</a></p>
 <script>
 (async () => {
   const params = new URLSearchParams(window.location.hash.slice(1));
@@ -2202,11 +2206,18 @@ fn callback_page() -> Response {
     credentials: 'same-origin',
     body: JSON.stringify(payload),
   });
+  if (response.status === 403) {
+    document.title = 'Access denied';
+    document.getElementById('status').textContent =
+      'You signed in, but this account does not have access to this site.';
+    document.getElementById('switch-account').hidden = false;
+    return;
+  }
   if (!response.ok) throw new Error('Login failed');
   const body = await response.json();
   window.location.assign(body.returnTo || '/');
 })().catch(() => {
-  document.body.textContent = 'Login failed. Please try again.';
+  document.getElementById('status').textContent = 'Login failed. Please try again.';
 });
 </script>
 </body>
@@ -2541,6 +2552,123 @@ mod tests {
         assert!(response
             .header_values("Set-Cookie")
             .any(|value| value.contains("amg_session=") && !value.contains("Max-Age=0")));
+    }
+
+    #[test]
+    fn callback_page_explains_allowlist_denial_and_offers_account_switch() {
+        let (status, content_type, _, body) = callback_page().into_parts();
+        assert_eq!(status, 200);
+        assert!(content_type.starts_with("text/html"));
+        let page = String::from_utf8(body).expect("UTF-8 callback page");
+        let denied_branch = page
+            .split("if (response.status === 403) {")
+            .nth(1)
+            .expect("403 branch")
+            .split("if (!response.ok)")
+            .next()
+            .expect("403 branch precedes generic failure");
+        assert!(denied_branch.contains("this account does not have access to this site"));
+        assert!(denied_branch.contains("getElementById('switch-account').hidden = false"));
+        assert!(!denied_branch.contains("Login failed"));
+        assert!(page.contains(
+            r#"<p id="switch-account" hidden><a href="/logout?return_to=%2Flogin">Sign in with a different account</a></p>"#
+        ));
+        assert!(page.contains("throw new Error('Login failed')"));
+        assert!(page.contains("textContent = 'Login failed. Please try again.'"));
+        // The page is static: identity and token material can only come from
+        // the fetch response, and neither branch renders the response body.
+        assert!(!page.contains("response.text()"));
+        assert!(!page.contains("innerHTML"));
+    }
+
+    #[test]
+    fn denied_callback_switch_account_link_revokes_session_and_restarts_login() {
+        let (_dir, database, store, config) = callback_fixture();
+        let auth = MockAuthMini::new(
+            Vec::new(),
+            "denied-user-marker".to_string(),
+            "auth-session".to_string(),
+        )
+        .with_initial(vec![Ok(verified_for("denied-user-marker", "auth-session"))]);
+        let state = store
+            .create_login_state("/private", config.login_state_ttl_seconds)
+            .expect("login state");
+        let denied = handle_callback_session(
+            &callback_request(&state.id, &config),
+            &config,
+            &store,
+            &auth,
+        )
+        .expect("callback response");
+        let session_cookie = denied
+            .header_values("Set-Cookie")
+            .find(|value| value.starts_with("amg_session="))
+            .and_then(|value| value.split(';').next())
+            .expect("denied session cookie")
+            .to_string();
+        let (status, _, _, body) = denied.into_parts();
+        assert_eq!(status, 403);
+        let body = String::from_utf8(body).expect("UTF-8 denial");
+        for forbidden in ["denied-user-marker", "callback-access", "callback-refresh"] {
+            assert!(!body.contains(forbidden));
+        }
+
+        let (_, _, _, page) = callback_page().into_parts();
+        let page = String::from_utf8(page).expect("UTF-8 callback page");
+        let switch_target = page
+            .split(r#"<a href=""#)
+            .nth(1)
+            .and_then(|rest| rest.split('"').next())
+            .expect("switch-account link");
+        let session_id = callback_session_id(&database);
+        let logout = handle_logout(
+            &Request::new(
+                "GET".to_string(),
+                switch_target.to_string(),
+                vec![("Cookie".to_string(), session_cookie)],
+                Vec::new(),
+            ),
+            &config,
+            &store,
+            &auth,
+        )
+        .expect("logout response");
+        assert_eq!(logout.status(), 302);
+        assert_eq!(
+            logout.header_values("Location").collect::<Vec<_>>(),
+            ["/login"]
+        );
+        assert!(logout
+            .header_values("Set-Cookie")
+            .any(|value| value.starts_with("amg_session=") && value.contains("Max-Age=0")));
+        assert!(matches!(
+            store.lookup_session(&session_id).expect("lookup"),
+            SessionLookup::Inactive
+        ));
+
+        let login = handle_login(
+            &Request::new(
+                "GET".to_string(),
+                "/login".to_string(),
+                Vec::new(),
+                Vec::new(),
+            ),
+            &config,
+            &store,
+        )
+        .expect("login response");
+        assert_eq!(login.status(), 302);
+        let login_prefix = build_auth_mini_login_url("", &config);
+        let login_prefix = login_prefix
+            .split("state=")
+            .next()
+            .expect("auth-mini login prefix");
+        assert!(login
+            .header_values("Location")
+            .any(|value| value.starts_with(login_prefix) && !value.contains("state=&")));
+        assert!(login
+            .header_values("Set-Cookie")
+            .any(|value| value.starts_with("amg_login_state=")));
     }
 
     #[test]
