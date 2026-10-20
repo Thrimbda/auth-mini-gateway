@@ -82,7 +82,7 @@ examples below; do not expose `7780` or `4096` publicly.
 - Local logout/expiry is terminal. Remote revocation is trusted only for the refresh endpoint's exact `session_invalidated` or `session_superseded` response, or for a cryptographically valid rotated token signed for another audience.
 - The gateway authorizes exact auth-mini user IDs from `ALLOW_USER_IDS`; email is never an authorization fact or an emitted identity. Nonempty `ALLOW_EMAILS` fails startup.
 
-Silent SSO is currently **unsupported** by the pinned auth-mini capability evidence. It is not implemented or simulated in the gateway.
+Silent SSO is provided by auth-mini `156484e` and later on its own login page; the gateway's login redirect and callback are unchanged and it does not simulate SSO itself. See the [capability gate](silent-sso-capability.md).
 
 ## Documentation
 

@@ -595,7 +595,8 @@ Schema v2 is additive. It adds authoritative idle/absolute deadlines and identit
 Before rollout, run `scripts/e2e-old-binary-compat.sh` against the pinned
 pre-lifecycle ref (default `f0519d1`, overridable with `OLD_GATEWAY_REF`),
 `scripts/e2e-wal-backup-restore.sh`, and `scripts/e2e-real-auth-mini.sh` against
-the pinned auth-mini source. Also run `scripts/e2e-proxy-mode.sh` and
+the pinned auth-mini source (set `AUTH_MINI_BIN` to exercise the exact
+auth-mini release binary being deployed). Also run `scripts/e2e-proxy-mode.sh` and
 `scripts/e2e-mode-switch.sh`; they use local ephemeral fixtures and explicitly
 report missing prerequisites or operator-requested skips. The old-binary
 harness builds and runs the actual
@@ -608,7 +609,7 @@ and starts the real gateway against the restored copy.
 
 Current auth-mini binds redirect logins to the callback hostname as a signed JWT audience and reserves `/me` for self-audience tokens. This gateway binary enforces that contract: it derives the expected audience from the `GATEWAY_PUBLIC_BASE_URL` hostname, requires it on initial, refreshed, and recovered tokens, and authorizes only exact `ALLOW_USER_IDS` values.
 
-1. Obtain exact auth-mini user IDs for every allowed user from the auth-mini admin view or from existing gateway session rows (never copy token columns).
+1. Obtain exact auth-mini user IDs for every allowed user from the auth-mini admin view (**Admin → Users** lists each user's ID and email; the admin API is `GET /admin/users` with an administrator self-audience token), from a read-only query on the auth-mini host (`SELECT id FROM users WHERE email = '<email>'` against the auth-mini SQLite database), or from existing gateway session rows (`SELECT DISTINCT user_id FROM gateway_sessions`; never copy token columns). The `/integration/user-ids` directory returns IDs only and cannot map an email to an ID.
 2. Set `ALLOW_USER_IDS` on each gateway service and remove or empty `ALLOW_EMAILS`; a nonempty `ALLOW_EMAILS` intentionally blocks startup.
 3. Deploy the fixed gateway to each distinct public hostname; two hostnames sharing one auth-mini issuer require separate expected audiences and therefore separate gateway configs.
 4. Complete a fresh login and refresh drill per hostname before opening traffic.
@@ -724,7 +725,7 @@ Positive `amg_session` and login-state cookies use only an absolute IMF-fixdate 
 
 ### Silent SSO capability gate
 
-The pinned auth-mini evidence does not establish no-interaction session reuse for a top-level redirect. The capability gate is **FAIL / unsupported**. Do not claim silent SSO in production; it requires a separate auth-mini task and a real browser-flow gate.
+auth-mini `156484e` and later reuse the browser's auth-mini main-site session for the gateway's top-level login redirect and return a delegated gateway-audience session (`amr` includes `sso`). The gateway needs no configuration for this. Gateway logout revokes only the delegated session; to force a fresh interactive login, also sign out on the auth-mini site. See [silent-sso-capability.md](silent-sso-capability.md) for the evidence boundary.
 
 ## Troubleshooting
 
@@ -743,7 +744,7 @@ Check:
 
 - `AUTH_MINI_ISSUER` exactly matches the JWT `iss` configured in auth-mini.
 - `AUTH_MINI_ISSUER/jwks` is reachable from the gateway.
-- The token audience matches the gateway: current auth-mini signs `aud` as the normalized `GATEWAY_PUBLIC_BASE_URL` hostname. A token minted for another downstream hostname, or an older token with issuer/no audience, is rejected at callback and conditionally revoked at refresh or Pending recovery.
+- The token audience matches the gateway: current auth-mini signs `aud` as the normalized `GATEWAY_PUBLIC_BASE_URL` hostname (or, for a multi-audience session, an array that must contain it). A token minted for another downstream hostname, or an older token with issuer/no audience, is rejected at callback and conditionally revoked at refresh or Pending recovery.
 - auth-mini's clock and gateway host clock are reasonably synchronized.
 
 ### User logs in but gets 403
