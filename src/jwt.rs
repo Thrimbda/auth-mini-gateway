@@ -111,7 +111,7 @@ pub fn verify_access_token(
         .iter()
         .map(|item| item.as_str().map(ToOwned::to_owned).ok_or(Invalid))
         .collect::<Result<Vec<_>, _>>()?;
-    if payload.get("aud").and_then(Value::as_str) != Some(expected_audience) {
+    if !audience_claim_contains(payload.get("aud"), expected_audience) {
         return Err(AccessTokenVerificationError::AudienceRejected);
     }
 
@@ -121,6 +121,26 @@ pub fn verify_access_token(
         amr,
         exp,
     })
+}
+
+/// auth-mini signs a single audience as a string and a multi-audience session
+/// as a canonical array (RFC 7519 section 4.1.3). Either form must name the
+/// exact gateway hostname; a malformed array is rejected as a whole.
+fn audience_claim_contains(claim: Option<&Value>, expected_audience: &str) -> bool {
+    match claim {
+        Some(Value::String(audience)) => audience == expected_audience,
+        Some(Value::Array(audiences)) => {
+            let mut found = false;
+            for audience in audiences {
+                match audience.as_str() {
+                    Some("") | None => return false,
+                    Some(audience) => found |= audience == expected_audience,
+                }
+            }
+            found
+        }
+        _ => false,
+    }
 }
 
 fn decode_json(segment: &str) -> Result<Value, Box<dyn std::error::Error>> {
@@ -161,13 +181,45 @@ mod tests {
     }
 
     #[test]
+    fn accepts_signed_audience_arrays_that_name_the_gateway() {
+        let (jwks, signing_key) = fixture_key();
+        for audience in [
+            json!(["app.example"]),
+            json!(["app.example", "portal.example"]),
+            json!(["other.example", "app.example"]),
+        ] {
+            let token = signed_token(
+                &signing_key,
+                json!({
+                    "sub": "user-1",
+                    "sid": "session-1",
+                    "iss": "https://auth.example",
+                    "aud": audience,
+                    "amr": ["sso", "email_otp"],
+                    "typ": "access",
+                    "exp": NOW + 60
+                }),
+            );
+            let verified =
+                verify_access_token(&token, &jwks, "https://auth.example", "app.example", NOW)
+                    .expect("audience array names the gateway");
+            assert_eq!(verified.amr, ["sso", "email_otp"]);
+        }
+    }
+
+    #[test]
     fn rejects_missing_malformed_and_mismatched_signed_audiences() {
         let (jwks, signing_key) = fixture_key();
         for audience in [
             Value::Null,
             json!(""),
             json!("other.example"),
-            json!(["app.example"]),
+            json!("APP.example"),
+            json!([]),
+            json!(["other.example"]),
+            json!(["app.example", 42]),
+            json!(["app.example", ""]),
+            json!([["app.example"]]),
             json!({"value": "app.example"}),
             json!(42),
         ] {

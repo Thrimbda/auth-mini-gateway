@@ -2,8 +2,11 @@
 set -euo pipefail
 
 ROOT_DIR=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)
-AUTH_MINI_RUST_DIR=${AUTH_MINI_RUST_DIR:-/tmp/opencode/auth-mini-official-20260730/rust-backend}
-AUTH_MINI_EXPECTED_COMMIT=${AUTH_MINI_EXPECTED_COMMIT:-c4e28f5cabe4dc248c137f2efb48453e35131ba6}
+AUTH_MINI_RUST_DIR=${AUTH_MINI_RUST_DIR:-/tmp/opencode/auth-mini-official-20261005/rust-backend}
+AUTH_MINI_EXPECTED_COMMIT=${AUTH_MINI_EXPECTED_COMMIT:-156484e69d00487151a283edf96930fac9bc9cae}
+# Optional prebuilt auth-mini server (for example the release binary that will
+# be deployed). The pinned checkout is still required for the commit check.
+AUTH_MINI_BIN=${AUTH_MINI_BIN:-}
 NGINX_IMAGE=${NGINX_IMAGE:-nginx:1.27-alpine}
 
 ALLOWED_USER_ID="11111111-1111-4111-8111-111111111111"
@@ -177,7 +180,7 @@ start_gateway() {
 }
 
 start_auth() {
-  "$ROOT_DIR/target/debug/auth-mini" --db "$AUTH_DB" --host 127.0.0.1 --port "$AUTH_PORT" >"$TMP_DIR/auth-mini.log" 2>&1 &
+  "$AUTH_MINI_SERVER" --db "$AUTH_DB" --host 127.0.0.1 --port "$AUTH_PORT" >"$TMP_DIR/auth-mini.log" 2>&1 &
   AUTH_PID=$!
   wait_status "$AUTH_BASE/healthz" 200 auth-mini
 }
@@ -205,6 +208,8 @@ pid nginx.pid;
 error_log /dev/stderr warn;
 events {}
 http {
+  access_log off;
+
   map \$http_upgrade \$connection_upgrade {
     default upgrade;
     '' close;
@@ -340,10 +345,14 @@ mint_tokens() {
   local code=$2
   local tokens_file=$3
   local redirect_uri=$4
-  local audience=$5
+  local audience=${5:-}
+  local audience_field=""
+  if [[ -n "$audience" ]]; then
+    audience_field=",\"aud\":\"$audience\""
+  fi
   curl --ipv4 -fsS \
     -H 'content-type: application/json' \
-    --data "{\"email\":\"$email\",\"code\":\"$code\",\"redirect_uri\":\"$redirect_uri\",\"aud\":\"$audience\"}" \
+    --data "{\"email\":\"$email\",\"code\":\"$code\",\"redirect_uri\":\"$redirect_uri\"$audience_field}" \
     "$AUTH_BASE/email/verify" >"$tokens_file"
 }
 
@@ -385,6 +394,73 @@ segment += "=" * (-len(segment) % 4)
 claims = json.loads(base64.urlsafe_b64decode(segment.encode()))
 if claims.get("sub") != expected_sub or claims.get("aud") != expected_aud:
     raise SystemExit("stored access token claims mismatch")
+PY
+}
+
+mint_main_site_tokens() {
+  local email=$1
+  local code=$2
+  local tokens_file=$3
+  curl --ipv4 -fsS \
+    -H 'content-type: application/json' \
+    --data "{\"email\":\"$email\",\"code\":\"$code\"}" \
+    "$AUTH_BASE/email/verify" >"$tokens_file"
+}
+
+mint_multi_audience_tokens() {
+  local email=$1
+  local code=$2
+  local tokens_file=$3
+  local redirect_uri=$4
+  local audiences_json=$5
+  curl --ipv4 -fsS \
+    -H 'content-type: application/json' \
+    --data "{\"email\":\"$email\",\"code\":\"$code\",\"redirect_uri\":\"$redirect_uri\",\"audiences\":$audiences_json}" \
+    "$AUTH_BASE/email/verify" >"$tokens_file"
+}
+
+sso_authorize() {
+  local main_tokens_file=$1
+  local tokens_file=$2
+  local redirect_uri=$3
+  local audience=$4
+  curl --ipv4 -fsS \
+    -H 'content-type: application/json' \
+    -H "authorization: Bearer $(access_token_of "$main_tokens_file")" \
+    --data "{\"redirect_uri\":\"$redirect_uri\",\"aud\":\"$audience\"}" \
+    "$AUTH_BASE/session/authorize" >"$tokens_file"
+}
+
+access_token_of() {
+  python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["access_token"])' "$1"
+}
+
+assert_claim_json() {
+  local source=$1
+  local claim=$2
+  local expected=$3
+  python3 - "$source" "$claim" "$expected" "$GATEWAY_DB" <<'PY'
+import base64, json, sqlite3, sys
+source, claim, expected, gateway_db = sys.argv[1:]
+if source == "stored":
+    connection = sqlite3.connect(gateway_db)
+    try:
+        row = connection.execute(
+            "SELECT access_token FROM gateway_sessions WHERE revoked_at IS NULL ORDER BY created_at DESC, id DESC LIMIT 1"
+        ).fetchone()
+    finally:
+        connection.close()
+    if not row:
+        raise SystemExit("no active gateway session stored")
+    token = row[0]
+else:
+    with open(source, "r", encoding="utf-8") as handle:
+        token = json.load(handle)["access_token"]
+segment = token.split(".")[1]
+segment += "=" * (-len(segment) % 4)
+claims = json.loads(base64.urlsafe_b64decode(segment.encode()))
+if claims.get(claim) != json.loads(expected):
+    raise SystemExit(f"{claim} claim mismatch")
 PY
 }
 
@@ -597,7 +673,13 @@ GATEWAY_DB="$TMP_DIR/gateway.sqlite"
 
 printf 'Building auth-mini and gateway binaries...\n'
 printf 'Pinned auth-mini commit: %s\n' "$AUTH_MINI_ACTUAL_COMMIT"
-CARGO_TARGET_DIR="$ROOT_DIR/target" cargo build --manifest-path "$AUTH_MINI_RUST_DIR/Cargo.toml" --bin auth-mini >/dev/null
+if [[ -n "$AUTH_MINI_BIN" ]]; then
+  AUTH_MINI_SERVER=$AUTH_MINI_BIN
+  printf 'Using prebuilt auth-mini server: %s\n' "$AUTH_MINI_SERVER"
+else
+  CARGO_TARGET_DIR="$ROOT_DIR/target" cargo build --manifest-path "$AUTH_MINI_RUST_DIR/Cargo.toml" --bin auth-mini >/dev/null
+  AUTH_MINI_SERVER="$ROOT_DIR/target/debug/auth-mini"
+fi
 cargo build --manifest-path "$ROOT_DIR/Cargo.toml" --bin auth-mini-gateway --example upstream >/dev/null
 
 start_auth
@@ -762,7 +844,9 @@ printf 'Checking a real wrong-audience token is rejected without a session or up
 WRONG_JAR="$TMP_DIR/wrong-cookies.txt"
 state=$(login_start "$WRONG_JAR" "$TMP_DIR/wrong-login.headers")
 seed_otp allowed@example.com 444444
-mint_tokens allowed@example.com 444444 "$TMP_DIR/wrong-tokens.json" "$PUBLIC_BASE/auth/callback" "$WRONG_AUDIENCE"
+# auth-mini 156484e requires explicit audiences to include the redirect host,
+# so mint the token the way another HTTPS app would receive it.
+mint_tokens allowed@example.com 444444 "$TMP_DIR/wrong-tokens.json" "https://$WRONG_AUDIENCE/auth/callback"
 assert_token_claims "$TMP_DIR/wrong-tokens.json" "$ALLOWED_USER_ID" "$WRONG_AUDIENCE"
 sessions_before=$(active_session_count)
 hits_before=$(upstream_hits)
@@ -770,6 +854,64 @@ callback_session "$WRONG_JAR" "$TMP_DIR/wrong-tokens.json" "$state" 401
 hits_after=$(upstream_hits)
 if [[ "$(active_session_count)" != "$sessions_before" || "$hits_before" != "$hits_after" ]]; then
   printf 'wrong-audience callback created a session or reached upstream\n' >&2
+  exit 1
+fi
+
+printf 'Checking an auth-mini SSO-delegated session is accepted and survives main-site logout...\n'
+SSO_JAR="$TMP_DIR/sso-cookies.txt"
+state=$(login_start "$SSO_JAR" "$TMP_DIR/sso-login.headers")
+seed_otp allowed@example.com 555555
+mint_main_site_tokens allowed@example.com 555555 "$TMP_DIR/main-site-tokens.json"
+assert_claim_json "$TMP_DIR/main-site-tokens.json" aud '"127.0.0.1"'
+sso_authorize "$TMP_DIR/main-site-tokens.json" "$TMP_DIR/sso-tokens.json" "$PUBLIC_BASE/auth/callback" localhost
+assert_token_claims "$TMP_DIR/sso-tokens.json" "$ALLOWED_USER_ID" localhost
+assert_claim_json "$TMP_DIR/sso-tokens.json" amr '["sso","email_otp"]'
+callback_session "$SSO_JAR" "$TMP_DIR/sso-tokens.json" "$state" 200
+status=$(protected_status "$SSO_JAR" "$body")
+if [[ "$status" != "200" ]] || ! grep -q "user_id=$ALLOWED_USER_ID" "$body"; then
+  printf 'expected SSO-delegated session to reach upstream, got %s\n' "$status" >&2
+  exit 1
+fi
+main_logout_status=$(curl --ipv4 -sS -o /dev/null -w '%{http_code}' -X POST \
+  -H "authorization: Bearer $(access_token_of "$TMP_DIR/main-site-tokens.json")" \
+  "$AUTH_BASE/session/logout")
+sso_before_refresh=$(active_refresh_token)
+expire_active_access
+status=$(protected_status "$SSO_JAR" "$body")
+sso_after_refresh=$(active_refresh_token)
+if [[ "$main_logout_status" != "200" || "$status" != "200" || "$sso_after_refresh" == "$sso_before_refresh" ]]; then
+  printf 'SSO-delegated session did not refresh independently of main-site logout, logout=%s status=%s\n' "$main_logout_status" "$status" >&2
+  exit 1
+fi
+assert_stored_access_claims "$ALLOWED_USER_ID" localhost
+assert_claim_json stored amr '["sso","email_otp"]'
+logout_status=$(curl --ipv4 -sS -o /dev/null -b "$SSO_JAR" -c "$SSO_JAR" -w '%{http_code}' "$PUBLIC_BASE/logout")
+status=$(protected_status "$SSO_JAR" "$body")
+if [[ "$logout_status" != "302" || "$status" != "302" ]]; then
+  printf 'SSO-delegated gateway logout failed, logout=%s status=%s\n' "$logout_status" "$status" >&2
+  exit 1
+fi
+
+printf 'Checking a multi-audience token naming the gateway is accepted and refreshed...\n'
+MULTI_JAR="$TMP_DIR/multi-cookies.txt"
+MULTI_AUDIENCES='["localhost","status.example"]'
+state=$(login_start "$MULTI_JAR" "$TMP_DIR/multi-login.headers")
+seed_otp allowed@example.com 777777
+mint_multi_audience_tokens allowed@example.com 777777 "$TMP_DIR/multi-tokens.json" "$PUBLIC_BASE/auth/callback" "$MULTI_AUDIENCES"
+assert_claim_json "$TMP_DIR/multi-tokens.json" aud "$MULTI_AUDIENCES"
+callback_session "$MULTI_JAR" "$TMP_DIR/multi-tokens.json" "$state" 200
+multi_before_refresh=$(active_refresh_token)
+expire_active_access
+status=$(protected_status "$MULTI_JAR" "$body")
+multi_after_refresh=$(active_refresh_token)
+if [[ "$status" != "200" || "$multi_after_refresh" == "$multi_before_refresh" ]]; then
+  printf 'multi-audience session did not refresh, status=%s\n' "$status" >&2
+  exit 1
+fi
+assert_claim_json stored aud "$MULTI_AUDIENCES"
+logout_status=$(curl --ipv4 -sS -o /dev/null -b "$MULTI_JAR" -c "$MULTI_JAR" -w '%{http_code}' "$PUBLIC_BASE/logout")
+if [[ "$logout_status" != "302" ]]; then
+  printf 'multi-audience gateway logout failed, logout=%s\n' "$logout_status" >&2
   exit 1
 fi
 
@@ -861,4 +1003,4 @@ if "amg_session" in jar:
     raise SystemExit("receipt-time cookie jar retained an already expired renewal")
 PY
 
-printf 'E2E passed: real audience-bound auth-mini, Rust gateway, nginx, protected HTTP/WebSocket upstream.\n'
+printf 'E2E passed: real audience-bound auth-mini (SSO delegation, multi-audience), Rust gateway, nginx, protected HTTP/WebSocket upstream.\n'

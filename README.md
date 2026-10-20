@@ -44,7 +44,10 @@ scripts/e2e-mode-switch.sh
 ```
 
 Both use ephemeral loopback fixtures and print no credentials. The real
-auth-mini drill additionally requires the pinned external auth-mini checkout.
+auth-mini drill additionally requires the pinned external auth-mini checkout
+(`AUTH_MINI_RUST_DIR` at `AUTH_MINI_EXPECTED_COMMIT`, currently official
+`zccz14/auth-mini` `156484e`). Set `AUTH_MINI_BIN` to run the same drill
+against a prebuilt auth-mini server, such as the release binary being deployed.
 
 The gateway expects a real auth-mini server at `AUTH_MINI_ISSUER`. For local browser traffic, set `AUTH_MINI_PUBLIC_BASE_URL` to the auth-mini origin reachable from the browser.
 
@@ -221,8 +224,10 @@ Current auth-mini binds redirect logins to the callback hostname as a signed
 JWT `aud` and reserves `/me` for self-audience tokens. The gateway therefore:
 
 - derives one expected audience from the `GATEWAY_PUBLIC_BASE_URL` hostname,
-- requires that exact string `aud` on initial, refreshed, and recovered tokens
-  after signature verification, and
+- requires the signed `aud` to name that exact hostname on initial, refreshed,
+  and recovered tokens after signature verification, either as the string or
+  as one element of a well-formed string array (RFC 7519; auth-mini signs a
+  multi-audience session as an array), and
 - builds sessions and identity only from signed claims (`sub`, `sid`, `amr`,
   `exp`) without calling `/me`.
 
@@ -235,6 +240,26 @@ recovery and the browser logs in again. Rolling back only the gateway binary
 does not restore login against current auth-mini; full functional rollback
 requires the previous gateway together with a pre-audience auth-mini.
 
+## auth-mini compatibility
+
+The gateway is verified against official `zccz14/auth-mini` `156484e`
+(2026-10-05) and remains compatible with the previous pin `c4e28f5`. Relative
+to `c4e28f5`, the wire contract the gateway uses (`/web/#/login` redirect,
+fragment callback, `/jwks`, `/session/refresh`, `/session/logout`, refresh error
+bodies) is unchanged. Newer auth-mini adds two token shapes the gateway accepts:
+
+- SSO-delegated sessions carry `amr` such as `["sso", "email_otp"]`, kept
+  across refresh. The gateway stores `amr` but does not authorize on it.
+- Multi-audience sessions carry an `aud` array, accepted when it names the
+  gateway hostname.
+
 ## Silent SSO capability
 
-The pinned auth-mini version does not provide a verified no-interaction top-level redirect reuse contract. The silent-SSO capability gate is **FAIL / unsupported**. This gateway does not emulate it; adding that capability requires a separate auth-mini change and browser verification.
+auth-mini `156484e` provides silent SSO on its own login page: when the browser
+already holds an auth-mini main-site session, the gateway's unchanged login
+redirect returns a delegated, gateway-audience session without a login form.
+The gateway does not emulate or detect this; it receives the same fragment
+callback. Logging out of the gateway revokes only the gateway's delegated
+session; the main-site session stays in auth-mini's browser storage, so the next
+gateway login can complete without interaction. See
+[the capability gate](docs/silent-sso-capability.md).
