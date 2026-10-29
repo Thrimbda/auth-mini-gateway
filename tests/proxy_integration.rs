@@ -3146,8 +3146,8 @@ async fn hyper_owned_framing_rejects_desync_and_never_duplicates_dispatch() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn stale_pool_failure_does_not_replay_a_non_idempotent_request() {
-    let stale = start_stale_pool_fixture().await;
+async fn stale_idle_connection_reconnects_before_dispatching_post() {
+    let stale = start_stale_pool_fixture(true).await;
     let gateway = start_gateway(Some(stale.address), SessionMode::Allowed).await;
     let cookie = gateway.cookie.as_deref().expect("stale cookie");
     let warm = request_once(
@@ -3174,10 +3174,42 @@ async fn stale_pool_failure_does_not_replay_a_non_idempotent_request() {
         ),
     )
     .await;
-    assert_status(&post, 502);
+    assert_status(&post, 200);
     tokio::time::sleep(TokioDuration::from_millis(100)).await;
+    assert_eq!(stale.connections.load(Ordering::SeqCst), 2);
+    assert_eq!(stale.post_dispatches.load(Ordering::SeqCst), 1);
+
+    gateway.task.abort();
+    stale.task.abort();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn dispatched_post_failure_is_not_replayed() {
+    let stale = start_stale_pool_fixture(false).await;
+    let gateway = start_gateway(Some(stale.address), SessionMode::Allowed).await;
+    let cookie = gateway.cookie.as_deref().expect("post cookie");
+    let warm = request_once(
+        gateway.address,
+        &format!(
+            "GET /warm HTTP/1.1\r\nHost: public.example\r\nCookie: amg_session={cookie}\r\nConnection: close\r\n\r\n"
+        ),
+    )
+    .await;
+    assert_status(&warm, 200);
+    stale.close_connection.add_permits(1);
+
+    let post = request_once(
+        gateway.address,
+        &format!(
+            "POST /write HTTP/1.1\r\nHost: public.example\r\nCookie: amg_session={cookie}\r\nContent-Length: 7\r\nConnection: close\r\n\r\npayload"
+        ),
+    )
+    .await;
+    assert_status(&post, 502);
+    // Let the fixture observe any attempted replay on a fresh connection.
+    tokio::time::sleep(TokioDuration::from_millis(600)).await;
     assert_eq!(stale.connections.load(Ordering::SeqCst), 1);
-    assert_eq!(stale.post_dispatches.load(Ordering::SeqCst), 0);
+    assert_eq!(stale.post_dispatches.load(Ordering::SeqCst), 1);
 
     gateway.task.abort();
     stale.task.abort();
@@ -5511,7 +5543,7 @@ async fn start_raw_response_fixture(response: Vec<u8>) -> RunningRawFixture {
     }
 }
 
-async fn start_stale_pool_fixture() -> RunningStaleFixture {
+async fn start_stale_pool_fixture(close_before_post: bool) -> RunningStaleFixture {
     let listener = TcpListener::bind("127.0.0.1:0")
         .await
         .expect("stale fixture bind");
@@ -5540,6 +5572,17 @@ async fn start_stale_pool_fixture() -> RunningStaleFixture {
         if let Ok(permit) = task_close.acquire().await {
             permit.forget();
         }
+        if !close_before_post {
+            let head = read_request_head(&mut stream)
+                .await
+                .expect("dispatched POST head");
+            assert!(head.starts_with("POST /base/write "));
+            let body = read_one_chunk(&mut stream)
+                .await
+                .expect("dispatched POST body");
+            assert_eq!(body, b"payload");
+            task_posts.fetch_add(1, Ordering::SeqCst);
+        }
         drop(stream);
 
         if let Ok(Ok((mut replay, _))) =
@@ -5550,6 +5593,9 @@ async fn start_stale_pool_fixture() -> RunningStaleFixture {
             if head.starts_with("POST ") {
                 task_posts.fetch_add(1, Ordering::SeqCst);
             }
+            let _ = replay
+                .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\nok")
+                .await;
         }
     });
     RunningStaleFixture {

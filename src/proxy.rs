@@ -2121,21 +2121,40 @@ impl Proxy {
         }
 
         if allow_h1 {
-            let complete = {
-                let mut pool = self.idle.lock().map_err(|_| ProxyError::Internal)?;
-                pool.iter()
-                    .position(|entry| matches!(entry, PoolEntry::H1(_)))
-                    .map(|index| match pool.remove(index) {
-                        PoolEntry::H1(complete) => complete,
-                        _ => unreachable!(),
-                    })
-            };
-            if let Some(complete) = complete {
+            // Only reselect before dispatch: neither the request nor its body
+            // has been handed to Hyper. Bound work by the idle pool capacity.
+            for _ in 0..UPSTREAM_IDLE_POOL_CAPACITY {
+                let complete = {
+                    let mut pool = self.idle.lock().map_err(|_| ProxyError::Internal)?;
+                    pool.iter()
+                        .position(|entry| matches!(entry, PoolEntry::H1(_)))
+                        .map(|index| match pool.remove(index) {
+                            PoolEntry::H1(complete) => complete,
+                            _ => unreachable!(),
+                        })
+                };
+                let Some(complete) = complete else {
+                    break;
+                };
+                let mut owner = ActiveOwner::new(
+                    complete,
+                    active_permit.take().expect("pooled H1 active permit"),
+                );
+                if owner
+                    .sender_mut()
+                    .ok_or(ProxyError::Internal)?
+                    .ready()
+                    .await
+                    .is_err()
+                {
+                    // Join the old driver before reusing admission capacity.
+                    // RetirementGuard retains cleanup ownership on cancellation.
+                    active_permit =
+                        retire_parts(owner.retirement_parts(RetirementReason::ReadyFailure)).await;
+                    continue;
+                }
                 return Ok(SelectedExchange::new(ExchangeResource::H1 {
-                    owner: ActiveOwner::new(
-                        complete,
-                        active_permit.take().expect("pooled H1 active permit"),
-                    ),
+                    owner,
                     pool: Arc::clone(&self.idle),
                 }));
             }
@@ -2915,8 +2934,8 @@ impl RetirementGuard {
         Self { parts: Some(parts) }
     }
 
-    fn finish(mut self) {
-        self.parts.take();
+    fn finish(mut self) -> Option<OwnedSemaphorePermit> {
+        self.parts.take().and_then(|mut parts| parts._permit.take())
     }
 }
 
@@ -2952,7 +2971,11 @@ fn schedule_retirement(mut parts: RetirementParts) {
     }
 }
 
-fn retire_parts(parts: RetirementParts) -> impl Future<Output = ()> + Send {
+// Reselection can retain admission after cleanup; other callers drop the
+// returned permit. Cancellation still transfers both driver and permit.
+fn retire_parts(
+    parts: RetirementParts,
+) -> impl Future<Output = Option<OwnedSemaphorePermit>> + Send {
     // As with resolver cleanup, make cancellation safe even before first poll.
     let mut parts = parts;
     parts.mark_started();
@@ -2963,7 +2986,7 @@ fn retire_parts(parts: RetirementParts) -> impl Future<Output = ()> + Send {
         parts.driver.abort();
         let _ = (&mut parts.driver).await;
         parts.mark_joined();
-        guard.finish();
+        guard.finish()
     }
 }
 
@@ -4462,6 +4485,99 @@ mod tests {
     use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
 
     use super::*;
+
+    #[tokio::test]
+    async fn cancelled_reselection_retirement_keeps_permit_until_driver_join() {
+        let (io, peer) = tokio::io::duplex(1024);
+        let (sender, connection) = http1::handshake::<_, RequestBody>(TokioIo::new(io))
+            .await
+            .unwrap();
+        drop(connection);
+        drop(peer);
+        let active = Arc::new(Semaphore::new(1));
+        let accounting = Arc::new(DriverRetirementAccounting::default());
+        let owner = ActiveOwner::new(
+            CompleteOwner::new(sender, tokio::spawn(pending()), Arc::clone(&accounting)),
+            Arc::clone(&active).try_acquire_owned().unwrap(),
+        );
+        let mut retiring = Box::pin(retire_parts(
+            owner.retirement_parts(RetirementReason::ReadyFailure),
+        ));
+        std::future::poll_fn(|cx| {
+            assert!(retiring.as_mut().poll(cx).is_pending());
+            Poll::Ready(())
+        })
+        .await;
+        drop(retiring);
+        assert_eq!(active.available_permits(), 0);
+        timeout(Duration::from_secs(2), async {
+            while active.available_permits() != 1 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("cancelled retirement joins before releasing admission");
+        assert_eq!(accounting.counts(RetirementReason::ReadyFailure), (1, 1));
+    }
+
+    #[tokio::test]
+    async fn selection_discards_multiple_stale_h1_owners_with_one_active_permit() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("replacement upstream");
+        let upstream = crate::config::parse_upstream_url(Some(&format!(
+            "http://{}",
+            listener.local_addr().unwrap()
+        )))
+        .unwrap()
+        .unwrap();
+        let client = Proxy::new(upstream, 1, 1).unwrap();
+        for _ in 0..3 {
+            let (io, peer) = tokio::io::duplex(1024);
+            let (sender, connection) = http1::handshake::<_, RequestBody>(TokioIo::new(io))
+                .await
+                .unwrap();
+            // Dropping Hyper's connection deterministically closes the sender.
+            drop(connection);
+            drop(peer);
+            let driver = tokio::spawn(async {});
+            client
+                .idle
+                .lock()
+                .unwrap()
+                .push(PoolEntry::H1(CompleteOwner::new(
+                    sender,
+                    driver,
+                    Arc::clone(&client.driver_accounting),
+                )));
+        }
+        let permit = Arc::clone(&client.active).try_acquire_owned().unwrap();
+        let mut selected = client.select_exchange(permit).await.unwrap();
+        selected.ready().await.expect("fresh replacement is ready");
+        assert_eq!(client.idle_owner_count(), 0);
+        assert_eq!(client.active.available_permits(), 0);
+        assert_eq!(
+            client
+                .driver_accounting
+                .counts(RetirementReason::ReadyFailure),
+            (3, 3)
+        );
+        assert_eq!(
+            client
+                .driver_accounting
+                .active_cleanups
+                .load(Ordering::Acquire),
+            0
+        );
+        drop(selected);
+        timeout(Duration::from_secs(2), async {
+            while client.active.available_permits() != 1 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("replacement cleanup releases admission");
+    }
 
     struct FragmentingProofIo {
         reads: VecDeque<Vec<u8>>,
